@@ -22,7 +22,7 @@ Rust 既能写进程外插件（gRPC），也是 Wasm 插件（RFC-0018）的首
 
 ## 包名
 
-crate `xihan-kernel`（crates.io）。领域词与规范术语表（`conventions/vocabulary.md`）一致，只换本语言的大小写风格。
+crate `xihan-framework`（crates.io）；拆多个 crate 时用 `xihan-framework-<包>` 前缀。领域词与规范术语表（`conventions/vocabulary.md`）一致，只换本语言的大小写风格。
 
 ## 成熟度
 
