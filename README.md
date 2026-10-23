@@ -36,7 +36,7 @@ Reference（.NET）、Stable（通过全部向量）、Experimental（部分向�
 
 ## 发布占位版本
 
-名字靠发布一个占位版本占住（crates.io 没有预留机制）。本仓库已含最小 crate（`Cargo.toml` + `src/lib.rs`，只导出 `VERSION` 与 `SPEC_VERSION`）：
+**已发布**：[crates.io 上的 `xihan-framework` 0.0.1](https://crates.io/crates/xihan-framework)（2026-10-23），名字已占住。名字靠发布一个占位版本占住（crates.io 没有预留机制）。本仓库已含最小 crate（`Cargo.toml` + `src/lib.rs`，只导出 `VERSION` 与 `SPEC_VERSION`）：
 
 ```bash
 cargo login
