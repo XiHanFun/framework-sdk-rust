@@ -1,0 +1,20 @@
+[package]
+name = "xihan-framework"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "XiHan Framework SDK for Rust: primitives, manifest, invocation context, pipeline and plugin runtimes (placeholder release; implementation planned)."
+license = "MIT"
+repository = "https://github.com/XiHanFun/framework-sdk-rust"
+homepage = "https://framework.xihanfun.com"
+documentation = "https://docs.rs/xihan-framework"
+readme = "README.md"
+keywords = ["xihan", "framework", "plugin", "wasm"]
+categories = ["development-tools"]
+exclude = [".github/", ".gitattributes", ".gitignore"]
+
+[dependencies]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"

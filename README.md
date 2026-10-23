@@ -34,6 +34,17 @@ Reference（.NET）、Stable（通过全部向量）、Experimental（部分向�
 2. 在本仓库开 Issue 认领要实现的包，一个包一个 PR，附向量测试。
 3. 公开契约的变更不在 SDK 仓库里做：走 framework-spec 的 RFC 流程，再同步到各 SDK。
 
+## 发布占位版本
+
+名字靠发布一个占位版本占住（crates.io 没有预留机制）。本仓库已含最小 crate（`Cargo.toml` + `src/lib.rs`，只导出 `VERSION` 与 `SPEC_VERSION`）：
+
+```bash
+cargo login
+cargo publish
+```
+
+发布的版本只能 yank、不能删除；之后用 `cargo owner --add` 把组织成员加成 owner。
+
 ## 许可
 
 [MIT](LICENSE)
