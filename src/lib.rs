@@ -11,11 +11,14 @@
 use std::future::Future;
 use std::pin::Pin;
 
-/// 本 crate 的版本。
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+mod grammar;
+pub mod primitives;
 
-/// 本 SDK 实现的原语层大版本（RFC-0001）。
-pub const SPEC_VERSION: &str = "1";
+/// 本 crate 的版本，同 [`primitives::SDK_VERSION`]。
+pub const VERSION: &str = primitives::SDK_VERSION;
+
+/// 本 SDK 实现的原语层大版本（RFC-0001），同 [`primitives::SPEC_VERSION`]。
+pub const SPEC_VERSION: &str = primitives::SPEC_VERSION;
 
 /// 装箱的、可跨线程发送的 future：中间件、管道步骤与操作处理器的返回类型。
 ///
