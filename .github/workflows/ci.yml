@@ -1,0 +1,66 @@
+name: CI
+
+# Rust SDK 的门禁：格式与 clippy（missing_docs 随 -D warnings 生效）、文档、全部测试（读 spec/ 的一致性向量）、最低 Rust 版本。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: 构建与测试
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: 检出（含规范 submodule）
+        uses: actions/checkout@v5
+        with:
+          submodules: true
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: 格式与静态检查
+        shell: bash
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+
+      - name: 文档
+        shell: bash
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+      - name: 测试
+        run: cargo test
+
+  msrv:
+    name: 最低 Rust 版本（1.85）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出
+        uses: actions/checkout@v5
+
+      - name: 安装 Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85
+
+      # 只构建库：测试读 spec/，在上面的作业里跑；依赖按 rust-version 解析到兼容的版本
+      - name: 构建
+        run: cargo build --lib
