@@ -79,7 +79,7 @@ fn invoke_runs_the_pipeline_and_encodes_the_response() {
 
     let missing = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.missing", ""))).unwrap_err();
     assert_eq!((missing.code(), missing.message_key()), (ERROR_CODE_NOT_FOUND, Some(MESSAGE_NOT_FOUND)));
-    assert_eq!(missing.message(), "kernel.operation.unknown (id=orders.missing)");
+    assert_eq!(missing.message(), "Operation 'orders.missing' is not registered.", "the built-in en-US template");
     assert_eq!(seen.lock().unwrap().len(), 2, "an unknown operation does not enter the pipeline");
 
     for payload in ["null", " null ", "[true]", "[1, 2]", "{", r#"{"quantity":"two"}"#] {

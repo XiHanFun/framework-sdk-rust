@@ -405,3 +405,60 @@ fn message_templates_follow_the_vectors() {
         assert_eq!(primitives::describe(&case.key, &case.arguments.clone().unwrap_or_default()), case.text, "{}", case.key);
     }
 }
+
+#[derive(Deserialize)]
+struct KernelMessageVectors {
+    messages: Vec<KernelMessage>,
+}
+
+#[derive(Deserialize)]
+struct KernelMessage {
+    code: String,
+    key: String,
+    arguments: Vec<String>,
+    template: String,
+}
+
+/// SDK 自带的 en-US 模板与向量逐字相同，参数与模板的占位符一一对应。
+#[test]
+fn builtin_templates_follow_kernel_messages() {
+    let _guard = default_messages();
+    let vectors: KernelMessageVectors = common::vector("primitives/kernel-messages.json");
+    let catalog = primitives::builtin_catalog();
+    assert_eq!(catalog.locales().collect::<Vec<_>>(), [primitives::DEFAULT_LOCALE]);
+    for message in &vectors.messages {
+        assert!(primitives::is_error_code(&message.code) && primitives::is_message_key(&message.key), "{}", message.key);
+        assert_eq!(catalog.template(primitives::DEFAULT_LOCALE, &message.key), Some(message.template.as_str()), "{}", message.key);
+        assert_eq!(primitives::placeholders(&message.template), message.arguments, "{}", message.key);
+        // 没有进程默认解析器时 Error::message 用自带的模板
+        let arguments: Details = message.arguments.iter().map(|name| (name.clone(), json!(format!("<{name}>")))).collect();
+        let error = Error::new(message.code.as_str(), message.key.as_str()).with_details(arguments.clone());
+        assert_eq!(error.message(), primitives::format_message(&message.template, &arguments), "{}", message.key);
+    }
+    assert_eq!(
+        catalog.template(primitives::DEFAULT_LOCALE, primitives::MESSAGE_UNINITIALIZED_RESULT),
+        Some("The result is uninitialized: a default value is not a valid result.")
+    );
+    assert_eq!(
+        Error::new("KERNEL_NOTFOUND_001", "kernel.operation.unknown").message(),
+        "kernel.operation.unknown",
+        "missing arguments fall back to the description"
+    );
+}
+
+#[test]
+fn framework_errors_carry_message_keys() {
+    let error = FrameworkError::with_message("KERNEL_OPERATION_002", "kernel.operation.registry_full", details(json!({"capacity": 10000})));
+    assert_eq!(
+        (error.code(), error.message(), error.message_key()),
+        ("KERNEL_OPERATION_002", "The operation registry has reached its capacity of 10000.", Some("kernel.operation.registry_full"))
+    );
+    let converted = error.to_error();
+    assert_eq!(
+        (converted.code(), converted.message_key(), converted.text()),
+        ("KERNEL_OPERATION_002", Some("kernel.operation.registry_full"), Some("The operation registry has reached its capacity of 10000."))
+    );
+    assert_eq!(converted.details(), Some(&details(json!({"capacity": 10000}))));
+    let unknown = FrameworkError::with_message("ORDERS_CONFLICT_001", "orders.duplicate", details(json!({"id": "o1"})));
+    assert_eq!(unknown.message(), "orders.duplicate (id=o1)");
+}

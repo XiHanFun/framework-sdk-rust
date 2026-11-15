@@ -10,7 +10,7 @@ use super::error_code::{
     error_code_domain, error_code_kind, is_error_code, validate_error_code,
 };
 use super::framework::{FrameworkError, invalid_argument};
-use super::messages::{Details, describe, is_message_key, resolve_message};
+use super::messages::{Details, describe, is_message_key, resolve_with_builtin};
 
 /// 没有细节时用来格式化的空参数表。
 static NO_DETAILS: Details = Details::new();
@@ -212,7 +212,8 @@ impl Error {
         error_code_domain(&self.code).unwrap_or_default()
     }
 
-    /// 面向人的消息：已解析文案；否则按进程默认区域解析消息键；再否则是「键 (参数)」；没有键时是错误码。
+    /// 面向人的消息：已解析文案；否则按进程默认区域解析消息键，再按 SDK 自带的 en-US 模板（[`builtin_catalog`](super::builtin_catalog)）；
+    /// 都解析不出时是「键 (参数)」；没有键时是错误码。
     pub fn message(&self) -> String {
         if let Some(text) = &self.text {
             return text.clone();
@@ -221,7 +222,7 @@ impl Error {
             return self.code.clone();
         };
         let arguments = self.details.as_ref().unwrap_or(&NO_DETAILS);
-        resolve_message(key, arguments).unwrap_or_else(|| describe(key, arguments))
+        resolve_with_builtin(key, arguments).unwrap_or_else(|| describe(key, arguments))
     }
 }
 

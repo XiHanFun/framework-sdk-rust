@@ -1,6 +1,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::{Arc, PoisonError, RwLock};
+use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use serde_json::Value;
 
@@ -327,6 +327,36 @@ pub fn resolve_message(key: &str, arguments: &Details) -> Option<String> {
     let (resolver, locale) = read_defaults(|defaults| (defaults.resolver.clone(), defaults.locale.clone()));
     // 在锁外调用解析器：解析器里再读写默认设置也不会死锁
     resolver?.resolve(key, &locale, arguments)
+}
+
+/// 原语层的消息键：读取未初始化的结果（Rust 的 `Result` 没有缺省值，SDK 不产生它，保留供解码与翻译）。
+pub const MESSAGE_UNINITIALIZED_RESULT: &str = "primitives.result.uninitialized";
+
+/// SDK 自带的 en-US 模板：SDK 与宿主共用的内核错误（RFC-0011「错误码」），逐字取自向量 `kernel-messages.json`。
+const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
+    (MESSAGE_UNINITIALIZED_RESULT, "The result is uninitialized: a default value is not a valid result."),
+    ("kernel.invocation.deadline_exceeded", "The invocation exceeded its deadline."),
+    ("kernel.invocation.deadline_before_start", "The invocation exceeded its deadline before it started."),
+    ("kernel.invocation.cancelled", "The invocation was canceled."),
+    ("kernel.operation.unknown", "Operation '{id}' is not registered."),
+    ("kernel.operation.invalid_payload", "The payload of operation '{id}' is not valid: {reason}"),
+    ("kernel.operation.type_mismatch", "Operation '{id}' handles '{expected}', but '{actual}' was supplied."),
+    ("kernel.operation.no_response", "Operation '{id}' completed without producing a response."),
+    ("kernel.operation.duplicate", "Operation '{id}' is already registered by '{owner}'."),
+    ("kernel.operation.registry_full", "The operation registry has reached its capacity of {capacity}."),
+];
+
+/// SDK 自带的消息目录：只有 [`DEFAULT_LOCALE`]，内容是 SDK 与宿主共用的内核错误模板。
+///
+/// [`Error::message`](super::Error::message) 在进程默认解析器解析不出时用它，再不行才退回描述；宿主收到错误后按键用自己的目录再翻译。
+pub fn builtin_catalog() -> &'static Catalog {
+    static CATALOG: OnceLock<Catalog> = OnceLock::new();
+    CATALOG.get_or_init(|| BUILTIN_TEMPLATES.iter().fold(Catalog::new(), |catalog, (key, template)| catalog.with(DEFAULT_LOCALE, *key, *template)))
+}
+
+/// 解析一条消息的文案：进程默认解析器，再 SDK 自带的 en-US 模板，都解析不出（含占位符缺参数）时为 `None`。
+pub(crate) fn resolve_with_builtin(key: &str, arguments: &Details) -> Option<String> {
+    resolve_message(key, arguments).or_else(|| builtin_catalog().resolve(key, DEFAULT_LOCALE, arguments))
 }
 
 /// 区域名文法 `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`，最长 35 个字符。

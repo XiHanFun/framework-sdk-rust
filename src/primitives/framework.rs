@@ -3,6 +3,7 @@ use std::fmt;
 
 use super::error::Error;
 use super::error_code::{ERROR_CODE_INVALID_ARGUMENT, is_error_code};
+use super::messages::{DEFAULT_LOCALE, Details, MessageResolver, builtin_catalog, describe};
 
 /// 框架名（RFC-0001 FrameworkInfo）。
 pub const NAME: &str = "XiHan Framework";
@@ -26,17 +27,29 @@ pub const DOCUMENTATION: &str = "https://framework.docs.xihanfun.com";
 ///
 /// 可恢复的业务失败用 [`Error`] 与 `Result`，不用它。清单校验、管道排序、操作登记等配置期失败以它返回；
 /// 原语的非法参数（如不合文法的错误码）以它为内容 panic。
+///
+/// 有登记消息键的配置期错误（如 `KERNEL_OPERATION_001` + `kernel.operation.duplicate`，RFC-0011「错误码」）以
+/// [`FrameworkError::with_message`] 创建，带上键与参数，说明取 SDK 自带的 en-US 模板，转成 [`Error`] 时一并带上。
 #[derive(Debug)]
 pub struct FrameworkError {
     code: String,
     message: String,
+    message_key: Option<String>,
+    details: Option<Details>,
     cause: Option<Box<dyn StdError + Send + Sync + 'static>>,
 }
 
 impl FrameworkError {
     /// 用错误码与英文说明创建。
     pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
-        Self { code: code.into(), message: message.into(), cause: None }
+        Self { code: code.into(), message: message.into(), message_key: None, details: None, cause: None }
+    }
+
+    /// 用错误码、消息键与参数创建：说明是 SDK 自带的 en-US 模板填入参数，没有模板或缺参数时是「键 (参数)」。
+    pub fn with_message(code: impl Into<String>, message_key: impl Into<String>, details: Details) -> Self {
+        let message_key = message_key.into();
+        let message = builtin_catalog().resolve(&message_key, DEFAULT_LOCALE, &details).unwrap_or_else(|| describe(&message_key, &details));
+        Self { code: code.into(), message, message_key: Some(message_key), details: Some(details), cause: None }
     }
 
     /// 附上底层错误。
@@ -55,17 +68,31 @@ impl FrameworkError {
         &self.message
     }
 
+    /// 消息键；以 [`FrameworkError::new`] 创建的为 `None`。
+    pub fn message_key(&self) -> Option<&str> {
+        self.message_key.as_deref()
+    }
+
+    /// 消息参数；以 [`FrameworkError::new`] 创建的为 `None`。
+    pub fn details(&self) -> Option<&Details> {
+        self.details.as_ref()
+    }
+
     /// 底层错误；没有为 `None`。
     pub fn cause(&self) -> Option<&(dyn StdError + Send + Sync + 'static)> {
         self.cause.as_deref()
     }
 
-    /// 转成可上线的 [`Error`]（字面量错误，带已解析文案）；错误码不合文法时用 `PRIMITIVES_VALIDATION_001`。
+    /// 转成可上线的 [`Error`]：带已解析文案，有消息键时连同键与参数；错误码不合文法时用 `PRIMITIVES_VALIDATION_001`、不带键。
     pub fn to_error(&self) -> Error {
         let code = if is_error_code(&self.code) { self.code.as_str() } else { ERROR_CODE_INVALID_ARGUMENT };
-        // 说明为空时用错误码作文案，字面量错误必须有文案
+        // 说明为空时用错误码作文案，错误必须有文案
         let text = if self.message.is_empty() { code } else { self.message.as_str() };
-        Error::literal(code, text)
+        let keyed = self.message_key.as_deref().filter(|_| code == self.code).and_then(|key| Error::try_new(code, key).ok());
+        match keyed {
+            Some(error) => error.with_details(self.details.clone().unwrap_or_default()).with_text(text),
+            None => Error::literal(code, text),
+        }
     }
 }
 
