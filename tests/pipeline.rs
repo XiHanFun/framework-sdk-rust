@@ -223,3 +223,47 @@ fn next_can_run_again_and_with_a_derived_context() {
     let pipeline = Arc::new(pipeline);
     std::thread::spawn(move || common::block_on(pipeline.run(&Context::background(), &shared))).join().unwrap().unwrap();
 }
+
+/// 约束的主体在声明时必须已登记，目标在构建时解析；按名字登记的实例只认实例名，没有名字的登记认中间件名（RFC-0004 排序规则第 7 条）。
+#[test]
+fn constraint_names_follow_rule_7() {
+    let early = Builder::new().before("A", "B").use_at(passthrough("A"), PipelineStage::Validate, Placement::End, APP_OWNER).use_at(
+        passthrough("B"),
+        PipelineStage::Validate,
+        Placement::End,
+        APP_OWNER,
+    );
+    assert_code(&early, ERROR_CODE_REGISTRATION);
+    assert_eq!(early.describe().unwrap_err().message(), "the middleware 'A' is not registered, so no ordering constraint can be declared for it.");
+
+    // 目标可以在约束之后登记
+    let late_target = Builder::new().use_at(passthrough("A"), PipelineStage::Validate, Placement::End, APP_OWNER).after("A", "B").use_at(
+        passthrough("B"),
+        PipelineStage::Validate,
+        Placement::End,
+        APP_OWNER,
+    );
+    let order: Vec<String> = late_target.describe().unwrap().into_iter().map(|descriptor| descriptor.middleware).collect();
+    assert_eq!(order, ["B", "A"]);
+
+    // 只有一个命名实例时也不能按中间件名约束它
+    let named = Builder::new().use_named_instance("guard-a", passthrough("Guard"), PipelineStage::Observe, Placement::End, APP_OWNER).use_at(
+        passthrough("Other"),
+        PipelineStage::Observe,
+        Placement::End,
+        APP_OWNER,
+    );
+    assert_code(&named.clone().before("Guard", "Other"), ERROR_CODE_REGISTRATION);
+    assert_code(&named.clone().before("Other", "Guard"), ERROR_CODE_REGISTRATION);
+    let order: Vec<String> = named.before("Other", "guard-a").describe().unwrap().iter().map(|descriptor| descriptor.display_name()).collect();
+    assert_eq!(order, ["Other", "Guard[guard-a]"]);
+
+    // 实例名与另一个中间件名相同即歧义
+    let clash = Builder::new()
+        .use_named_instance("Other", passthrough("Guard"), PipelineStage::Observe, Placement::End, APP_OWNER)
+        .use_at(passthrough("Other"), PipelineStage::Observe, Placement::End, APP_OWNER)
+        .use_at(passthrough("Third"), PipelineStage::Observe, Placement::End, APP_OWNER);
+    assert_code(&clash.clone().before("Other", "Third"), ERROR_CODE_REGISTRATION);
+    let error = clash.before("Third", "Other").describe().unwrap_err();
+    assert_eq!(error.message(), "the middleware name 'Other' matches several registrations, so ordering constraints by name are ambiguous for it.");
+}

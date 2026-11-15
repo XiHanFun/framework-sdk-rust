@@ -202,11 +202,14 @@ struct Registration {
     descriptor: Descriptor,
 }
 
-/// 一条顺序约束：`first` 在 `second` 之前，两端都是中间件名或实例名。
+/// 一条顺序约束：主体 `name` 在目标之前（`before`）或之后。
 #[derive(Clone)]
 struct Constraint {
-    first: String,
-    second: String,
+    name: String,
+    // 主体在声明时解析：登记的下标，或留到构建时报出的错误
+    subject: std::result::Result<usize, String>,
+    target: String,
+    before: bool,
 }
 
 /// 收集中间件与顺序约束，按规范排序后构建管道。
@@ -250,16 +253,21 @@ impl Builder {
 
     /// 约束 `middleware` 在 `other` 之前。
     ///
-    /// 两端都是名字：命名实例的实例名，或只登记了一个实例的中间件名；名字对应不到恰好一个登记、或两端不在同一阶段，
-    /// 在构建时报 `KERNEL_PIPELINE_003`。
-    pub fn before(mut self, middleware: &str, other: &str) -> Self {
-        self.constraints.push(Constraint { first: middleware.to_owned(), second: other.to_owned() });
-        self
+    /// 两端都是名字：按名字登记的实例用实例名，没有名字的登记用中间件名（RFC-0004 排序规则第 7 条）。主体 `middleware`
+    /// 在声明时就必须已登记，目标 `other` 在构建时解析；解析不到恰好一个登记、或两端不在同一阶段，在构建或打印时报
+    /// `KERNEL_PIPELINE_003`。
+    pub fn before(self, middleware: &str, other: &str) -> Self {
+        self.constrain(middleware, other, true)
     }
 
-    /// 约束 `middleware` 在 `other` 之后；名字的解析同 [`Builder::before`]。
-    pub fn after(mut self, middleware: &str, other: &str) -> Self {
-        self.constraints.push(Constraint { first: other.to_owned(), second: middleware.to_owned() });
+    /// 约束 `middleware` 在 `other` 之后；名字的解析与时机同 [`Builder::before`]。
+    pub fn after(self, middleware: &str, other: &str) -> Self {
+        self.constrain(middleware, other, false)
+    }
+
+    fn constrain(mut self, middleware: &str, other: &str, before: bool) -> Self {
+        let subject = self.subject(middleware);
+        self.constraints.push(Constraint { name: middleware.to_owned(), subject, target: other.to_owned(), before });
         self
     }
 
@@ -287,11 +295,13 @@ impl Builder {
         self.check_registrations()?;
         let mut edges = Vec::with_capacity(self.constraints.len());
         for constraint in &self.constraints {
-            let (first, second) = (self.resolve(&constraint.first)?, self.resolve(&constraint.second)?);
-            if self.registrations[first].descriptor.stage != self.registrations[second].descriptor.stage {
-                return Err(registration_error(format!("the ordering constraint between '{}' and '{}' crosses stages", constraint.first, constraint.second)));
+            let subject = constraint.subject.clone().map_err(registration_error)?;
+            let target = self.target(&constraint.target)?;
+            if self.registrations[subject].descriptor.stage != self.registrations[target].descriptor.stage {
+                let (first, second) = if constraint.before { (&constraint.name, &constraint.target) } else { (&constraint.target, &constraint.name) };
+                return Err(registration_error(format!("the ordering constraint between '{first}' and '{second}' crosses stages")));
             }
-            edges.push((first, second));
+            edges.push(if constraint.before { (subject, target) } else { (target, subject) });
         }
 
         let mut result = Vec::with_capacity(self.registrations.len());
@@ -327,21 +337,32 @@ impl Builder {
         Ok(())
     }
 
-    /// 把约束里的名字解析成唯一的登记：实例名，或中间件名；没有或有多个都是登记错误。
-    fn resolve(&self, name: &str) -> std::result::Result<usize, FrameworkError> {
-        let matches: Vec<usize> = (0..self.registrations.len())
-            .filter(|&index| {
-                let descriptor = &self.registrations[index].descriptor;
-                descriptor.instance.as_deref() == Some(name) || descriptor.middleware == name
-            })
-            .collect();
-        match matches.as_slice() {
-            [] => Err(registration_error(format!("the ordering constraint references the unregistered middleware '{name}'"))),
-            [index] => Ok(*index),
-            _ if matches.iter().all(|&index| self.registrations[index].descriptor.middleware == name) => {
-                Err(registration_error(format!("the middleware '{name}' has several named instances; ordering constraints by type are ambiguous")))
-            }
-            _ => Err(registration_error(format!("the middleware name '{name}' refers to several middlewares; ordering constraints by it are ambiguous"))),
+    /// 在登记里按名字找唯一的一个：按名字登记的实例只认实例名，没有名字的登记认中间件名（RFC-0004 排序规则第 7 条）。
+    ///
+    /// 没有为 `Ok(None)`；对应多个（不同中间件的实例同名，或实例名与某个中间件名相同）为歧义的登记错误。
+    fn find(&self, name: &str) -> std::result::Result<Option<usize>, String> {
+        let mut matches = (0..self.registrations.len()).filter(|&index| {
+            let descriptor = &self.registrations[index].descriptor;
+            descriptor.instance.as_deref().map_or(descriptor.middleware == name, |instance| instance == name)
+        });
+        match (matches.next(), matches.next()) {
+            (None, _) => Ok(None),
+            (Some(index), None) => Ok(Some(index)),
+            _ => Err(format!("the middleware name '{name}' matches several registrations, so ordering constraints by name are ambiguous for it")),
+        }
+    }
+
+    /// 解析约束的主体：声明时就必须已登记（排序规则第 7 条），解析不出的错误留到构建或打印时报出，链式调用不中断。
+    fn subject(&self, name: &str) -> std::result::Result<usize, String> {
+        self.find(name)?.ok_or_else(|| format!("the middleware '{name}' is not registered, so no ordering constraint can be declared for it"))
+    }
+
+    /// 解析约束的目标：在排序时按当时的登记解析。
+    fn target(&self, name: &str) -> std::result::Result<usize, FrameworkError> {
+        match self.find(name) {
+            Ok(Some(index)) => Ok(index),
+            Ok(None) => Err(registration_error(format!("the ordering constraint references the unregistered middleware '{name}'"))),
+            Err(message) => Err(registration_error(message)),
         }
     }
 }
