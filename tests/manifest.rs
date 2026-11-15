@@ -350,3 +350,35 @@ fn write_validates_programmatic_manifests() {
     m.primitives = 0;
     assert_eq!(manifest::write(&m).unwrap_err().message(), "the primitives version of 'xihan.a.b' must be a positive integer.");
 }
+
+/// 读取按 Schema 逐字执行（RFC-0002 解析规则 2）：可选成员写成 null 不合法，contributes.operations 按操作 ID 文法。
+#[test]
+fn reading_follows_the_schema_verbatim() {
+    let base = r#""id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable""#;
+    for member in [
+        r#""$schema":null"#,
+        r#""package":null"#,
+        r#""role":null"#,
+        r#""contributes":null"#,
+        r#""entry":null"#,
+        r#""activation":null"#,
+        r#""requires":[{"id":"a.b","version":"1","optional":null}]"#,
+        r#""bindings":[{"name":"db","type":"queue","required":null}]"#,
+        r#""contributes":{"config":null}"#,
+        r#""contributes":{"config":{"section":"XiHan:A","schema":null}}"#,
+    ] {
+        let data = format!(r#"{{{base},"kind":"provider",{member}}}"#);
+        assert!(manifest::read(&data).is_err(), "{member} must be rejected");
+    }
+    assert!(manifest::read(format!(r#"{{{base},"kind":"plugin","isolation":null}}"#)).is_err(), "a null isolation is not a missing one");
+
+    let operations = |operation: &str| format!(r#"{{{base},"kind":"capability","contributes":{{"operations":["{operation}"]}}}}"#);
+    for operation in ["orders.create", "order-lines.list", "a1.b2", "tenant-members.list-online"] {
+        assert!(manifest::read(operations(operation)).is_ok(), "{operation} must be accepted");
+    }
+    for operation in
+        ["orders-.create", "orders.-create", "order--lines.list", "orders.create-", "orders", "orders.create.now", "Orders.create", "orders_x.create"]
+    {
+        assert!(manifest::read(operations(operation)).is_err(), "{operation} must be rejected");
+    }
+}

@@ -19,9 +19,9 @@ use std::fmt;
 use std::path::Path;
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::grammar::{all, digit, lower, lower_digit, lower_digit_hyphen, positive, upper, word};
+use crate::grammar::{all, digit, lower, lower_digit, lower_digit_hyphen, operation_id, positive, upper, word};
 use crate::primitives::{ERROR_CODE_INVALID_ARGUMENT, FrameworkError, PipelineStage, Stability};
 
 /// 清单文件名。
@@ -243,7 +243,7 @@ pub struct Binding {
     #[serde(rename = "type")]
     pub resource_type: String,
     /// 是否必需；`None` 即缺省的必需。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub required: Option<bool>,
 }
 
@@ -291,7 +291,7 @@ pub struct ConfigContribution {
     /// 配置节。
     pub section: String,
     /// 配置节的 JSON Schema。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
 }
 
@@ -314,7 +314,7 @@ pub struct Contributions {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<String>,
     /// 配置节。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub config: Option<ConfigContribution>,
     /// 此包定义的权限码（RFC-0008 文法：小写、点分、至少两段，如 `orders.read`），不重复；
     /// 插件的由宿主在登记它的代理操作时一并登记（`plugin/invocation.md` §1）。
@@ -340,12 +340,12 @@ impl Contributions {
 #[non_exhaustive]
 pub struct Manifest {
     /// `$schema`。
-    #[serde(rename = "$schema", default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "$schema", default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     /// 清单 ID `xihan.<领域>.<名称>`。
     pub id: String,
     /// 所属包 ID。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub package: Option<String>,
     /// 语义化版本。
     pub version: String,
@@ -357,10 +357,10 @@ pub struct Manifest {
     /// 种类。
     pub kind: Kind,
     /// Provider 角色；`None` 即缺省的 `provider`。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub role: Option<Role>,
     /// 插件隔离级别；插件必须声明，非插件不得声明。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub isolation: Option<Isolation>,
     /// 提供的能力。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -372,7 +372,7 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<Binding>,
     /// 贡献点。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub contributes: Option<Contributions>,
     /// 激活事件；空即缺省的 `onStartup`。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -381,7 +381,7 @@ pub struct Manifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permissions: Vec<String>,
     /// 入口：插件可执行文件名、类型名或等价标识。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
 }
 
@@ -519,7 +519,7 @@ impl Contributions {
         if self.pipeline.iter().any(|contribution| contribution.middleware.is_empty()) {
             return invalid(format!("a pipeline contribution of '{id}' has no middleware name"));
         }
-        if let Some(operation) = self.operations.iter().find(|operation| !is_manifest_operation(operation)) {
+        if let Some(operation) = self.operations.iter().find(|operation| !operation_id(operation)) {
             return invalid(format!("the operation '{operation}' of '{id}' must match <resource>.<verb>"));
         }
         if let Some(config) = self.config.as_ref().filter(|config| !is_config_section(&config.section)) {
@@ -627,11 +627,9 @@ fn is_binding_type(resource_type: &str) -> bool {
     }
 }
 
-/// 清单里的操作 ID `^[a-z][a-z0-9-]*\.[a-z][a-z0-9-]*$`（比操作契约的文法宽，与 Schema 一致）。
-fn is_manifest_operation(operation: &str) -> bool {
-    let mut parts = operation.split('.');
-    let segment = |part: Option<&str>| part.is_some_and(|part| word(part, lower, lower_digit_hyphen));
-    segment(parts.next()) && segment(parts.next()) && parts.next().is_none()
+/// 可选成员写了就必须有值：缺失表示没有，写成 `null` 不合法（RFC-0002 解析规则 2）。
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(deserializer).map(Some)
 }
 
 /// 配置节 `^XiHan:[A-Z][A-Za-z0-9]*(:[A-Z][A-Za-z0-9]*)*$`。
@@ -705,7 +703,7 @@ mod tests {
         for resource_type in ["", "a:", ":a", "a:b:c", "Queue", "cache-x"] {
             assert!(!is_binding_type(resource_type), "{resource_type}");
         }
-        assert!(is_manifest_operation("orders-x.create-1") && !is_manifest_operation("orders") && !is_manifest_operation("a.b.c"));
+        assert!(operation_id("orders-x.create-1") && !operation_id("orders") && !operation_id("a.b.c") && !operation_id("orders-.create"));
         assert_eq!(domain("xihan.samples.echo"), Some("samples"));
         assert_eq!(domain("caching.distributed"), Some("caching"));
         assert_eq!(domain("Caching"), None);

@@ -82,7 +82,7 @@ pub const EXPOSE_AI: &str = "ai";
 
 /// 判断操作 ID 是否符合 `<resource>.<verb>`：`^[a-z][a-z0-9]*(-[a-z0-9]+)*\.[a-z][a-z0-9]*(-[a-z0-9]+)*$`。
 pub fn is_id(id: &str) -> bool {
-    id.split_once('.').is_some_and(|(resource, verb)| crate::grammar::kebab(resource) && crate::grammar::kebab(verb))
+    crate::grammar::operation_id(id)
 }
 
 /// 操作契约：ID、稳定性、暴露的协议与授权要求（`permission` 与 `policy` 二选一）。

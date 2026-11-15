@@ -52,6 +52,14 @@ pub(crate) fn kebab(text: &str) -> bool {
     parts.next().is_some_and(|head| word(head, lower, lower_digit)) && parts.all(|part| all(part, lower_digit))
 }
 
+/// 操作 ID `<resource>.<verb>`：`^[a-z][a-z0-9]*(-[a-z0-9]+)*\.[a-z][a-z0-9]*(-[a-z0-9]+)*$`（RFC-0011）。
+///
+/// 操作契约与清单的 `contributes.operations` 用同一个文法（RFC-0002 解析规则 2）。
+pub(crate) fn operation_id(id: &str) -> bool {
+    // 动词段里再有点即不合法：kebab 不收点
+    id.split_once('.').is_some_and(|(resource, verb)| kebab(resource) && kebab(verb))
+}
+
 /// 正整数 `[1-9][0-9]*`，并且能放进 `u32`。
 pub(crate) fn positive(text: &str) -> Option<u32> {
     if !word(text, |byte| (b'1'..=b'9').contains(&byte), digit) {
