@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod grammar;
+pub mod manifest;
 pub mod primitives;
 
 /// 本 crate 的版本，同 [`primitives::SDK_VERSION`]。

@@ -22,6 +22,11 @@ pub(crate) fn lower_digit(byte: u8) -> bool {
     lower(byte) || digit(byte)
 }
 
+/// 小写字母、数字或连字符 `[a-z0-9-]`。
+pub(crate) fn lower_digit_hyphen(byte: u8) -> bool {
+    lower_digit(byte) || byte == b'-'
+}
+
 /// 非空且首字节满足 `first`、其余字节满足 `rest`：即 `first rest*`。
 pub(crate) fn word(text: &str, first: fn(u8) -> bool, rest: fn(u8) -> bool) -> bool {
     match text.as_bytes().split_first() {
@@ -42,9 +47,27 @@ pub(crate) fn kebab(text: &str) -> bool {
     parts.next().is_some_and(|head| word(head, lower, lower_digit)) && parts.all(|part| all(part, lower_digit))
 }
 
+/// 正整数 `[1-9][0-9]*`，并且能放进 `u32`。
+pub(crate) fn positive(text: &str) -> Option<u32> {
+    if !word(text, |byte| (b'1'..=b'9').contains(&byte), digit) {
+        return None;
+    }
+    text.parse().ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn positive_parses_within_u32() {
+        assert_eq!(positive("1"), Some(1));
+        assert_eq!(positive("12"), Some(12));
+        assert_eq!(positive("4294967295"), Some(u32::MAX));
+        for text in ["", "0", "01", "-1", "+1", "1.0", "^1", "4294967296"] {
+            assert_eq!(positive(text), None, "{text}");
+        }
+    }
 
     #[test]
     fn kebab_rejects_empty_segments() {
