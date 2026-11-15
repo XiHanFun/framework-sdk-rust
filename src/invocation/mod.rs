@@ -37,8 +37,10 @@ pub const ERROR_CODE_DEADLINE_EXCEEDED: &str = "KERNEL_TIMEOUT_001";
 /// 调用在截止时间到达之前被调用方取消。
 pub const ERROR_CODE_CANCELLED: &str = "KERNEL_CANCELLED_001";
 
-/// 超时的消息键。
+/// 超时的消息键：截止时间在调用途中到达。
 pub const MESSAGE_DEADLINE_EXCEEDED: &str = "kernel.invocation.deadline_exceeded";
+/// 超时的消息键：构建上下文（调用开始）时截止时间已经过去。
+pub const MESSAGE_DEADLINE_BEFORE_START: &str = "kernel.invocation.deadline_before_start";
 /// 取消的消息键。
 pub const MESSAGE_CANCELLED: &str = "kernel.invocation.cancelled";
 
@@ -204,13 +206,15 @@ impl Context {
     }
 
     /// 把取消与超时翻译成原语层错误：截止令牌已触发为 `KERNEL_TIMEOUT_001`，否则调用方已取消为
-    /// `KERNEL_CANCELLED_001`；都没有为 `None`。
+    /// `KERNEL_CANCELLED_001`；都没有为 `None`。错误都没有参数（RFC-0011「错误码」）。
     ///
     /// 归因只看令牌（RFC-0003 规则 1、RFC-0004）：截止令牌已触发即超时，不论调用方是否也已取消；截止令牌没有触发时，
-    /// 即使时钟已过截止时间，调用方的取消仍是取消。
+    /// 即使时钟已过截止时间，调用方的取消仍是取消。构建上下文时截止时间已经过去的，消息键是
+    /// `kernel.invocation.deadline_before_start`，否则是 `kernel.invocation.deadline_exceeded`。
     pub fn cancellation(&self) -> Option<Error> {
-        if self.deadline.as_ref().is_some_and(|deadline| deadline.has_fired()) {
-            return Some(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_EXCEEDED));
+        if let Some(deadline) = self.deadline.as_ref().filter(|deadline| deadline.has_fired()) {
+            let key = if deadline.passed_before_start() { MESSAGE_DEADLINE_BEFORE_START } else { MESSAGE_DEADLINE_EXCEEDED };
+            return Some(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, key));
         }
         self.token.is_cancelled().then(|| Error::cancelled(ERROR_CODE_CANCELLED, MESSAGE_CANCELLED))
     }

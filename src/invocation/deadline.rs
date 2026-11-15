@@ -13,6 +13,8 @@ use super::cancellation::CancellationToken;
 pub(crate) struct Deadline {
     at: SystemTime,
     fired: CancellationToken,
+    // 构建时截止时间已经过去：调用开始之前就超时了
+    before_start: bool,
     // 丢弃即从定时器里撤下条目，条目数以仍然存活的截止时间为上限
     _registration: Option<Registration>,
 }
@@ -21,16 +23,16 @@ impl Deadline {
     /// 登记截止时间：已经过去的立即触发；远到 `Instant` 表示不了的不起定时器，等同于调用期间不会到期（ADR-0203）。
     pub(crate) fn start(at: SystemTime, context: &CancellationToken) -> Arc<Self> {
         let fired = CancellationToken::new();
-        let registration = match at.duration_since(SystemTime::now()) {
+        let (registration, before_start) = match at.duration_since(SystemTime::now()) {
             Ok(remaining) if remaining > Duration::ZERO => {
-                Instant::now().checked_add(remaining).map(|instant| Timer::global().register(instant, fired.clone(), context.clone()))
+                (Instant::now().checked_add(remaining).map(|instant| Timer::global().register(instant, fired.clone(), context.clone())), false)
             }
             _ => {
                 fire(&fired, context);
-                None
+                (None, true)
             }
         };
-        Arc::new(Self { at, fired, _registration: registration })
+        Arc::new(Self { at, fired, before_start, _registration: registration })
     }
 
     /// 绝对截止时间。
@@ -41,6 +43,11 @@ impl Deadline {
     /// 截止令牌是否已触发。
     pub(crate) fn has_fired(&self) -> bool {
         self.fired.is_cancelled()
+    }
+
+    /// 构建上下文时截止时间是否已经过去。
+    pub(crate) fn passed_before_start(&self) -> bool {
+        self.before_start
     }
 }
 

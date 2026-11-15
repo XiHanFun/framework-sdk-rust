@@ -48,3 +48,36 @@ pub fn panic_message(action: impl FnOnce() + std::panic::UnwindSafe) -> String {
     }
     payload.downcast_ref::<&str>().map(|text| (*text).to_owned()).unwrap_or_default()
 }
+
+/// 向量 `kernel-messages.json` 里的一条内核错误。
+#[derive(serde::Deserialize)]
+pub struct KernelMessage {
+    pub code: String,
+    pub key: String,
+    pub arguments: Vec<String>,
+    pub template: String,
+}
+
+#[derive(serde::Deserialize)]
+struct KernelMessages {
+    messages: Vec<KernelMessage>,
+}
+
+/// 全部内核错误。
+pub fn kernel_messages() -> Vec<KernelMessage> {
+    vector::<KernelMessages>("primitives/kernel-messages.json").messages
+}
+
+/// 核对一个错误与向量里同键的条目一致：错误码、消息键、参数名，以及没有进程默认解析器时的 en-US 文案。
+pub fn assert_kernel_error(error: &xihan_framework::primitives::Error, key: &str) {
+    let messages = kernel_messages();
+    let expected = messages.iter().find(|message| message.key == key).unwrap_or_else(|| panic!("{key} is not in kernel-messages.json"));
+    assert_eq!((error.code(), error.message_key()), (expected.code.as_str(), Some(key)), "{error}");
+    let names: Vec<&str> = error.details().map(|details| details.keys().map(String::as_str).collect()).unwrap_or_default();
+    let mut arguments: Vec<&str> = expected.arguments.iter().map(String::as_str).collect();
+    arguments.sort_unstable();
+    assert_eq!(names, arguments, "the arguments of {key}");
+    let empty = xihan_framework::primitives::Details::new();
+    let text = xihan_framework::primitives::format_message(&expected.template, error.details().unwrap_or(&empty));
+    assert_eq!(error.message(), text, "the en-US message of {key}");
+}

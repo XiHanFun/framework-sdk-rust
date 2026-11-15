@@ -406,27 +406,14 @@ fn message_templates_follow_the_vectors() {
     }
 }
 
-#[derive(Deserialize)]
-struct KernelMessageVectors {
-    messages: Vec<KernelMessage>,
-}
-
-#[derive(Deserialize)]
-struct KernelMessage {
-    code: String,
-    key: String,
-    arguments: Vec<String>,
-    template: String,
-}
-
 /// SDK 自带的 en-US 模板与向量逐字相同，参数与模板的占位符一一对应。
 #[test]
 fn builtin_templates_follow_kernel_messages() {
     let _guard = default_messages();
-    let vectors: KernelMessageVectors = common::vector("primitives/kernel-messages.json");
+    let messages = common::kernel_messages();
     let catalog = primitives::builtin_catalog();
     assert_eq!(catalog.locales().collect::<Vec<_>>(), [primitives::DEFAULT_LOCALE]);
-    for message in &vectors.messages {
+    for message in &messages {
         assert!(primitives::is_error_code(&message.code) && primitives::is_message_key(&message.key), "{}", message.key);
         assert_eq!(catalog.template(primitives::DEFAULT_LOCALE, &message.key), Some(message.template.as_str()), "{}", message.key);
         assert_eq!(primitives::placeholders(&message.template), message.arguments, "{}", message.key);
