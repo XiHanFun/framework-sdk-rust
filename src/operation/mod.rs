@@ -31,12 +31,13 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use serde_json::error::Category;
+use serde_json::Value;
+use serde_path_to_error::Segment;
 
 use crate::BoxFuture;
 use crate::invocation::Context;
 use crate::pipeline::{self, APP_OWNER, Pipeline, Step};
-use crate::primitives::{ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_UNINITIALIZED_RESULT, Error, FrameworkError, Result, Stability};
+use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, Result, Stability};
 
 /// 操作未登记。
 pub const ERROR_CODE_NOT_FOUND: &str = "KERNEL_NOTFOUND_001";
@@ -49,15 +50,21 @@ pub const ERROR_CODE_DUPLICATE: &str = "KERNEL_OPERATION_001";
 /// 操作登记表已满（配置期）。
 pub const ERROR_CODE_REGISTRY_FULL: &str = "KERNEL_OPERATION_002";
 
-/// 响应编码失败：调用期间的意外错误。
-const ERROR_CODE_UNEXPECTED: &str = "KERNEL_UNEXPECTED_001";
+/// 调用期间的意外错误：管道以成功结束而没有响应（规则 9），或响应编码失败。
+pub const ERROR_CODE_UNEXPECTED: &str = "KERNEL_UNEXPECTED_001";
 
 /// 操作未登记的消息键；参数 `id`。
 pub const MESSAGE_NOT_FOUND: &str = "kernel.operation.unknown";
-/// 载荷不合法的消息键；参数 `id`、`reason`。
+/// 载荷不合法的消息键；参数 `id`、`reason`（出错位置的 JSON 路径，如 `$.quantity`）。
 pub const MESSAGE_INVALID_PAYLOAD: &str = "kernel.operation.invalid_payload";
-/// 类型不符的消息键；参数 `id`、`expected`、`actual`。
+/// 类型不符的消息键；参数 `id`、`expected`、`actual`（Rust 类型的短名）。
 pub const MESSAGE_TYPE_MISMATCH: &str = "kernel.operation.type_mismatch";
+/// 管道以成功结束而没有响应的消息键；参数 `id`。
+pub const MESSAGE_NO_RESPONSE: &str = "kernel.operation.no_response";
+/// 操作 ID 重复登记的消息键；参数 `id`、`owner`（已登记的那一个的归属）。
+pub const MESSAGE_DUPLICATE: &str = "kernel.operation.duplicate";
+/// 操作登记表已满的消息键；参数 `capacity`。
+pub const MESSAGE_REGISTRY_FULL: &str = "kernel.operation.registry_full";
 
 /// 登记表的容量。
 pub const CAPACITY: usize = 10_000;
@@ -355,11 +362,13 @@ impl Registry {
 
         // 重复与容量在同一次写锁里判断：并发的登记不会越过容量，也不会都以为自己是第一个
         let mut descriptors = self.write();
-        if descriptors.contains_key(&id) {
-            return Err(FrameworkError::new(ERROR_CODE_DUPLICATE, format!("The operation '{id}' is already registered.")));
+        if let Some(existing) = descriptors.get(&id) {
+            let details = Details::from([("id".to_owned(), Value::from(id.as_str())), ("owner".to_owned(), Value::from(existing.owner()))]);
+            return Err(FrameworkError::with_message(ERROR_CODE_DUPLICATE, MESSAGE_DUPLICATE, details));
         }
         if descriptors.len() >= CAPACITY {
-            return Err(FrameworkError::new(ERROR_CODE_REGISTRY_FULL, format!("The operation registry is full ({CAPACITY} operations).")));
+            let details = Details::from([("capacity".to_owned(), Value::from(CAPACITY))]);
+            return Err(FrameworkError::with_message(ERROR_CODE_REGISTRY_FULL, MESSAGE_REGISTRY_FULL, details));
         }
         descriptors.insert(id, Arc::new(descriptor));
         Ok(())
@@ -540,7 +549,7 @@ impl Invoker {
     /// 执行一个 XGI 请求，成功时返回响应载荷。
     ///
     /// 未登记返回 `KERNEL_NOTFOUND_001`（不进管道）；否则把操作与请求放进上下文，经完整管道执行，handle 阶段之后解码、
-    /// 执行、编码。中间件以成功短路、没有执行操作时返回 `PRIMITIVES_VALIDATION_002`。
+    /// 执行、编码。中间件以成功短路、没有执行操作时返回 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response`（规则 9）；载荷不合法时 `reason` 是出错位置的 JSON 路径（如 `$.quantity`）。
     ///
     /// 载荷按请求类型自己的 `Deserialize` 解码：serde 派生的结构体除了 JSON 对象，也接受字段同序的数组（如 `[1]`）；
     /// 要只收对象时在请求类型上自行实现 `Deserialize`。
@@ -556,7 +565,7 @@ impl Invoker {
             let response = scope.take_response();
             drop(scope);
             outcome?;
-            response.ok_or_else(uninitialized)
+            response.ok_or_else(|| no_response(descriptor.id()))
         }
     }
 
@@ -585,7 +594,7 @@ impl Invoker {
             let outcome = self.pipeline.run(ctx, &terminal).await;
             drop(scope);
             outcome?;
-            terminal.outcome.into_inner().unwrap_or_else(PoisonError::into_inner).unwrap_or_else(|| Err(uninitialized()))
+            terminal.outcome.into_inner().unwrap_or_else(PoisonError::into_inner).unwrap_or_else(|| Err(no_response(id)))
         }
     }
 }
@@ -603,16 +612,33 @@ fn decode<Req: DeserializeOwned>(id: &str, payload: &[u8]) -> Result<Req> {
     if trimmed == b"null" {
         return Err(invalid_payload(id, "the payload is null".to_owned()));
     }
-    serde_json::from_slice(trimmed).map_err(|error| invalid_payload(id, reason(&error)))
+    let mut deserializer = serde_json::Deserializer::from_slice(trimmed);
+    let request = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| invalid_payload(id, json_path(error.path())))?;
+    // 值之后还有别的内容（如两个 JSON 值）也不合法，位置是根
+    deserializer.end().map_err(|_| invalid_payload(id, "$".to_owned()))?;
+    Ok(request)
 }
 
-/// JSON 错误的原因：只写位置，不带 Rust 类型名（RFC-0011 规则 2，ADR-0124）。
-fn reason(error: &serde_json::Error) -> String {
-    match error.classify() {
-        Category::Data => format!("the payload does not match the request at line {}, column {}", error.line(), error.column()),
-        Category::Syntax | Category::Eof => format!("the payload is not valid JSON at line {}, column {}", error.line(), error.column()),
-        Category::Io => "the payload could not be read".to_owned(),
+/// 出错位置的 JSON 路径（RFC-0011 规则 2，ADR-0124）：根是 `$`，成员 `.name`，下标 `[0]`；
+/// 成员名不只含字母、数字与下划线时写成 `['name']`。不带 Rust 类型名，也不带解析器的错误文本。
+fn json_path(path: &serde_path_to_error::Path) -> String {
+    let mut text = String::from("$");
+    for segment in path.iter() {
+        match segment {
+            Segment::Seq { index } => text.push_str(&format!("[{index}]")),
+            Segment::Map { key } | Segment::Enum { variant: key } => {
+                if !key.is_empty() && key.chars().all(|char| char.is_ascii_alphanumeric() || char == '_') {
+                    text.push('.');
+                    text.push_str(key);
+                } else {
+                    text.push_str(&format!("['{}']", key.replace('\\', "\\\\").replace('\'', "\\'")));
+                }
+            }
+            // 路径不明的一段（如未标记的枚举内部）不写出
+            Segment::Unknown => {}
+        }
     }
+    text
 }
 
 fn invalid_payload(id: &str, reason: String) -> Error {
@@ -630,9 +656,9 @@ fn type_mismatch<Req, Res>(descriptor: &Descriptor) -> Error {
         .with_detail("actual", format!("{} -> {}", short_type_name::<Req>(), short_type_name::<Res>()))
 }
 
-/// 管道成功结束却没有执行操作：中间件以成功短路。
-fn uninitialized() -> Error {
-    Error::literal(ERROR_CODE_UNINITIALIZED_RESULT, "The result has not been initialized.")
+/// 管道以成功结束而没有响应：某个中间件以成功短路、操作没有执行（规则 9）。
+fn no_response(id: &str) -> Error {
+    Error::unexpected(ERROR_CODE_UNEXPECTED, MESSAGE_NO_RESPONSE).with_detail("id", id)
 }
 
 fn invalid(message: String) -> FrameworkError {

@@ -10,10 +10,11 @@ use serde_json::json;
 use xihan_framework::invocation::Context;
 use xihan_framework::operation::{
     self, CAPACITY, Contract, ERROR_CODE_DUPLICATE, ERROR_CODE_INVALID_PAYLOAD, ERROR_CODE_NOT_FOUND, ERROR_CODE_REGISTRY_FULL, ERROR_CODE_TYPE_MISMATCH,
-    EXPOSE_AI, EXPOSE_HTTP, Invoker, MESSAGE_INVALID_PAYLOAD, MESSAGE_NOT_FOUND, MESSAGE_TYPE_MISMATCH, Registry, Request, Schema,
+    EXPOSE_AI, EXPOSE_HTTP, Invoker, MESSAGE_DUPLICATE, MESSAGE_INVALID_PAYLOAD, MESSAGE_NO_RESPONSE, MESSAGE_NOT_FOUND, MESSAGE_REGISTRY_FULL,
+    MESSAGE_TYPE_MISMATCH, Registry, Request, Schema,
 };
 use xihan_framework::pipeline::{self, APP_OWNER, Builder, Placement};
-use xihan_framework::primitives::{BAGGAGE_CORRELATION, ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_UNINITIALIZED_RESULT, Error, PipelineStage, Stability};
+use xihan_framework::primitives::{BAGGAGE_CORRELATION, ERROR_CODE_INVALID_ARGUMENT, Error, PipelineStage, Stability};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -80,15 +81,23 @@ fn invoke_runs_the_pipeline_and_encodes_the_response() {
     let missing = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.missing", ""))).unwrap_err();
     assert_eq!((missing.code(), missing.message_key()), (ERROR_CODE_NOT_FOUND, Some(MESSAGE_NOT_FOUND)));
     assert_eq!(missing.message(), "Operation 'orders.missing' is not registered.", "the built-in en-US template");
+    common::assert_kernel_error(&missing, MESSAGE_NOT_FOUND);
     assert_eq!(seen.lock().unwrap().len(), 2, "an unknown operation does not enter the pipeline");
 
-    for payload in ["null", " null ", "[true]", "[1, 2]", "{", r#"{"quantity":"two"}"#] {
+    // reason 只写出错位置的 JSON 路径（RFC-0011 规则 2）
+    for (payload, reason) in [
+        ("null", "the payload is null"),
+        (" null ", "the payload is null"),
+        ("[true]", "$[0]"),
+        ("[1, 2]", "$"),
+        ("{", "$"),
+        (r#"{"quantity":"two"}"#, "$.quantity"),
+        (r#"{"quantity":1} {}"#, "$"),
+    ] {
         let invalid = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", payload))).unwrap_err();
         assert_eq!((invalid.code(), invalid.message_key()), (ERROR_CODE_INVALID_PAYLOAD, Some(MESSAGE_INVALID_PAYLOAD)), "payload {payload:?}");
-        let details = invalid.details().unwrap();
-        assert_eq!(details["id"], json!("orders.create"));
-        let reason = details["reason"].as_str().unwrap();
-        assert!(!reason.contains("CreateOrder"), "the reason must not name the request type: {reason}");
+        assert_eq!(invalid.details().unwrap()["reason"], json!(reason), "payload {payload:?}");
+        common::assert_kernel_error(&invalid, MESSAGE_INVALID_PAYLOAD);
     }
     let empty = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", " \n"))).unwrap_err();
     assert_eq!(empty.code(), "ORDERS_VALIDATION_001", "an empty payload is {{}}");
@@ -106,6 +115,7 @@ fn typed_invoke_checks_types() {
     assert_eq!((mismatch.code(), mismatch.message_key()), (ERROR_CODE_TYPE_MISMATCH, Some(MESSAGE_TYPE_MISMATCH)));
     let details = mismatch.details().unwrap();
     assert_eq!((details["expected"].as_str(), details["actual"].as_str()), (Some("CreateOrder -> OrderCreated"), Some("CreateOrder -> String")));
+    common::assert_kernel_error(&mismatch, MESSAGE_TYPE_MISMATCH);
 
     let missing = common::block_on(invoker.invoke_typed::<CreateOrder, OrderCreated>(&ctx, "orders.missing", CreateOrder::default())).unwrap_err();
     assert_eq!(missing.code(), ERROR_CODE_NOT_FOUND);
@@ -129,7 +139,8 @@ fn registry_rejects_duplicates_and_bad_ids() {
 
     registry.add(Contract::new("orders.create").with_permission("orders.write").with_expose([EXPOSE_HTTP, EXPOSE_AI]), handler()).unwrap();
     let error = registry.add(Contract::new("orders.create"), handler()).unwrap_err();
-    assert_eq!((error.code(), error.message()), (ERROR_CODE_DUPLICATE, "The operation 'orders.create' is already registered."));
+    assert_eq!((error.code(), error.message()), (ERROR_CODE_DUPLICATE, "Operation 'orders.create' is already registered by 'app'."));
+    common::assert_kernel_error(&error.to_error(), MESSAGE_DUPLICATE);
     registry.add_with(Contract::new("order-lines.list"), handler(), None, "xihan.samples.orders").unwrap();
 
     let list = registry.list();
@@ -154,7 +165,8 @@ fn registry_capacity_is_bounded() {
     let duplicate = registry.add(Contract::new("r0.create"), handler()).unwrap_err();
     assert_eq!(duplicate.code(), ERROR_CODE_DUPLICATE, "duplicates are reported before capacity");
     let full = registry.add(Contract::new("extra.create"), handler()).unwrap_err();
-    assert_eq!((full.code(), full.message()), (ERROR_CODE_REGISTRY_FULL, "The operation registry is full (10000 operations)."));
+    assert_eq!((full.code(), full.message()), (ERROR_CODE_REGISTRY_FULL, "The operation registry has reached its capacity of 10000."));
+    common::assert_kernel_error(&full.to_error(), MESSAGE_REGISTRY_FULL);
     assert_eq!(registry.len(), CAPACITY);
 }
 
@@ -164,9 +176,10 @@ fn short_circuits_and_nested_invocations() {
     let skip = pipeline::from_fn("Skip", |_ctx, _next| Box::pin(async { Ok(()) }));
     let invoker = Invoker::new(registry(), &Builder::new().use_at(skip, PipelineStage::Idempotency, Placement::End, APP_OWNER)).unwrap();
     let skipped = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", r#"{"quantity":1}"#))).unwrap_err();
-    assert_eq!(skipped.code(), ERROR_CODE_UNINITIALIZED_RESULT);
+    common::assert_kernel_error(&skipped, MESSAGE_NO_RESPONSE);
+    assert_eq!(skipped.message(), "Operation 'orders.create' completed without producing a response.");
     let skipped = common::block_on(invoker.invoke_typed::<CreateOrder, OrderCreated>(&Context::background(), "orders.create", CreateOrder { quantity: 1 }));
-    assert_eq!(skipped.unwrap_err().code(), ERROR_CODE_UNINITIALIZED_RESULT);
+    common::assert_kernel_error(&skipped.unwrap_err(), MESSAGE_NO_RESPONSE);
 
     // 嵌套调用各看到自己的操作，返回后恢复外层
     let registry = registry();
@@ -222,4 +235,37 @@ fn execute_skips_the_pipeline_and_reports_encoding_failures() {
     let ok = registry();
     let created = common::block_on(ok.get("orders.create").unwrap().execute(&correlated("c5"), br#"{"quantity":1}"#)).unwrap();
     assert_eq!(created, br#"{"id":"o-c5","quantity":1}"#);
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct PlaceOrder {
+    #[allow(dead_code)]
+    lines: Vec<Line>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct Line {
+    #[allow(dead_code)]
+    quantity: u32,
+    #[serde(rename = "unit price")]
+    #[allow(dead_code)]
+    unit_price: f64,
+}
+
+#[test]
+fn invalid_payload_reasons_are_json_paths() {
+    let registry = Registry::new();
+    registry.add(Contract::new("orders.place"), operation::handler_fn(|_ctx, _request: PlaceOrder| Box::pin(async { Ok(()) }))).unwrap();
+    let invoker = Invoker::new(Arc::new(registry), &Builder::new()).unwrap();
+    for (payload, reason) in [
+        (r#"{"lines":[{"quantity":1,"unit price":2.5},{"quantity":-1,"unit price":1}]}"#, "$.lines[1].quantity"),
+        (r#"{"lines":[{"quantity":1,"unit price":"x"}]}"#, "$.lines[0]['unit price']"),
+        (r#"{"lines":[{"quantity":1}]}"#, "$.lines[0]"),
+        (r#"{"lines":{}}"#, "$.lines"),
+        ("{}", "$"),
+    ] {
+        let error = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.place", payload))).unwrap_err();
+        assert_eq!(error.details().unwrap()["reason"], json!(reason), "payload {payload}");
+    }
+    assert!(common::block_on(invoker.invoke(&Context::background(), Request::new("orders.place", r#"{"lines":[]}"#))).is_ok());
 }

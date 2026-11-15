@@ -19,6 +19,8 @@ exclude = [".github/", ".gitattributes", ".gitignore", ".gitmodules", ".editorco
 # JSON 编码（Result / Error 线上形态、XGI 载荷）与清单读取
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# 载荷不合法时报出错位置的 JSON 路径（RFC-0011 规则 2：reason 只写路径）
+serde_path_to_error = "0.1"
 # 追踪 ID 与 Span ID 的随机数
 getrandom = "0.3"
 

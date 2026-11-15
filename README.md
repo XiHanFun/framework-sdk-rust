@@ -13,7 +13,7 @@ xihan-framework = "0.1"
 | `manifest` | `xihan.manifest.json` 的模型、读取、规范化输出与校验，能力声明与依赖文本 | RFC-0002、`manifest/manifest.schema.json` |
 | `invocation` | `Context`：可等待、父子传播的 `CancellationToken`，后台定时器触发的截止时间，W3C 追踪、已登记的 Baggage、按类型存取的对象袋；超时与取消只按截止令牌归因为 `KERNEL_TIMEOUT_001` / `KERNEL_CANCELLED_001` | RFC-0003 |
 | `pipeline` | 十一阶段的 `Builder`：`use_middleware` / `use_at` / `use_named_instance`、`before` / `after`（中间件名或实例名）、`describe` / `dump` / `build`；排序规则与错误码 `KERNEL_PIPELINE_00x`；中间件与终点都是异步的 | RFC-0004 |
-| `operation` | `Contract`、`Schema`、异步 `Handler<Req, Res>`、容量 10000 的 `Registry`、经完整管道执行的 `Invoker`（XGI：JSON 请求与响应；另有不经 JSON 的类型化入口） | RFC-0011 |
+| `operation` | `Contract`、`Schema`、异步 `Handler<Req, Res>`、容量 10000 的 `Registry`、经完整管道执行的 `Invoker`（XGI：JSON 请求与响应；另有不经 JSON 的类型化入口）；内核错误的码、键、参数与 en-US 模板同向量 `kernel-messages.json`，载荷不合法的 `reason` 是 JSON 路径，中间件以成功短路而没有响应时报 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response` | RFC-0011 |
 
 ## 用法
 
@@ -98,6 +98,7 @@ assert_eq!(failed, r#"{"ok":false,"error":{"code":"ORDERS_CONFLICT_001","message
 | --- | --- |
 | `serde`（`derive`）、`serde_json` | `Result` / `Error` / `Maybe` 的线上编码、XGI 载荷编解码、清单读写；`serde_json::Value` 是错误细节与模板参数的值类型 |
 | `getrandom` | 追踪 ID 与 Span ID 的随机数 |
+| `serde_path_to_error` | 载荷不合法时给出出错位置的 JSON 路径（`$.lines[1].quantity`）：RFC-0011 规则 2 要求 `reason` 只写路径，`serde_json` 本身只报行列 |
 
 规范里的文法（错误码、消息键、Baggage 键、清单各字段、`traceparent` 等）是手写的逐字节判定，不依赖正则库；取消令牌与截止时间是自带的轻量实现，不依赖异步运行时。没有开发依赖：测试用自写的最小执行器运行 future。
 

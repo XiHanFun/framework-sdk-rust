@@ -4,10 +4,9 @@ use crate::grammar::{digit, upper, word};
 /// 原语参数非法（空 Code、空消息键、清单跨字段约束等）。
 pub const ERROR_CODE_INVALID_ARGUMENT: &str = "PRIMITIVES_VALIDATION_001";
 
-/// 使用了未初始化的结果。
+/// 使用了未初始化的结果；消息键 [`MESSAGE_UNINITIALIZED_RESULT`](super::MESSAGE_UNINITIALIZED_RESULT)。
 ///
-/// Rust 的 `Result` 没有未初始化的值；本码在调用器里表示「管道成功结束却没有执行处理器」，
-/// 即中间件以成功短路、没有交出响应。
+/// Rust 的 `Result` 没有缺省值或零值，SDK 不产生本码；保留供解码其他语言的错误与按键翻译。
 pub const ERROR_CODE_UNINITIALIZED_RESULT: &str = "PRIMITIVES_VALIDATION_002";
 
 /// 错误码的 KIND 段：校验失败。领域可以自定义其他 KIND。
