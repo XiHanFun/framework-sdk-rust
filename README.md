@@ -11,7 +11,7 @@ xihan-framework = "0.1"
 | --- | --- | --- |
 | `primitives` | `Error` / 错误码、`Result<T>`（标准库 `Result<T, Error>`）与线上编码 `WireResult`、`Maybe<T>`（`Option<T>`）、`TypedId<Tag, V>`、`LifecycleState`、`PipelineStage`、`Stability`、Baggage 键与值约束、消息键与模板、`Catalog` 与进程默认解析器、`FrameworkError` | RFC-0001、RFC-0010、`conventions/` |
 | `manifest` | `xihan.manifest.json` 的模型、读取、规范化输出与校验，能力声明与依赖文本 | RFC-0002、`manifest/manifest.schema.json` |
-| `invocation` | `Context`：可等待、父子传播的 `CancellationToken`，后台定时器触发的截止时间，W3C 追踪、已登记的 Baggage、按类型存取的对象袋；超时与取消只按截止令牌归因为 `KERNEL_TIMEOUT_001` / `KERNEL_CANCELLED_001` | RFC-0003 |
+| `invocation` | `Context`：可等待、父子传播的 `CancellationToken`，后台定时器触发的截止时间，W3C 追踪、已登记的 Baggage（构建与派生时丢弃已登记键里不合值约束的成员：空值、按 UTF-16 码元超过 256、含控制字符；幂等键除外）、按类型存取的对象袋；超时与取消只按截止令牌归因为 `KERNEL_TIMEOUT_001` / `KERNEL_CANCELLED_001` | RFC-0003 |
 | `pipeline` | 十一阶段的 `Builder`：`use_middleware` / `use_at` / `use_named_instance`、`before` / `after`（中间件名或实例名）、`describe` / `dump` / `build`；排序规则与错误码 `KERNEL_PIPELINE_00x`；中间件与终点都是异步的 | RFC-0004 |
 | `operation` | `Contract`、`Schema`、异步 `Handler<Req, Res>`、容量 10000 的 `Registry`、经完整管道执行的 `Invoker`（XGI：JSON 请求与响应；另有不经 JSON 的类型化入口）；内核错误的码、键、参数与 en-US 模板同向量 `kernel-messages.json`，载荷不合法的 `reason` 是 JSON 路径，中间件以成功短路而没有响应时报 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response` | RFC-0011 |
 

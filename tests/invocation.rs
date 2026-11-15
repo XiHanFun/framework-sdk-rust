@@ -9,7 +9,7 @@ use xihan_framework::invocation::{
     CancellationToken, Context, ERROR_CODE_CANCELLED, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_CANCELLED, MESSAGE_DEADLINE_BEFORE_START,
     MESSAGE_DEADLINE_EXCEEDED, TraceContext,
 };
-use xihan_framework::primitives::{BAGGAGE_CORRELATION, BAGGAGE_LOCALE, BAGGAGE_TENANT, ERROR_CODE_INVALID_ARGUMENT};
+use xihan_framework::primitives::{BAGGAGE_CORRELATION, BAGGAGE_IDEMPOTENCY_KEY, BAGGAGE_LOCALE, BAGGAGE_TENANT, ERROR_CODE_INVALID_ARGUMENT};
 
 /// 对象袋里按类型存取，测试用的新类型。
 #[derive(Debug, PartialEq)]
@@ -188,4 +188,34 @@ fn cancellation_errors_follow_kernel_messages() {
     let cancelled = Context::builder().cancellation(&caller).build();
     caller.cancel();
     common::assert_kernel_error(&cancelled.cancellation().unwrap(), MESSAGE_CANCELLED);
+}
+
+/// 已登记键里不合值约束的成员在构建与派生时丢弃，幂等键与未登记的键不按这条丢弃（conventions/baggage-keys.md）。
+#[test]
+fn unacceptable_baggage_values_are_dropped() {
+    let values = common::baggage_values();
+    for value in &values.acceptable {
+        let ctx = Context::builder().baggage(BAGGAGE_TENANT, value.as_str()).build();
+        assert_eq!(ctx.tenant(), Some(value.as_str()), "{value:?} must be kept");
+        assert_eq!(Context::background().with_baggage(BAGGAGE_CORRELATION, value.as_str()).correlation(), Some(value.as_str()));
+    }
+    for value in &values.unacceptable {
+        let ctx = Context::builder()
+            .baggage(BAGGAGE_TENANT, value.as_str())
+            .baggage(BAGGAGE_IDEMPOTENCY_KEY, value.as_str())
+            .baggage("xihan.note", value.as_str())
+            .build();
+        assert_eq!(ctx.tenant(), None, "{value:?} must be dropped");
+        assert_eq!(ctx.idempotency_key(), Some(value.as_str()), "the idempotency key is left to the idempotency stage");
+        assert_eq!(ctx.baggage().get("xihan.note").map(String::as_str), Some(value.as_str()), "unregistered keys are not checked");
+        let derived = correlated_context().with_baggage(BAGGAGE_CORRELATION, value.as_str());
+        assert_eq!(derived.correlation(), Some("c1"), "a derived context keeps the previous value");
+        assert_eq!(Context::background().with_baggage(BAGGAGE_LOCALE, value.as_str()).locale(), None);
+    }
+    // 同一个键以最后一次为准，最后一次不合即没有
+    assert_eq!(Context::builder().baggage(BAGGAGE_TENANT, "t1").baggage(BAGGAGE_TENANT, "a\nb").build().tenant(), None);
+}
+
+fn correlated_context() -> Context {
+    Context::builder().baggage(BAGGAGE_CORRELATION, "c1").build()
 }

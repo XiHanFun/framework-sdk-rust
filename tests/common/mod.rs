@@ -81,3 +81,20 @@ pub fn assert_kernel_error(error: &xihan_framework::primitives::Error, key: &str
     let text = xihan_framework::primitives::format_message(&expected.template, error.details().unwrap_or(&empty));
     assert_eq!(error.message(), text, "the en-US message of {key}");
 }
+
+/// 向量 `baggage-keys.json` 的 `values`：已登记键的值能否进入调用上下文。
+#[derive(serde::Deserialize)]
+pub struct BaggageValues {
+    pub acceptable: Vec<String>,
+    pub unacceptable: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct BaggageVectors {
+    values: BaggageValues,
+}
+
+/// Baggage 值的向量。
+pub fn baggage_values() -> BaggageValues {
+    vector::<BaggageVectors>("primitives/baggage-keys.json").values
+}

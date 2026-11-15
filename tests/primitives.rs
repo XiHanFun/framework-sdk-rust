@@ -51,6 +51,7 @@ struct BaggageKeyVectors {
     well_formed: Vec<String>,
     ill_formed: Vec<String>,
     registered: Vec<String>,
+    values: common::BaggageValues,
 }
 
 #[test]
@@ -67,6 +68,12 @@ fn baggage_keys_follow_the_vectors() {
         assert!(primitives::is_baggage_key_registered(key), "{key:?} must be registered");
     }
     assert!(!primitives::is_baggage_key_registered("xihan.feature-flag"));
+    for value in &vectors.values.acceptable {
+        assert!(primitives::is_baggage_value_acceptable(value), "{value:?} must be acceptable");
+    }
+    for value in &vectors.values.unacceptable {
+        assert!(!primitives::is_baggage_value_acceptable(value), "{value:?} must be unacceptable");
+    }
 }
 
 #[test]
