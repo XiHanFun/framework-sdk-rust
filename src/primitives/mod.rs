@@ -38,8 +38,8 @@ pub use framework::{DOCUMENTATION, FrameworkError, NAME, REPOSITORY, SDK_NAME, S
 pub use id::TypedId;
 pub use lifecycle::LifecycleState;
 pub use messages::{
-    Catalog, DEFAULT_LOCALE, Details, MESSAGE_KEY_MAX_LENGTH, MessageResolver, default_locale, describe, format_message, is_message_key, message_key_domain,
-    placeholders, positional, resolve_message, set_default_messages, try_format_message,
+    Catalog, DEFAULT_LOCALE, Details, MESSAGE_KEY_MAX_LENGTH, MessageResolver, default_locale, describe, format_message, format_value, is_message_key,
+    message_key_domain, placeholders, positional, resolve_message, set_default_messages, try_format_message,
 };
 pub use result::{Maybe, Result, WireResult, wire_result};
 pub use stability::Stability;

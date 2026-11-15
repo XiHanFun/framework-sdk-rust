@@ -179,7 +179,7 @@ fn error_messages_resolve_through_the_default_catalog() {
     assert_eq!(primitives::default_locale(), "en-US");
     assert_eq!(error.message(), "orders.missing (id=42)");
     assert!(common::panic_message(|| primitives::set_default_messages(None, Some("zh_CN"))).starts_with(ERROR_CODE_INVALID_ARGUMENT));
-    assert_eq!(primitives::format_message("{0} of {count:%03d}", &details(json!({"0": "a", "count": 7}))), "a of 007");
+    assert_eq!(primitives::format_message("{0} of {count:D3}", &details(json!({"0": "a", "count": 7}))), "a of 007");
     assert_eq!(primitives::format_message("{missing}", &Details::new()), "{missing}", "missing placeholders stay");
 }
 
@@ -356,4 +356,52 @@ fn framework_errors_convert_to_literal_errors() {
     assert_eq!(primitives::SDK_VERSION, env!("CARGO_PKG_VERSION"));
     assert_eq!(BAGGAGE_TENANT, "xihan.tenant");
     assert_eq!(BAGGAGE_CORRELATION, "xihan.correlation");
+}
+
+#[derive(Deserialize)]
+struct TemplateVectors {
+    keys: KeyCases,
+    format: Vec<FormatCase>,
+    describe: Vec<DescribeCase>,
+}
+
+#[derive(Deserialize)]
+struct KeyCases {
+    valid: Vec<String>,
+    invalid: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct FormatCase {
+    name: String,
+    template: String,
+    arguments: Option<Details>,
+    lenient: String,
+    strict: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DescribeCase {
+    key: String,
+    arguments: Option<Details>,
+    text: String,
+}
+
+#[test]
+fn message_templates_follow_the_vectors() {
+    let vectors: TemplateVectors = common::vector("primitives/message-templates.json");
+    for key in &vectors.keys.valid {
+        assert!(primitives::is_message_key(key), "{key:?} must be valid");
+    }
+    for key in &vectors.keys.invalid {
+        assert!(!primitives::is_message_key(key), "{key:?} must be invalid");
+    }
+    for case in &vectors.format {
+        let arguments = case.arguments.clone().unwrap_or_default();
+        assert_eq!(primitives::format_message(&case.template, &arguments), case.lenient, "lenient: {}", case.name);
+        assert_eq!(primitives::try_format_message(&case.template, &arguments), case.strict, "strict: {}", case.name);
+    }
+    for case in &vectors.describe {
+        assert_eq!(primitives::describe(&case.key, &case.arguments.clone().unwrap_or_default()), case.text, "{}", case.key);
+    }
 }

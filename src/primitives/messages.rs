@@ -116,11 +116,10 @@ pub fn placeholders(template: &str) -> Vec<String> {
     names
 }
 
-/// 宽松格式化：用参数填充模板，缺参数的占位符原样保留。
+/// 宽松格式化：用参数填充模板，缺参数的占位符连同格式说明符原样保留（RFC-0010「模板」）。
 ///
-/// `{name}` 取命名参数，`{0}` 取位置参数（键 `"0"`、`"1"`…，见 [`positional`]）；`{{`、`}}` 还原为单个花括号。
-/// 字符串原样输出，其他值输出 JSON 文本。`:format` 以 `%` 开头时按 printf 风格解释，支持标志 `-`、`+`、`0`、空格，
-/// 宽度、精度与动词 `d`、`x`、`X`、`f`、`s`、`v`（如 `{count:%03d}`）；其他写法或类型不合时按默认形式输出。
+/// `{name}` 取命名参数，`{0}` 取位置参数（键 `"0"`、`"1"`…，见 [`positional`]）；`{{`、`}}` 还原为单个花括号；参数存在而值为
+/// `null` 不算缺值，写成空串。值的文本形式与格式说明符见 [`format_value`]。
 pub fn format_message(template: &str, arguments: &Details) -> String {
     render(template, arguments, false).unwrap_or_default()
 }
@@ -155,97 +154,101 @@ fn render(template: &str, arguments: &Details, strict: bool) -> Option<String> {
     Some(output)
 }
 
-/// 按格式说明符输出一个值。
-fn format_value(value: &Value, format: Option<&str>) -> String {
-    format.filter(|format| format.starts_with('%')).and_then(|format| printf(format, value)).unwrap_or_else(|| display(value))
+/// 按格式说明符输出一个值（RFC-0010「模板」，按不变文化）。
+///
+/// 没有说明符时是值的文本形式：字符串原样，整数十进制，布尔 `true` / `false`，`null` 为空串，浮点写最短往返的十进制、
+/// 不用指数（`2.0` 写 `2`）；数组与对象写 JSON 文本（规范不作规定）。
+///
+/// 可移植的说明符（`n` 是可选的位数，最多三位数字）：
+///
+/// - `Dn`：整数，至少 n 位，不足补零，负号在前；`{n:D3}` 取 -7 得 `-007`。
+/// - `Xn` / `xn`：非负整数的十六进制，大写或小写，至少 n 位；`{n:x4}` 取 255 得 `00ff`。
+/// - `Fn`：定点小数，n 位小数，缺省 2。
+/// - `Nn`：带千分位（`,`）的定点小数，n 位小数，缺省 2，负号在前。
+///
+/// `F` 与 `N` 按值的精确十进制展开舍入，正好一半时取偶：0.125 写 `F2` 得 `0.12`，2.5 写 `F0` 得 `2`，2.675 写 `F2` 得 `2.67`。
+/// `D`、`F`、`N` 的小写与大写相同。其余说明符（如日期的 `yyyy-MM-dd`），以及 `D`、`X` 用在非整数、`X` 用在负数上，
+/// 都按没有说明符输出，不报错。
+pub fn format_value(value: &Value, format: Option<&str>) -> String {
+    format.and_then(|format| portable(format, value)).unwrap_or_else(|| display(value))
 }
 
-/// 值的默认文本：字符串原样，其他为 JSON 文本。
+/// 值的文本形式（无格式说明符时，`Describe` 同样适用）。
 pub(crate) fn display(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
+        Value::Null => String::new(),
+        Value::Bool(flag) => flag.to_string(),
+        Value::Number(number) => match (number.as_i64(), number.as_u64(), number.as_f64()) {
+            (Some(integer), ..) => integer.to_string(),
+            (None, Some(integer), _) => integer.to_string(),
+            // f64 的 Display 是能往返的最短十进制、不用指数，整数值不带小数点
+            (None, None, Some(float)) => float.to_string(),
+            _ => number.to_string(),
+        },
         other => other.to_string(),
     }
 }
 
-/// printf 风格的一个说明符 `%[flags][width][.precision]verb`；不支持的写法或类型不合时返回 `None`。
-fn printf(spec: &str, value: &Value) -> Option<String> {
-    let bytes = spec.as_bytes();
-    let (mut minus, mut plus, mut zero, mut space) = (false, false, false, false);
-    let mut index = 1;
-    while let Some(&flag) = bytes.get(index) {
-        match flag {
-            b'-' => minus = true,
-            b'+' => plus = true,
-            b'0' => zero = true,
-            b' ' => space = true,
-            _ => break,
-        }
-        index += 1;
-    }
-    let width_start = index;
-    while bytes.get(index).is_some_and(|&byte| digit(byte)) {
-        index += 1;
-    }
-    let width: usize = if index > width_start { spec[width_start..index].parse().ok()? } else { 0 };
-    let mut precision = None;
-    if bytes.get(index) == Some(&b'.') {
-        index += 1;
-        let precision_start = index;
-        while bytes.get(index).is_some_and(|&byte| digit(byte)) {
-            index += 1;
-        }
-        precision = Some(if index > precision_start { spec[precision_start..index].parse().ok()? } else { 0 });
-    }
-    // 说明符必须恰好以一个动词结束
-    if index + 1 != bytes.len() {
-        return None;
-    }
-    let positive_sign = if plus {
-        "+"
-    } else if space {
-        " "
-    } else {
-        ""
-    };
-    let (sign, body, numeric) = match bytes[index] {
-        verb @ (b'd' | b'x' | b'X') => {
-            let number = value.as_i64().map(i128::from).or_else(|| value.as_u64().map(i128::from))?;
-            let magnitude = number.unsigned_abs();
-            let body = match verb {
-                b'd' => magnitude.to_string(),
-                b'x' => format!("{magnitude:x}"),
-                _ => format!("{magnitude:X}"),
-            };
-            (if number < 0 { "-" } else { positive_sign }, body, true)
-        }
-        b'f' => {
-            let number = value.as_f64()?;
-            let text = format!("{:.*}", precision.unwrap_or(6), number);
-            match text.strip_prefix('-') {
-                Some(body) => ("-", body.to_owned(), true),
-                None => (positive_sign, text, true),
-            }
-        }
-        b's' | b'v' => {
-            let text = display(value);
-            let text = match precision {
-                Some(limit) => text.chars().take(limit).collect(),
-                None => text,
-            };
-            ("", text, false)
-        }
+/// 可移植的格式说明符；不认识的说明符或类型不合时返回 `None`，由调用方按无格式输出。
+fn portable(spec: &str, value: &Value) -> Option<String> {
+    let mut characters = spec.chars();
+    let letter = characters.next()?;
+    let digits = characters.as_str();
+    // 位数最多三位数字：说明符写错时不会为一个占位符分配巨大的缓冲
+    let precision: Option<usize> = match digits {
+        "" => None,
+        _ if digits.len() <= 3 && digits.bytes().all(digit) => Some(digits.parse().ok()?),
         _ => return None,
     };
-    let length = sign.chars().count() + body.chars().count();
-    let padding = width.saturating_sub(length);
-    Some(if minus {
-        format!("{sign}{body}{}", " ".repeat(padding))
-    } else if zero && numeric {
-        format!("{sign}{}{body}", "0".repeat(padding))
-    } else {
-        format!("{}{sign}{body}", " ".repeat(padding))
-    })
+    match letter {
+        'D' | 'd' => {
+            let number = integer(value)?;
+            let width = precision.unwrap_or(0);
+            Some(format!("{}{:0>width$}", if number < 0 { "-" } else { "" }, number.unsigned_abs()))
+        }
+        'X' | 'x' => {
+            let number = u128::try_from(integer(value)?).ok()?;
+            let width = precision.unwrap_or(0);
+            Some(if letter == 'X' { format!("{number:0width$X}") } else { format!("{number:0width$x}") })
+        }
+        'F' | 'f' => fixed(value, precision.unwrap_or(2)),
+        'N' | 'n' => fixed(value, precision.unwrap_or(2)).map(|text| group_thousands(&text)),
+        _ => None,
+    }
+}
+
+/// 整数值；浮点（即使是整数值）不算。
+fn integer(value: &Value) -> Option<i128> {
+    value.as_i64().map(i128::from).or_else(|| value.as_u64().map(i128::from))
+}
+
+/// 定点小数：整数按十进制补零位，浮点用 Rust 的定点格式化——它按精确的二进制值舍入、正好一半时取偶，与 .NET 一致。
+fn fixed(value: &Value, precision: usize) -> Option<String> {
+    if let Some(number) = integer(value) {
+        return Some(if precision == 0 { number.to_string() } else { format!("{number}.{}", "0".repeat(precision)) });
+    }
+    value.as_f64().map(|number| format!("{number:.precision$}"))
+}
+
+/// 给定点小数的整数部分加千分位：`-1234567.89` 得 `-1,234,567.89`。
+fn group_thousands(text: &str) -> String {
+    let (sign, unsigned) = match text.strip_prefix('-') {
+        Some(rest) => ("-", rest),
+        None => ("", text),
+    };
+    let (whole, fraction) = unsigned.split_at(unsigned.find('.').unwrap_or(unsigned.len()));
+    let mut grouped = String::with_capacity(text.len() + whole.len() / 3);
+    grouped.push_str(sign);
+    for (index, digit) in whole.chars().enumerate() {
+        // 从右往左每三位一组：剩下的位数是三的倍数时插入分组符
+        if index > 0 && (whole.len() - index) % 3 == 0 {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped.push_str(fraction);
+    grouped
 }
 
 /// 把位置参数转成以 `"0"`、`"1"`… 为键的参数表。
@@ -406,24 +409,28 @@ mod tests {
 
     #[test]
     fn templates_follow_rfc_0010() {
-        let values = arguments(json!({"0": "a", "count": 7, "name": "x", "price": 12.34567, "big": -255}));
-        assert_eq!(format_message("{0} of {count:%03d}", &values), "a of 007");
+        let values = arguments(json!({"0": "a", "count": 7, "name": "x", "price": 12.34567, "big": -255, "large": 18446744073709551615u64}));
+        assert_eq!(format_message("{0} of {count:D3}", &values), "a of 007");
         assert_eq!(format_message("{{name}} is {name}", &values), "{name} is x");
         assert_eq!(format_message("订单 {name} 不存在。}", &values), "订单 x 不存在。}");
         assert_eq!(format_message("}} {", &values), "} {");
         assert_eq!(format_message("{not valid} {_x} {name", &values), "{not valid} {_x} {name");
-        assert_eq!(format_message("{price:%.2f}|{price:%8.3f}|{count:%-4d}|{big:%x}|{count:%+d}", &values), "12.35|  12.346|7   |-ff|+7");
-        assert_eq!(format_message("{name:%5s}|{name:N2}|{count:%q}", &values), "    x|x|7");
+        assert_eq!(format_message("{price:F2}|{price:f3}|{price:N0}|{count:d}|{count:F0}|{large:X}", &values), "12.35|12.346|12|7|7|FFFFFFFFFFFFFFFF");
+        // 不支持的说明符与类型不合按无格式输出
+        assert_eq!(format_message("{name:N2}|{count:yyyy-MM-dd}|{big:X}|{price:D}|{count:D1000}|{count:%03d}", &values), "x|7|-255|12.34567|7|7");
         assert_eq!(format_message("{missing} {missing:N2}", &values), "{missing} {missing:N2}");
         assert_eq!(try_format_message("{missing}", &values), None);
         assert_eq!(try_format_message("{name}", &values).as_deref(), Some("x"));
         assert_eq!(placeholders("{a} {b:N2} {a} {{c}} {0}"), ["a", "b", "0"]);
+        assert_eq!(group_thousands("-1234567.89"), "-1,234,567.89");
+        assert_eq!(group_thousands("123"), "123");
+        assert_eq!(group_thousands("1000"), "1,000");
     }
 
     #[test]
     fn describe_sorts_arguments() {
         assert_eq!(describe("orders.failed", &Details::new()), "orders.failed");
-        assert_eq!(describe("orders.failed", &arguments(json!({"z": true, "a": 1, "m": "x", "n": null}))), "orders.failed (a=1, m=x, n=null, z=true)");
+        assert_eq!(describe("orders.failed", &arguments(json!({"z": true, "a": 1, "m": "x", "n": null}))), "orders.failed (a=1, m=x, n=, z=true)");
         assert_eq!(positional(["a", "b"]), arguments(json!({"0": "a", "1": "b"})));
     }
 
