@@ -2,41 +2,49 @@ use std::fmt;
 
 use crate::grammar::lower_hex;
 
-/// W3C Trace Context 的一段：追踪 ID、Span ID 与采样标志（RFC-0003「追踪」）。
+/// W3C trace-flags 的采样位。
+const SAMPLED: u8 = 0x01;
+
+/// W3C Trace Context 的一段：追踪 ID、Span ID 与 trace-flags（RFC-0003「追踪」）。
+///
+/// 标志为空表示没有上游，这次调用是链路的根（[`TraceContext::generate`]）；写出的 `traceparent` 总带两位十六进制的标志，
+/// 标志为空时写 `01`，即按已采样传下去，由下游的采样器决定。上游给的标志原样保留，是否采样只看最低位。
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TraceContext {
     trace_id: String,
     span_id: String,
-    sampled: bool,
+    flags: Option<u8>,
 }
 
 impl TraceContext {
-    /// 用追踪 ID（32 位小写十六进制）与 Span ID（16 位小写十六进制）创建；格式不对或全零时为 `None`。
+    /// 用追踪 ID（32 位小写十六进制）、Span ID（16 位小写十六进制）与采样决定创建；格式不对或全零时为 `None`。
     pub fn new(trace_id: impl Into<String>, span_id: impl Into<String>, sampled: bool) -> Option<Self> {
-        let (trace_id, span_id) = (trace_id.into(), span_id.into());
-        (is_id(&trace_id, 32) && is_id(&span_id, 16)).then_some(Self { trace_id, span_id, sampled })
+        Self::with_flags(trace_id, span_id, Some(if sampled { SAMPLED } else { 0 }))
     }
 
-    /// 解析 W3C `traceparent`：`version-traceid-spanid-flags`；不合法时为 `None`。
-    ///
-    /// 采样取标志的最低位（W3C trace-flags），其余标志位不保留。
+    /// 用追踪 ID、Span ID 与 trace-flags 创建；`flags` 为 `None` 表示没有上游的采样决定。格式不对或全零时为 `None`。
+    pub fn with_flags(trace_id: impl Into<String>, span_id: impl Into<String>, flags: Option<u8>) -> Option<Self> {
+        let (trace_id, span_id) = (trace_id.into(), span_id.into());
+        (is_id(&trace_id, 32) && is_id(&span_id, 16)).then_some(Self { trace_id, span_id, flags })
+    }
+
+    /// 解析 W3C `traceparent`：`version-traceid-spanid-flags`；不合法时为 `None`。标志的全部位原样保留。
     pub fn parse(trace_parent: &str) -> Option<Self> {
         let mut parts = trace_parent.split('-');
         let (version, trace_id, span_id, flags) = (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
         if parts.next().is_some() || !is_hex(version, 2) || !is_hex(flags, 2) {
             return None;
         }
-        let sampled = u8::from_str_radix(flags, 16).ok()? & 0x01 == 0x01;
-        Self::new(trace_id, span_id, sampled)
+        Self::with_flags(trace_id, span_id, Some(u8::from_str_radix(flags, 16).ok()?))
     }
 
-    /// 生成新的追踪：随机的追踪 ID 与 Span ID，标记为已采样。
+    /// 生成新的追踪：随机的追踪 ID 与 Span ID，没有上游的标志（链路的根）。
     ///
     /// # Panics
     ///
     /// 操作系统的随机数源不可用时 panic。
     pub fn generate() -> Self {
-        Self { trace_id: new_trace_id(), span_id: new_span_id(), sampled: true }
+        Self { trace_id: new_trace_id(), span_id: new_span_id(), flags: None }
     }
 
     /// 追踪 ID：32 位小写十六进制。
@@ -49,12 +57,17 @@ impl TraceContext {
         &self.span_id
     }
 
-    /// 是否采样。
-    pub fn is_sampled(&self) -> bool {
-        self.sampled
+    /// trace-flags；没有上游时为 `None`。
+    pub fn flags(&self) -> Option<u8> {
+        self.flags
     }
 
-    /// W3C `traceparent`：`00-<trace>-<span>-<01|00>`。
+    /// 是否采样：标志的最低位；没有上游的标志时按已采样。
+    pub fn is_sampled(&self) -> bool {
+        self.flags.is_none_or(|flags| flags & SAMPLED == SAMPLED)
+    }
+
+    /// W3C `traceparent`：`00-<trace>-<span>-<flags>`，标志为空时写 `01`。
     pub fn trace_parent(&self) -> String {
         self.to_string()
     }
@@ -62,7 +75,7 @@ impl TraceContext {
 
 impl fmt::Display for TraceContext {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "00-{}-{}-{}", self.trace_id, self.span_id, if self.sampled { "01" } else { "00" })
+        write!(formatter, "00-{}-{}-{:02x}", self.trace_id, self.span_id, self.flags.unwrap_or(SAMPLED))
     }
 }
 

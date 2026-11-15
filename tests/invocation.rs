@@ -219,3 +219,23 @@ fn unacceptable_baggage_values_are_dropped() {
 fn correlated_context() -> Context {
     Context::builder().baggage(BAGGAGE_CORRELATION, "c1").build()
 }
+
+/// 写出的 traceparent 总带标志：没有上游时写 01，上游给的标志全部位原样写出，采样只看最低位（RFC-0003 规则 7）。
+#[test]
+fn trace_flags_are_written_as_received() {
+    let root = Context::background();
+    assert_eq!(root.trace().flags(), None, "a generated trace has no upstream flags");
+    assert!(root.trace().is_sampled());
+    assert!(root.trace_parent().ends_with("-01"), "{}", root.trace_parent());
+
+    for (flags, sampled) in [("00", false), ("01", true), ("02", false), ("03", true), ("ff", true)] {
+        let header = format!("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-{flags}");
+        let ctx = Context::builder().trace_parent(&header).build();
+        assert_eq!((ctx.trace_parent(), ctx.trace().is_sampled()), (header.clone(), sampled), "{flags}");
+        assert_eq!(ctx.trace().flags(), Some(u8::from_str_radix(flags, 16).unwrap()));
+    }
+    let unsampled = TraceContext::new("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", false).unwrap();
+    assert_eq!(unsampled.trace_parent(), "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00");
+    let unknown = TraceContext::with_flags("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", None).unwrap();
+    assert!(unknown.trace_parent().ends_with("-01") && unknown.is_sampled());
+}
