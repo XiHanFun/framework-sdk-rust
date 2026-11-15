@@ -30,6 +30,11 @@ pub const SPEC_VERSION: &str = primitives::SPEC_VERSION;
 /// 实现时写 `Box::pin(async move { … })`。
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// README 里的 Rust 示例作为文档测试编译运行，保证示例与 API 一致。
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
