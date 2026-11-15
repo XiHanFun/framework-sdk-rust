@@ -22,6 +22,11 @@ pub(crate) fn lower_digit(byte: u8) -> bool {
     lower(byte) || digit(byte)
 }
 
+/// 小写十六进制 `[0-9a-f]`。
+pub(crate) fn lower_hex(byte: u8) -> bool {
+    digit(byte) || (b'a'..=b'f').contains(&byte)
+}
+
 /// 小写字母、数字或连字符 `[a-z0-9-]`。
 pub(crate) fn lower_digit_hyphen(byte: u8) -> bool {
     lower_digit(byte) || byte == b'-'

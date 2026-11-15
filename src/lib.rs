@@ -12,6 +12,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 mod grammar;
+pub mod invocation;
 pub mod manifest;
 pub mod primitives;
 

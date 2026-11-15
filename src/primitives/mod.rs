@@ -33,6 +33,7 @@ pub use error_code::{
     ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_UNINITIALIZED_RESULT, KIND_CANCELLED, KIND_CONFLICT, KIND_DENIED, KIND_NOT_FOUND, KIND_TIMEOUT, KIND_UNAVAILABLE,
     KIND_UNEXPECTED, KIND_VALIDATION, error_code_domain, error_code_kind, is_error_code, validate_error_code,
 };
+pub(crate) use framework::invalid_argument;
 pub use framework::{DOCUMENTATION, FrameworkError, NAME, REPOSITORY, SDK_NAME, SDK_VERSION, SPEC_VERSION};
 pub use id::TypedId;
 pub use lifecycle::LifecycleState;
