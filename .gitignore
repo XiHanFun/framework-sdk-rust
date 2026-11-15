@@ -1,8 +1,11 @@
+# Cargo 构建产物；库 crate 不提交锁文件
+/target/
+Cargo.lock
+**/*.rs.bk
+
 # 编辑器
 .idea/
 .vs/
 .vscode/
 *.swp
 .DS_Store
-/target/
-Cargo.lock

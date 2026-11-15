@@ -1,19 +1,26 @@
 [package]
 name = "xihan-framework"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2024"
+# edition 2024 需要 1.85；clippy 的 incompatible_msrv 按这里核对标准库 API
 rust-version = "1.85"
-description = "XiHan Framework SDK for Rust: primitives, manifest, invocation context, pipeline and plugin runtimes (placeholder release; implementation planned)."
+description = "XiHan Framework SDK for Rust: primitives, manifest, invocation context, pipeline and operations."
 license = "MIT"
 repository = "https://github.com/XiHanFun/framework-sdk-rust"
 homepage = "https://framework.xihanfun.com"
 documentation = "https://docs.rs/xihan-framework"
 readme = "README.md"
-keywords = ["xihan", "framework", "plugin", "wasm"]
+keywords = ["xihan", "framework", "plugin", "pipeline"]
 categories = ["development-tools"]
-exclude = [".github/", ".gitattributes", ".gitignore"]
+# 规范 submodule 与读取它的一致性测试不进 crate 包
+exclude = [".github/", ".gitattributes", ".gitignore", ".gitmodules", ".editorconfig", "/spec", "/tests"]
 
 [dependencies]
+# JSON 编码（Result / Error 线上形态、XGI 载荷）与清单读取
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 追踪 ID 与 Span ID 的随机数
+getrandom = "0.3"
 
 [lints.rust]
 unsafe_code = "forbid"
