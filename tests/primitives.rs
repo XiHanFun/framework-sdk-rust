@@ -202,8 +202,10 @@ fn error_wire_encoding() {
 
     let rejected = serde_json::from_str::<Error>(r#"{"code":"bad"}"#).unwrap_err().to_string();
     assert!(rejected.contains(ERROR_CODE_INVALID_ARGUMENT), "an invalid code on the wire must be rejected: {rejected}");
-    let minimal: Error = serde_json::from_str(r#"{"code":"ORDERS_CONFLICT_001","extra":1}"#).unwrap();
-    assert_eq!((minimal.text(), minimal.message()), (None, "ORDERS_CONFLICT_001".to_owned()), "unknown fields are ignored");
+    let minimal: Error = serde_json::from_str(r#"{"code":"ORDERS_CONFLICT_001","message":"stale","extra":1}"#).unwrap();
+    assert_eq!((minimal.text(), minimal.message_key()), (Some("stale"), None), "unknown fields are ignored");
+    assert!(serde_json::from_str::<Error>(r#"["ORDERS_CONFLICT_001","stale"]"#).is_err(), "the array form of a struct is rejected");
+    assert!(serde_json::from_str::<Error>(r#"{"code":"ORDERS_CONFLICT_001","message":"a","message":"b"}"#).is_err(), "duplicate members are rejected");
     assert_eq!(
         serde_json::to_string(&Error::literal("ORDERS_CONFLICT_001", "stale").with_details(Details::new())).unwrap(),
         r#"{"code":"ORDERS_CONFLICT_001","message":"stale"}"#
@@ -220,19 +222,20 @@ fn result_wire_encoding() {
     let decoded: WireResult<Details> = serde_json::from_str(&data).unwrap();
     assert_eq!(decoded.into_inner().unwrap_err().code(), "ORDERS_CONFLICT_001");
 
-    // 不带值的成功与 .NET 非泛型 Result 一致；Go 写出的 {"value":{}} 也接受
+    // 不带值的成功只写 {"ok":true}（RFC-0001「Result」）
     assert_eq!(serde_json::to_string(&WireResult(Ok(()))).unwrap(), r#"{"ok":true}"#);
-    for text in [r#"{"ok":true}"#, r#"{"ok":true,"value":{}}"#, r#"{"ok":true,"value":null}"#] {
-        assert!(serde_json::from_str::<WireResult<()>>(text).unwrap().0.is_ok(), "{text}");
-    }
-    assert_eq!(serde_json::from_str::<WireResult<Option<u32>>>(r#"{"ok":true}"#).unwrap().0.unwrap(), None);
+    assert!(serde_json::from_str::<WireResult<()>>(r#"{"ok":true}"#).unwrap().0.is_ok());
+    assert_eq!(serde_json::from_str::<WireResult<Option<u32>>>(r#"{"ok":true,"value":null}"#).unwrap().0.unwrap(), None);
+    assert_eq!(serde_json::to_string(&WireResult(Ok(None::<u32>))).unwrap(), r#"{"ok":true,"value":null}"#);
     assert_eq!(serde_json::from_str::<WireResult<u32>>(r#"{"ok":true,"value":5,"extra":[1]}"#).unwrap().0.unwrap(), 5);
     for (text, fragment) in [
         (r#"{"ok":true}"#, "missing field `value`"),
         (r#"{"value":1}"#, "missing field `ok`"),
         (r#"{"ok":false}"#, "A failed result on the wire needs an error."),
-        (r#"{"ok":false,"error":null}"#, "A failed result on the wire needs an error."),
+        (r#"{"ok":false,"error":null}"#, "expected an error object"),
+        (r#"{"ok":true,"value":null}"#, "must not be null unless the value type is a Maybe"),
         (r#"{"ok":true,"ok":true,"value":1}"#, "duplicate field `ok`"),
+        (r#"[true,1]"#, "expected a result object"),
     ] {
         let error = serde_json::from_str::<WireResult<u32>>(text).unwrap_err().to_string();
         assert!(error.contains(fragment), "{text}: {error}");
@@ -243,6 +246,70 @@ fn result_wire_encoding() {
     let bound: Result<i32> = Err::<i32, _>(Error::literal("ORDERS_CONFLICT_001", "stale"))
         .and_then(|value: i32| value.checked_mul(2).ok_or_else(|| Error::literal("ORDERS_CONFLICT_001", "overflow")));
     assert!(bound.is_err(), "and_then propagates failures");
+}
+
+#[derive(Deserialize)]
+struct WireVectors {
+    results: WireCases<ResultCase>,
+    errors: WireCases<ErrorCase>,
+}
+
+#[derive(Deserialize)]
+struct WireCases<T> {
+    valid: Vec<T>,
+    invalid: Vec<T>,
+}
+
+#[derive(Deserialize)]
+struct ResultCase {
+    name: String,
+    kind: String,
+    json: serde_json::Value,
+    #[serde(default)]
+    canonical: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ErrorCase {
+    name: String,
+    json: serde_json::Value,
+    #[serde(default)]
+    canonical: Option<serde_json::Value>,
+}
+
+/// 从线上文本读入再写出，返回写出的 JSON 值；读不出时返回错误文本。
+fn round_trip<T: serde::de::DeserializeOwned + serde::Serialize>(json: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
+    let decoded: T = serde_json::from_str(&json.to_string()).map_err(|error| error.to_string())?;
+    Ok(serde_json::to_value(&decoded).unwrap())
+}
+
+fn round_trip_result(kind: &str, json: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
+    match kind {
+        "value" => round_trip::<WireResult<serde_json::Value>>(json),
+        "unit" => round_trip::<WireResult<()>>(json),
+        "maybe" => round_trip::<WireResult<Option<serde_json::Value>>>(json),
+        other => panic!("unknown result kind {other:?}"),
+    }
+}
+
+#[test]
+fn wire_encoding_follows_the_vectors() {
+    let _guard = default_messages();
+    let vectors: WireVectors = common::vector("primitives/wire-encoding.json");
+    for case in &vectors.results.valid {
+        let written = round_trip_result(&case.kind, &case.json).unwrap_or_else(|error| panic!("{} must be read: {error}", case.name));
+        assert_eq!(&written, case.canonical.as_ref().unwrap_or(&case.json), "{}", case.name);
+    }
+    for case in &vectors.results.invalid {
+        assert!(round_trip_result(&case.kind, &case.json).is_err(), "{} must be rejected", case.name);
+    }
+    for case in &vectors.errors.valid {
+        let written = round_trip::<Error>(&case.json).unwrap_or_else(|error| panic!("{} must be read: {error}", case.name));
+        assert_eq!(&written, case.canonical.as_ref().unwrap_or(&case.json), "{}", case.name);
+    }
+    for case in &vectors.errors.invalid {
+        assert!(round_trip::<Error>(&case.json).is_err(), "{} must be rejected", case.name);
+    }
 }
 
 #[test]

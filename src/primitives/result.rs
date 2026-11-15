@@ -2,7 +2,7 @@ use std::any::TypeId;
 use std::fmt;
 use std::marker::PhantomData;
 
-use serde::de::{self, IgnoredAny, MapAccess, Visitor};
+use serde::de::{self, DeserializeSeed, IgnoredAny, MapAccess, Visitor};
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -22,8 +22,12 @@ pub type Maybe<T> = Option<T>;
 
 /// [`Result`] 的线上编码包装：`{"ok":true,"value":…}` 或 `{"ok":false,"error":{…}}`。
 ///
-/// 不带值的成功（`Result<()>`）编码为 `{"ok":true}`，与 .NET 非泛型 `Result` 一致；读入时忽略它的 `value`。
-/// 读入时未知字段忽略；`ok` 为假而没有 `error`、或 `ok` 为真而缺少 `value`（`Option` 值除外）都是错误。
+/// 读写规则见 RFC-0001「Result」与向量 `wire-encoding.json`：
+///
+/// - 不带值的成功（`Result<()>`）只写 `{"ok":true}`；读入时带了 `value` 即不合法，`{}` 与 `null` 也一样。
+/// - 有值成功的 `value` 必填；值类型是 `Maybe`（`Option`）时无值写 `null`，其他类型的 `value` 不能是 `null`。
+/// - 失败的 `error` 必填且不能是 `null`；失败不能带 `value`，成功不能带 `error`。
+/// - 只收 JSON 对象；未知成员忽略。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WireResult<T>(pub Result<T>);
 
@@ -93,37 +97,91 @@ where
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> std::result::Result<Result<T>, A::Error> {
-        let (mut ok, mut value, mut error) = (None, None, None::<Option<Error>>);
+        let (mut ok, mut value, mut error) = (None, None, None::<Error>);
         while let Some(key) = map.next_key::<String>()? {
             match key.as_str() {
                 "ok" if ok.is_some() => return Err(de::Error::duplicate_field("ok")),
                 "ok" => ok = Some(map.next_value::<bool>()?),
+                // 无值成功只写 {"ok":true}：带了 value 即不合法，{} 与 null 也一样
+                "value" if is_unit::<T>() => return Err(invalid("A result without a value must not carry 'value'.")),
                 "value" if value.is_some() => return Err(de::Error::duplicate_field("value")),
-                // 不带值的成功不看 value：Go 写成 {}，.NET 省略，都接受
-                "value" if is_unit::<T>() => {
-                    map.next_value::<IgnoredAny>()?;
-                    value = Some(None);
-                }
-                "value" => value = Some(Some(map.next_value::<T>()?)),
+                "value" => value = Some(map.next_value_seed(PresentValue::<T>(PhantomData))?),
                 "error" if error.is_some() => return Err(de::Error::duplicate_field("error")),
-                "error" => error = Some(map.next_value::<Option<Error>>()?),
+                // null 读不成 Error：失败的 error 写成 null 不合法
+                "error" => error = Some(map.next_value::<Error>()?),
                 _ => {
                     map.next_value::<IgnoredAny>()?;
                 }
             }
         }
-        match ok {
-            None => Err(de::Error::missing_field("ok")),
-            Some(false) => match error.flatten() {
-                Some(error) => Ok(Err(error)),
-                None => Err(de::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: A failed result on the wire needs an error."))),
-            },
-            Some(true) => match value.flatten() {
-                Some(value) => Ok(Ok(value)),
-                // 缺少 value：`()` 与 `Option` 可以从「无」得到值，其他类型即缺字段
-                None => T::deserialize(de::value::UnitDeserializer::<A::Error>::new()).map(Ok).map_err(|_: A::Error| de::Error::missing_field("value")),
-            },
+        match (ok, value, error) {
+            (None, ..) => Err(de::Error::missing_field("ok")),
+            (Some(false), Some(_), _) => Err(invalid("A failed result must not carry 'value'.")),
+            (Some(false), None, Some(error)) => Ok(Err(error)),
+            (Some(false), None, None) => Err(invalid("A failed result on the wire needs an error.")),
+            (Some(true), _, Some(_)) => Err(invalid("A successful result must not carry 'error'.")),
+            (Some(true), Some(value), None) => Ok(Ok(value)),
+            // 无值成功的值从「单元」得到
+            (Some(true), None, None) if is_unit::<T>() => T::deserialize(de::value::UnitDeserializer::<A::Error>::new()).map(Ok),
+            (Some(true), None, None) => Err(de::Error::missing_field("value")),
         }
+    }
+}
+
+/// 线上编码的读入错误：`PRIMITIVES_VALIDATION_001` 加英文说明。
+fn invalid<E: de::Error>(message: &str) -> E {
+    E::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: {message}"))
+}
+
+/// 读入 `value`：`null` 只能是 `Maybe`（`Option`）的无值，其他类型的 `value` 不能是 `null`。
+struct PresentValue<T>(PhantomData<T>);
+
+impl<'de, T: Deserialize<'de>> DeserializeSeed<'de> for PresentValue<T> {
+    type Value = T;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> std::result::Result<T, D::Error> {
+        deserializer.deserialize_option(self)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Visitor<'de> for PresentValue<T> {
+    type Value = T;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the value of a successful result")
+    }
+
+    fn visit_none<E: de::Error>(self) -> std::result::Result<T, E> {
+        // 只有 Option 会以 deserialize_option 接住「无」，其他类型（含 serde_json::Value）在这里失败
+        T::deserialize(OnlyNone(PhantomData))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> std::result::Result<T, E> {
+        self.visit_none()
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> std::result::Result<T, D::Error> {
+        T::deserialize(deserializer)
+    }
+}
+
+/// 只表示「无」的反序列化器：`deserialize_option` 给出 `None`，其余一律失败。
+struct OnlyNone<E>(PhantomData<E>);
+
+impl<'de, E: de::Error> Deserializer<'de> for OnlyNone<E> {
+    type Error = E;
+
+    fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> std::result::Result<V::Value, E> {
+        Err(invalid("The value of a successful result must not be null unless the value type is a Maybe."))
+    }
+
+    fn deserialize_option<V: Visitor<'de>>(self, visitor: V) -> std::result::Result<V::Value, E> {
+        visitor.visit_none()
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes byte_buf unit unit_struct newtype_struct seq tuple
+        tuple_struct map struct enum identifier ignored_any
     }
 }
 

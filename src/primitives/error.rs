@@ -1,7 +1,7 @@
 use std::error::Error as StdError;
 use std::fmt;
 
-use serde::de::Error as _;
+use serde::de::{self, Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
@@ -265,33 +265,60 @@ impl Serialize for Error {
     }
 }
 
-/// 线上编码的读入形态；未知字段忽略。
-#[derive(Deserialize)]
-struct ErrorIn {
-    code: String,
-    #[serde(default)]
-    message: Option<String>,
-    #[serde(rename = "messageKey", default)]
-    message_key: Option<String>,
-    #[serde(default)]
-    details: Option<Details>,
-    #[serde(default)]
-    inner: Option<Box<Error>>,
+/// 逐成员读入线上编码（RFC-0001「Result」）：只收 JSON 对象，未知成员忽略，可选成员写成 `null` 不合法。
+struct ErrorVisitor;
+
+/// 记下一个成员的值；同一成员出现两次即不合法。
+fn set_once<T, E: de::Error>(slot: &mut Option<T>, value: T, name: &'static str) -> Result<(), E> {
+    if slot.replace(value).is_some() {
+        return Err(E::duplicate_field(name));
+    }
+    Ok(())
+}
+
+impl<'de> Visitor<'de> for ErrorVisitor {
+    type Value = Error;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(r#"an error object {"code":…,"message":…}"#)
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Error, A::Error> {
+        let (mut code, mut message, mut message_key, mut details, mut inner) = (None, None, None, None::<Details>, None::<Error>);
+        while let Some(name) = map.next_key::<String>()? {
+            // 各成员按类型读入：null 读不成字符串、对象或 Error，因此可选成员写成 null 也被拒绝
+            match name.as_str() {
+                "code" => set_once(&mut code, map.next_value::<String>()?, "code")?,
+                "message" => set_once(&mut message, map.next_value::<String>()?, "message")?,
+                "messageKey" => set_once(&mut message_key, map.next_value::<String>()?, "messageKey")?,
+                "details" => set_once(&mut details, map.next_value::<Details>()?, "details")?,
+                "inner" => set_once(&mut inner, map.next_value::<Error>()?, "inner")?,
+                _ => {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        let code = code.ok_or_else(|| A::Error::missing_field("code"))?;
+        if !is_error_code(&code) {
+            return Err(A::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: The error code '{code}' must match <DOMAIN>_<KIND>_<NNN>.")));
+        }
+        let message = message.ok_or_else(|| A::Error::missing_field("message"))?;
+        if message.is_empty() {
+            return Err(A::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: The message of the error '{code}' must not be empty.")));
+        }
+        if let Some(key) = message_key.as_deref().filter(|key| !is_message_key(key)) {
+            return Err(A::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: The message key '{key}' must match <domain>.<segment>[.<segment>].")));
+        }
+        Ok(Error { code, message_key, text: Some(message), details, inner: inner.map(Box::new) })
+    }
 }
 
 impl<'de> Deserialize<'de> for Error {
-    /// 从线上编码还原：`message` 成为已解析文案；错误码不合文法时整体失败。消息键原样保留，只用于再翻译。
+    /// 从线上编码还原：`message` 成为已解析文案，消息键原样保留、只用于再翻译。
+    ///
+    /// `code` 与非空的 `message` 必填；`messageKey`、`details`、`inner` 写了就必须合文法、是对象、是 Error，
+    /// 写成 `null` 不合法；未知成员忽略；不是 JSON 对象（含数组形式）即失败。
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let wire = ErrorIn::deserialize(deserializer)?;
-        if !is_error_code(&wire.code) {
-            return Err(D::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: The error code '{}' must match <DOMAIN>_<KIND>_<NNN>.", wire.code)));
-        }
-        Ok(Self {
-            code: wire.code,
-            message_key: wire.message_key.filter(|key| !key.is_empty()),
-            text: wire.message.filter(|text| !text.is_empty()),
-            details: wire.details,
-            inner: wire.inner,
-        })
+        deserializer.deserialize_map(ErrorVisitor)
     }
 }
