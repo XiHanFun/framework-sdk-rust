@@ -14,6 +14,7 @@ use std::pin::Pin;
 mod grammar;
 pub mod invocation;
 pub mod manifest;
+pub mod operation;
 pub mod pipeline;
 pub mod primitives;
 
@@ -25,7 +26,7 @@ pub const SPEC_VERSION: &str = primitives::SPEC_VERSION;
 
 /// 装箱的、可跨线程发送的 future：中间件、管道步骤与操作处理器的返回类型。
 ///
-/// 用装箱的 trait 对象而不是关联类型，让中间件、管道步骤与处理器的 trait 可以作为 `dyn` 使用；
+/// 用装箱的 trait 对象而不是关联类型，让 [`pipeline::Middleware`]、[`pipeline::Step`] 与 [`operation::Handler`] 可以作为 `dyn` 使用；
 /// 实现时写 `Box::pin(async move { … })`。
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
