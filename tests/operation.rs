@@ -269,3 +269,34 @@ fn invalid_payload_reasons_are_json_paths() {
     }
     assert!(common::block_on(invoker.invoke(&Context::background(), Request::new("orders.place", r#"{"lines":[]}"#))).is_ok());
 }
+
+/// 中间件或处理器 panic 时调用以 KERNEL_UNEXPECTED_001 结束（RFC-0011 规则 5），对象袋恢复成调用前的样子。
+#[test]
+fn panics_become_unexpected_errors() {
+    let crashing = Registry::new();
+    crashing
+        .add(
+            Contract::new("orders.crash"),
+            operation::handler_fn(|_ctx, request: CreateOrder| {
+                Box::pin(async move {
+                    assert!(request.quantity >= 0, "the handler crashed");
+                    Ok(())
+                })
+            }),
+        )
+        .unwrap();
+    let invoker = Invoker::new(Arc::new(crashing), &Builder::new()).unwrap();
+    let ctx = Context::background();
+    let crashed = common::block_on(invoker.invoke(&ctx, Request::new("orders.crash", r#"{"quantity":-1}"#))).unwrap_err();
+    assert_eq!((crashed.code(), crashed.message_key(), crashed.details()), ("KERNEL_UNEXPECTED_001", Some(operation::MESSAGE_UNHANDLED_PANIC), None));
+    assert_eq!(crashed.message(), "An unhandled exception occurred during the invocation.");
+    assert!(operation::current(&ctx).is_none(), "the scope is restored after a panic");
+    let typed = common::block_on(invoker.invoke_typed::<CreateOrder, ()>(&ctx, "orders.crash", CreateOrder { quantity: -1 })).unwrap_err();
+    assert_eq!(typed.message_key(), Some(operation::MESSAGE_UNHANDLED_PANIC));
+    assert!(common::block_on(invoker.invoke(&ctx, Request::new("orders.crash", r#"{"quantity":1}"#))).is_ok(), "the invoker keeps working");
+
+    let explode = pipeline::from_fn("Explode", |_ctx, _next| Box::pin(async { panic!("the middleware crashed") }));
+    let invoker = Invoker::new(registry(), &Builder::new().use_at(explode, PipelineStage::Observe, Placement::End, APP_OWNER)).unwrap();
+    let crashed = common::block_on(invoker.invoke(&ctx, Request::new("orders.create", r#"{"quantity":1}"#))).unwrap_err();
+    assert_eq!(crashed.message_key(), Some(operation::MESSAGE_UNHANDLED_PANIC));
+}

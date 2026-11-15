@@ -27,7 +27,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
+use std::panic::{self, AssertUnwindSafe};
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
+use std::task::Poll;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -65,6 +68,8 @@ pub const MESSAGE_NO_RESPONSE: &str = "kernel.operation.no_response";
 pub const MESSAGE_DUPLICATE: &str = "kernel.operation.duplicate";
 /// 操作登记表已满的消息键；参数 `capacity`。
 pub const MESSAGE_REGISTRY_FULL: &str = "kernel.operation.registry_full";
+/// 中间件或处理器在调用期间 panic 的消息键（与 .NET 的未处理异常同键）；没有参数。
+pub const MESSAGE_UNHANDLED_PANIC: &str = "kernel.invocation.unhandled_exception";
 
 /// 登记表的容量。
 pub const CAPACITY: usize = 10_000;
@@ -524,6 +529,24 @@ where
     }
 }
 
+/// 管道执行中的 panic 转成失败结果（RFC-0011 规则 5）：中间件或处理器 panic 时调用以 `KERNEL_UNEXPECTED_001` +
+/// `kernel.invocation.unhandled_exception` 结束，不把 panic 抛给调用方。
+///
+/// 只在 `panic = "unwind"` 下有效；panic 之后不再轮询内层 future，对象袋的作用域照常由 `Scope` 恢复。
+struct CatchPanic<'a>(BoxFuture<'a, Result<()>>);
+
+impl Future for CatchPanic<'_> {
+    type Output = Result<()>;
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut std::task::Context<'_>) -> Poll<Result<()>> {
+        // AssertUnwindSafe：panic 之后内层 future 只会被丢弃，不会再被轮询，它里面可能半改的状态不会再被读到
+        match panic::catch_unwind(AssertUnwindSafe(|| self.0.as_mut().poll(context))) {
+            Ok(poll) => poll,
+            Err(_) => Poll::Ready(Err(Error::unexpected(ERROR_CODE_UNEXPECTED, MESSAGE_UNHANDLED_PANIC))),
+        }
+    }
+}
+
 /// 让操作经过完整管道执行。
 pub struct Invoker {
     registry: Arc<Registry>,
@@ -561,7 +584,7 @@ impl Invoker {
             let request = Arc::new(request);
             let scope = Scope::enter(ctx, Arc::clone(&descriptor), Some(Arc::clone(&request)));
             let terminal = Dispatch { descriptor: &descriptor, payload: &request.payload };
-            let outcome = self.pipeline.run(ctx, &terminal).await;
+            let outcome = CatchPanic(self.pipeline.run(ctx, &terminal)).await;
             let response = scope.take_response();
             drop(scope);
             outcome?;
@@ -591,7 +614,7 @@ impl Invoker {
             let handler = descriptor.typed.downcast_ref::<Arc<dyn Handler<Req, Res>>>().ok_or_else(|| type_mismatch::<Req, Res>(&descriptor))?;
             let terminal = Typed { handler: Arc::clone(handler), request, outcome: Mutex::new(None) };
             let scope = Scope::enter(ctx, Arc::clone(&descriptor), None);
-            let outcome = self.pipeline.run(ctx, &terminal).await;
+            let outcome = CatchPanic(self.pipeline.run(ctx, &terminal)).await;
             drop(scope);
             outcome?;
             terminal.outcome.into_inner().unwrap_or_else(PoisonError::into_inner).unwrap_or_else(|| Err(no_response(id)))
