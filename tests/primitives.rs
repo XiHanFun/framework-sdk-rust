@@ -259,6 +259,16 @@ fn result_wire_encoding() {
 struct WireVectors {
     results: WireCases<ResultCase>,
     errors: WireCases<ErrorCase>,
+    duplicates: Vec<DuplicateCase>,
+}
+
+#[derive(Deserialize)]
+struct DuplicateCase {
+    name: String,
+    target: String,
+    #[serde(default)]
+    kind: Option<String>,
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -316,6 +326,17 @@ fn wire_encoding_follows_the_vectors() {
     }
     for case in &vectors.errors.invalid {
         assert!(round_trip::<Error>(&case.json).is_err(), "{} must be rejected", case.name);
+    }
+    // 同一层的重复成员不合法（RFC-0001「Result」，ADR-0235）；JSON 值表达不了，按原文读入
+    for case in &vectors.duplicates {
+        let rejected = match (case.target.as_str(), case.kind.as_deref()) {
+            ("result", Some("value")) => serde_json::from_str::<WireResult<serde_json::Value>>(&case.text).is_err(),
+            ("result", Some("unit")) => serde_json::from_str::<WireResult<()>>(&case.text).is_err(),
+            ("result", Some("maybe")) => serde_json::from_str::<WireResult<Option<serde_json::Value>>>(&case.text).is_err(),
+            ("error", None) => serde_json::from_str::<Error>(&case.text).is_err(),
+            other => panic!("unknown duplicate case {other:?}"),
+        };
+        assert!(rejected, "{} must be rejected", case.name);
     }
 }
 
