@@ -28,8 +28,8 @@ use deadline::Deadline;
 pub use trace::{TraceContext, new_span_id, new_trace_id};
 
 use crate::primitives::{
-    BAGGAGE_CORRELATION, BAGGAGE_IDEMPOTENCY_KEY, BAGGAGE_LOCALE, BAGGAGE_PRINCIPAL, BAGGAGE_TENANT, Error, is_baggage_key_registered,
-    is_baggage_key_well_formed, is_baggage_value_acceptable,
+    BAGGAGE_CORRELATION, BAGGAGE_IDEMPOTENCY_KEY, BAGGAGE_LOCALE, BAGGAGE_MAX_VALUE_LENGTH, BAGGAGE_PRINCIPAL, BAGGAGE_TENANT, Error,
+    is_baggage_key_registered, is_baggage_key_well_formed, is_baggage_value_acceptable,
 };
 
 /// 调用超过截止时间。
@@ -121,21 +121,20 @@ impl Context {
         &self.baggage
     }
 
-    /// 派生一个多一个（或改写一个）Baggage 键值的上下文。
-    ///
-    /// 已登记键（幂等键除外）的值不合 [`is_baggage_value_acceptable`] 时丢弃这个成员：派生的上下文保持原来的值
-    /// （原来没有就没有），与 W3C Baggage 忽略不合法的成员一致（`conventions/baggage-keys.md`，ADR-0204、ADR-0233）。
+    /// 派生一个多一个（或改写一个）Baggage 键值的上下文：程序内逐项派生（`conventions/baggage-keys.md`，ADR-0235）。
     ///
     /// # Panics
     ///
-    /// 键不符合 `xihan.<name>` 时 panic（编程错误）；来自载体的键先用
-    /// [`is_baggage_key_well_formed`] 判断。
+    /// 键不符合 `xihan.<name>` 时 panic；已登记的键（幂等键除外）给了 [`is_baggage_value_acceptable`] 不接受的值时同样 panic。
+    /// 两者都是编程错误，不静默丢弃、也不保留原值。来自外部的 Baggage 交给 [`ContextBuilder::baggage`]，它按外部输入丢弃不合的成员。
     #[track_caller]
     pub fn with_baggage(&self, key: impl Into<String>, value: impl Into<String>) -> Self {
         let (key, value) = (key.into(), value.into());
         must_be_baggage_key(&key);
         if !keeps(&key, &value) {
-            return self.clone();
+            crate::primitives::invalid_argument(format!(
+                "The value of the baggage key '{key}' must be non-empty, at most {BAGGAGE_MAX_VALUE_LENGTH} UTF-16 code units and free of control characters."
+            ));
         }
         let mut baggage = BTreeMap::clone(&self.baggage);
         baggage.insert(key, value);
@@ -314,24 +313,25 @@ impl ContextBuilder {
         self
     }
 
-    /// 设置一个 Baggage 键值；同一个键以最后一次为准。
+    /// 加入一个 Baggage 成员：这是由一组 Baggage 构建上下文的入口，按外部输入处理（`conventions/baggage-keys.md`，ADR-0235）。
     ///
-    /// 构建时丢弃已登记键（幂等键除外）里值不合 [`is_baggage_value_acceptable`] 的成员：非空、按 UTF-16 码元计最多 256、
-    /// 不含 U+0000–U+001F 与 U+007F–U+009F（`conventions/baggage-keys.md`，ADR-0204、ADR-0233）。
+    /// 已登记键（幂等键除外）的值不合 [`is_baggage_value_acceptable`]（非空、按 UTF-16 码元计最多 256、不含 U+0000–U+001F
+    /// 与 U+007F–U+009F）时丢弃这个成员，同名的原值保留，与 W3C 忽略不合法的成员一致；合格的值改写同名的原值。
     ///
     /// # Panics
     ///
-    /// 键不符合 `xihan.<name>` 时 panic（编程错误）。
+    /// 键不符合 `xihan.<name>` 时 panic（编程错误）；来自载体的键先用 [`is_baggage_key_well_formed`] 判断。
     #[track_caller]
     pub fn baggage(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
-        let key = key.into();
+        let (key, value) = (key.into(), value.into());
         must_be_baggage_key(&key);
-        self.baggage.insert(key, value.into());
+        if keeps(&key, &value) {
+            self.baggage.insert(key, value);
+        }
         self
     }
 
-    /// 构建上下文：丢弃不合值约束的已登记键成员（见 [`ContextBuilder::baggage`]），有截止时间时登记定时器，
-    /// 没有追踪时生成新的追踪 ID 与 Span ID。
+    /// 构建上下文：有截止时间时登记定时器，没有追踪时生成新的追踪 ID 与 Span ID。
     ///
     /// # Panics
     ///
@@ -344,7 +344,7 @@ impl ContextBuilder {
             token,
             deadline,
             trace: self.trace.unwrap_or_else(TraceContext::generate),
-            baggage: Arc::new(self.baggage.into_iter().filter(|(key, value)| keeps(key, value)).collect()),
+            baggage: Arc::new(self.baggage),
             items: Arc::new(Items::default()),
         }
     }

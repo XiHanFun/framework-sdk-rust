@@ -30,8 +30,9 @@ pub fn is_baggage_key_registered(key: &str) -> bool {
 /// 判断值是否可以进入调用上下文：非空、按 UTF-16 码元计不超过 [`BAGGAGE_MAX_VALUE_LENGTH`]、不含控制字符
 /// U+0000–U+001F 与 U+007F–U+009F（`conventions/baggage-keys.md`，ADR-0204、ADR-0233）。
 ///
-/// 这些值会写进日志、审计与消息信封，换行能伪造日志行。[`invocation::Context`](crate::invocation::Context) 在构建与派生时
-/// 丢弃不合的已登记键成员（幂等键除外，它由 Idempotency 阶段以校验错误拒绝），上下文里只有通过的值。
+/// 这些值会写进日志、审计与消息信封，换行能伪造日志行。[`invocation::ContextBuilder::baggage`](crate::invocation::ContextBuilder::baggage)
+/// 按外部输入丢弃不合的成员，[`invocation::Context::with_baggage`](crate::invocation::Context::with_baggage) 遇到不合的值即 panic
+/// （两者都只看已登记键，幂等键除外：它由 Idempotency 阶段以校验错误拒绝），上下文里只有通过的值。
 pub fn is_baggage_value_acceptable(value: &str) -> bool {
     !value.is_empty() && value.encode_utf16().count() <= BAGGAGE_MAX_VALUE_LENGTH && !value.chars().any(char::is_control)
 }

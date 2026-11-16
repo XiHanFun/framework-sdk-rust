@@ -190,9 +190,9 @@ fn cancellation_errors_follow_kernel_messages() {
     common::assert_kernel_error(&cancelled.cancellation().unwrap(), MESSAGE_CANCELLED);
 }
 
-/// 已登记键里不合值约束的成员在构建与派生时丢弃，幂等键与未登记的键不按这条丢弃（conventions/baggage-keys.md）。
+/// Baggage 的值约束（conventions/baggage-keys.md，ADR-0235）：构建上下文按外部输入丢弃不合的成员，程序内逐项派生给已登记键不合的值即 panic；幂等键与未登记的键不按这条处理。
 #[test]
-fn unacceptable_baggage_values_are_dropped() {
+fn baggage_values_follow_the_conventions() {
     let values = common::baggage_values();
     for value in &values.acceptable {
         let ctx = Context::builder().baggage(BAGGAGE_TENANT, value.as_str()).build();
@@ -208,12 +208,26 @@ fn unacceptable_baggage_values_are_dropped() {
         assert_eq!(ctx.tenant(), None, "{value:?} must be dropped");
         assert_eq!(ctx.idempotency_key(), Some(value.as_str()), "the idempotency key is left to the idempotency stage");
         assert_eq!(ctx.baggage().get("xihan.note").map(String::as_str), Some(value.as_str()), "unregistered keys are not checked");
-        let derived = correlated_context().with_baggage(BAGGAGE_CORRELATION, value.as_str());
-        assert_eq!(derived.correlation(), Some("c1"), "a derived context keeps the previous value");
-        assert_eq!(Context::background().with_baggage(BAGGAGE_LOCALE, value.as_str()).locale(), None);
+        // 程序内逐项派生给已登记的键一个不合的值是编程错误：panic，不静默丢弃也不保留原值
+        let message = common::panic_message(|| drop(correlated_context().with_baggage(BAGGAGE_CORRELATION, value.as_str())));
+        assert!(message.starts_with(ERROR_CODE_INVALID_ARGUMENT) && message.contains("'xihan.correlation'"), "{message}");
+        assert_eq!(Context::background().with_baggage(BAGGAGE_IDEMPOTENCY_KEY, value.as_str()).idempotency_key(), Some(value.as_str()));
+        assert_eq!(Context::background().with_baggage("xihan.note", value.as_str()).baggage().get("xihan.note").map(String::as_str), Some(value.as_str()));
     }
-    // 同一个键以最后一次为准，最后一次不合即没有
-    assert_eq!(Context::builder().baggage(BAGGAGE_TENANT, "t1").baggage(BAGGAGE_TENANT, "a\nb").build().tenant(), None);
+    // 外部输入丢弃不合的成员，同名的原值保留；合格的值改写原值
+    assert_eq!(
+        Context::builder()
+            .baggage(BAGGAGE_TENANT, "t1")
+            .baggage(
+                BAGGAGE_TENANT,
+                "a
+b"
+            )
+            .build()
+            .tenant(),
+        Some("t1")
+    );
+    assert_eq!(Context::builder().baggage(BAGGAGE_TENANT, "t1").baggage(BAGGAGE_TENANT, "t2").build().tenant(), Some("t2"));
 }
 
 fn correlated_context() -> Context {
