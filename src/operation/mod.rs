@@ -649,7 +649,7 @@ fn decode<Req: DeserializeOwned>(id: &str, payload: &[u8]) -> Result<Req> {
     let trimmed = payload.trim_ascii();
     let trimmed = if trimmed.is_empty() { b"{}".as_slice() } else { trimmed };
     if trimmed == b"null" {
-        return Err(invalid_payload(id, "the payload is null".to_owned()));
+        return Err(invalid_payload(id, "$".to_owned()));
     }
     let mut deserializer = serde_json::Deserializer::from_slice(trimmed);
     let request = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| invalid_payload(id, json_path(error.path())))?;
@@ -658,19 +658,21 @@ fn decode<Req: DeserializeOwned>(id: &str, payload: &[u8]) -> Result<Req> {
     Ok(request)
 }
 
-/// 出错位置的 JSON 路径（RFC-0011 规则 2，ADR-0124）：根是 `$`，成员 `.name`，下标 `[0]`；
-/// 成员名不只含字母、数字与下划线时写成 `['name']`。不带 Rust 类型名，也不带解析器的错误文本。
+/// 出错位置的 JSON 路径（RFC-0011 规则 2，ADR-0124、ADR-0235，照 System.Text.Json 的实测）：根是 `$`，成员 `.名字`，下标 `[i]`。
+///
+/// 成员名含 [`QUOTED`] 里的任一字符时写成 `['名字']`，名字原样、不转义；其余字符照写（含 `-`、`:`、汉字与其他控制字符），
+/// 空的成员名写成 `$.`。不带 Rust 类型名，也不带解析器的错误文本。
 fn json_path(path: &serde_path_to_error::Path) -> String {
     let mut text = String::from("$");
     for segment in path.iter() {
         match segment {
             Segment::Seq { index } => text.push_str(&format!("[{index}]")),
             Segment::Map { key } | Segment::Enum { variant: key } => {
-                if !key.is_empty() && key.chars().all(|char| char.is_ascii_alphanumeric() || char == '_') {
+                if key.chars().any(|char| QUOTED.contains(&char)) {
+                    text.push_str(&format!("['{key}']"));
+                } else {
                     text.push('.');
                     text.push_str(key);
-                } else {
-                    text.push_str(&format!("['{}']", key.replace('\\', "\\\\").replace('\'', "\\'")));
                 }
             }
             // 路径不明的一段（如未标记的枚举内部）不写出
@@ -679,6 +681,9 @@ fn json_path(path: &serde_path_to_error::Path) -> String {
     }
     text
 }
+
+/// 成员名里需要写成 `['名字']` 的字符（RFC-0011 规则 2）。
+const QUOTED: &[char] = &['.', ' ', '\'', '/', '"', '[', ']', '(', ')', '\\', '\t', '\n', '\r', '\u{0C}', '\u{08}', '\u{85}', '\u{2028}', '\u{2029}'];
 
 fn invalid_payload(id: &str, reason: String) -> Error {
     Error::validation(ERROR_CODE_INVALID_PAYLOAD, MESSAGE_INVALID_PAYLOAD).with_detail("id", id).with_detail("reason", reason)

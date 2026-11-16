@@ -13,7 +13,7 @@ xihan-framework = "0.1"
 | `manifest` | `xihan.manifest.json` 的模型、读取、规范化输出与校验，能力声明与依赖文本；读取按 Schema 逐字执行：成员名区分大小写，可选成员写成 `null` 不合法，只有 `requires[].version` 可以带 `^`，`contributes.operations` 按操作 ID 文法 | RFC-0002、`manifest/manifest.schema.json` |
 | `invocation` | `Context`：可等待、父子传播的 `CancellationToken`，后台定时器触发的截止时间，W3C 追踪（`traceparent` 只认版本 `00` 与小写十六进制，不合法的当作没有给出；采样只看最低位，写出 `00` 或 `01`，没有上游时写 `01`）、已登记的 Baggage（已登记键的值非空、按 UTF-16 码元最多 256、不含控制字符，幂等键除外：构建上下文时按外部输入丢弃不合的成员、保留原值，`with_baggage` 给出不合的值即 panic）、按类型存取的对象袋；超时与取消只按截止令牌归因为 `KERNEL_TIMEOUT_001` / `KERNEL_CANCELLED_001` | RFC-0003 |
 | `pipeline` | 十一阶段的 `Builder`：`use_middleware` / `use_at` / `use_named_instance`、`before` / `after`（按名字登记的实例用实例名，其余用中间件名；约束的主体在声明时必须已登记）、`describe` / `dump` / `build`；排序规则与错误码 `KERNEL_PIPELINE_00x`；中间件与终点都是异步的 | RFC-0004 |
-| `operation` | `Contract`、`Schema`、异步 `Handler<Req, Res>`、容量 10000 的 `Registry`、经完整管道执行的 `Invoker`（XGI：JSON 请求与响应；另有不经 JSON 的类型化入口）；内核错误的码、键、参数与 en-US 模板同向量 `kernel-messages.json`，载荷不合法的 `reason` 是 JSON 路径，中间件以成功短路而没有响应时报 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response`，中间件或处理器 panic 时报 `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception`（`panic = "unwind"` 时） | RFC-0011 |
+| `operation` | `Contract`、`Schema`、异步 `Handler<Req, Res>`、容量 10000 的 `Registry`、经完整管道执行的 `Invoker`（XGI：JSON 请求与响应；另有不经 JSON 的类型化入口）；内核错误的码、键、参数与 en-US 模板同向量 `kernel-messages.json`，载荷不合法的 `reason` 是 JSON 路径（根上与 `null` 载荷写 `$`，成员名含 `.`、空格、引号、括号等写 `['名字']`，照 System.Text.Json），中间件以成功短路而没有响应时报 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response`，中间件或处理器 panic 时报 `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception`（`panic = "unwind"` 时） | RFC-0011 |
 
 ## 用法
 

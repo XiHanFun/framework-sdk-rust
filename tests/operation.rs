@@ -86,8 +86,8 @@ fn invoke_runs_the_pipeline_and_encodes_the_response() {
 
     // reason 只写出错位置的 JSON 路径（RFC-0011 规则 2）
     for (payload, reason) in [
-        ("null", "the payload is null"),
-        (" null ", "the payload is null"),
+        ("null", "$"),
+        (" null ", "$"),
         ("[true]", "$[0]"),
         ("[1, 2]", "$"),
         ("{", "$"),
@@ -355,4 +355,69 @@ fn expired_deadlines_stop_before_the_pipeline() {
     let in_time = Context::builder().timeout(std::time::Duration::from_secs(60)).build();
     assert!(common::block_on(invoker.invoke(&in_time, Request::new("orders.create", r#"{"quantity":1}"#))).is_ok());
     assert_eq!(*entered.lock().unwrap(), 1);
+}
+
+/// payload-reasons.json 的订单：lines 是数组，每项是对象，quantity 是整数。
+#[derive(Clone, Debug, Deserialize)]
+struct VectorOrder {
+    #[allow(dead_code)]
+    lines: Vec<VectorLine>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct VectorLine {
+    #[allow(dead_code)]
+    quantity: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ReasonVectors {
+    cases: Vec<ReasonCase>,
+    syntax_errors: Vec<SyntaxCase>,
+}
+
+#[derive(Deserialize)]
+struct ReasonCase {
+    name: String,
+    request: String,
+    payload: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+struct SyntaxCase {
+    request: String,
+    payload: String,
+}
+
+/// 载荷不合法时的 reason 按 payload-reasons.json（RFC-0011 规则 2）：counts 是整数字典，order 是带明细数组的订单。
+#[test]
+fn payload_reasons_follow_the_vectors() {
+    let registry = Registry::new();
+    registry.add(Contract::new("counts.set"), operation::handler_fn(|_ctx, _request: BTreeMap<String, i64>| Box::pin(async { Ok(()) }))).unwrap();
+    registry.add(Contract::new("orders.place"), operation::handler_fn(|_ctx, _request: VectorOrder| Box::pin(async { Ok(()) }))).unwrap();
+    let invoker = Invoker::new(Arc::new(registry), &Builder::new()).unwrap();
+    let invoke = |request: &str, payload: &str| {
+        let id = match request {
+            "counts" => "counts.set",
+            "order" => "orders.place",
+            other => panic!("unknown request type {other}"),
+        };
+        common::block_on(invoker.invoke(&Context::background(), Request::new(id, payload)))
+    };
+    let vectors: ReasonVectors = common::vector("operations/payload-reasons.json");
+    for case in &vectors.cases {
+        let error = invoke(&case.request, &case.payload).expect_err(&case.name);
+        common::assert_kernel_error(&error, MESSAGE_INVALID_PAYLOAD);
+        assert_eq!(error.details().unwrap()["reason"], json!(case.reason), "{}", case.name);
+    }
+    for case in &vectors.syntax_errors {
+        let error = invoke(&case.request, &case.payload).expect_err(&case.payload);
+        assert_eq!(error.code(), ERROR_CODE_INVALID_PAYLOAD, "{}", case.payload);
+        let reason = error.details().unwrap()["reason"].as_str().unwrap().to_owned();
+        assert!(reason.starts_with('$'), "{}: {reason}", case.payload);
+    }
+    assert!(invoke("counts", r#"{"a":1,"b":2}"#).is_ok());
+    assert!(invoke("order", r#"{"lines":[{"quantity":1}]}"#).is_ok());
 }
