@@ -5,6 +5,7 @@ use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 use serde_json::Value;
 
 use super::framework::invalid_argument;
+use super::json;
 use crate::grammar::{digit, lower, lower_digit, word};
 
 /// 模板参数，也是错误的结构化细节：名字到 JSON 值，按名字排序。
@@ -116,27 +117,37 @@ pub fn placeholders(template: &str) -> Vec<String> {
     names
 }
 
-/// 宽松格式化：用参数填充模板，缺参数的占位符连同格式说明符原样保留（RFC-0010「模板」）。
+/// 宽松格式化：用参数填充模板，缺参数的占位符连同格式说明符原样保留（RFC-0010「模板」），数字按不变文化。
 ///
 /// `{name}` 取命名参数，`{0}` 取位置参数（键 `"0"`、`"1"`…，见 [`positional`]）；`{{`、`}}` 还原为单个花括号；参数存在而值为
 /// `null` 不算缺值，写成空串。值的文本形式与格式说明符见 [`format_value`]。
 pub fn format_message(template: &str, arguments: &Details) -> String {
-    render(template, arguments, false).unwrap_or_default()
+    render(template, arguments, false, INVARIANT).unwrap_or_default()
 }
 
-/// 严格格式化：任一占位符缺参数即返回 `None`，供消息解析拒绝半截译文（RFC-0010）。
+/// 严格格式化：任一占位符缺参数即返回 `None`，供消息解析拒绝半截译文（RFC-0010），数字按不变文化。
 pub fn try_format_message(template: &str, arguments: &Details) -> Option<String> {
-    render(template, arguments, true)
+    render(template, arguments, true, INVARIANT)
+}
+
+/// 按区域宽松格式化：同 [`format_message`]，小数点与分组符取区域的符号（见 [`format_value_in`]）。
+pub fn format_message_in(template: &str, arguments: &Details, locale: &str) -> String {
+    render(template, arguments, false, symbols(locale)).unwrap_or_default()
+}
+
+/// 按区域严格格式化：同 [`try_format_message`]，小数点与分组符取区域的符号。
+pub fn try_format_message_in(template: &str, arguments: &Details, locale: &str) -> Option<String> {
+    render(template, arguments, true, symbols(locale))
 }
 
 /// 逐段渲染；严格模式下缺参数返回 `None`。
-fn render(template: &str, arguments: &Details, strict: bool) -> Option<String> {
+fn render(template: &str, arguments: &Details, strict: bool, symbols: Symbols) -> Option<String> {
     let mut output = String::with_capacity(template.len() + 16);
     for segment in segments(template) {
         match segment {
             Segment::Literal(text) => output.push_str(text),
             Segment::Placeholder { name, format } => match arguments.get(name) {
-                Some(value) => output.push_str(&format_value(value, format)),
+                Some(value) => output.push_str(&value_text(value, format, symbols)),
                 None if strict => return None,
                 None => {
                     // 宽松模式把占位符原样留在文本里，让遗漏可见而不是悄悄吞掉
@@ -154,43 +165,146 @@ fn render(template: &str, arguments: &Details, strict: bool) -> Option<String> {
     Some(output)
 }
 
-/// 按格式说明符输出一个值（RFC-0010「模板」，按不变文化）。
+/// 按格式说明符输出一个值（RFC-0010「模板」），数字按不变文化。
+///
+/// 值先归到值模型：空、布尔、字符串、64 位整数、双精度浮点、数组、对象。`serde_json::Value` 里超出 `i64` 的整数（`u64` 的上半段）
+/// 按模型是浮点；单精度与其他数值类型先转成 `Value`（`Value::from(0.1f32)` 即双精度的 `0.10000000149011612`），日期、UUID 等
+/// 语言自己的类型先按 `Serialize`（[`json::to_value`]）或 `to_string()` 转成字符串。
 ///
 /// 没有说明符时是值的文本形式：字符串原样，整数十进制，布尔 `true` / `false`，`null` 为空串；浮点在 1e-4 ≤ |x| < 1e17
-/// 时写最短往返的十进制、不用指数（`2.0` 写 `2`），范围之外写 `1E+17`、`9.9E-05` 这样的指数形式，负零写 `-0`；数组与对象写 JSON 文本（规范不作规定）。
+/// 时写最短往返的十进制、不用指数（`2.0` 写 `2`），范围之外写 `1E+17`、`9.9E-05` 这样的指数形式，负零写 `-0`，非数与无穷写
+/// `NaN`、`Infinity`、`-Infinity`；数组与对象写紧凑的 JSON 文本，对象成员按名字的 UTF-16 码元序，超过 64 层的容器写 `null`。
 ///
-/// 可移植的说明符（`n` 是可选的位数，最多三位数字）：
+/// 说明符只认 `^[DdFfNnXx][0-9]{0,2}$`（精度至多两位，可有前导零），其余（`E2`、`0.00`、`yyyy`、空说明符、带空格、`D100`）
+/// 一律按无格式输出：
 ///
 /// - `Dn`：整数，至少 n 位，不足补零，负号在前；`{n:D3}` 取 -7 得 `-007`。
 /// - `Xn` / `xn`：非负整数的十六进制，大写或小写，至少 n 位；`{n:x4}` 取 255 得 `00ff`。
-/// - `Fn`：定点小数，n 位小数，缺省 2。
-/// - `Nn`：带千分位（`,`）的定点小数，n 位小数，缺省 2，负号在前。
+/// - `Fn`：整数与浮点的定点小数，n 位小数，缺省 2，写出全部整数位。
+/// - `Nn`：同 `F`，整数部分带千分位，负号在前。
 ///
-/// `F` 与 `N` 按值的精确十进制展开舍入，正好一半时取偶：0.125 写 `F2` 得 `0.12`，2.5 写 `F0` 得 `2`，2.675 写 `F2` 得 `2.67`。
-/// `D`、`F`、`N` 的小写与大写相同。其余说明符（如日期的 `yyyy-MM-dd`），以及 `D`、`X` 用在非整数、`X` 用在负数上，
-/// 都按没有说明符输出，不报错。
+/// `F` 与 `N` 按值的精确十进制展开舍入，正好一半时取偶：0.125 写 `F2` 得 `0.12`，2.5 写 `F0` 得 `2`，2.675 写 `F2` 得 `2.67`；
+/// 负数舍入成零时保留负号。`D`、`F`、`N` 不区分大小写。`D` 与 `X` 用在浮点上、`X` 用在负数上、任何说明符用在字符串、布尔、
+/// `null`、数组与对象上都按无格式输出，不报错。
 pub fn format_value(value: &Value, format: Option<&str>) -> String {
-    format.and_then(|format| portable(format, value)).unwrap_or_else(|| display(value))
+    value_text(value, format, INVARIANT)
 }
 
-/// 值的文本形式（无格式说明符时，`Describe` 同样适用）。
-pub(crate) fn display(value: &Value) -> String {
+/// 按区域输出一个值：同 [`format_value`]，区域只改变小数点与分组符（RFC-0010「模板」的固定表，区域名不区分大小写）。
+///
+/// de-DE、es-ES、pt-BR 是 `,` 与 `.`，fr-FR 是 `,` 与 U+202F，ru-RU 是 `,` 与 U+00A0；en-US、zh-CN、zh-TW、ja-JP、ko-KR 与表外的
+/// 区域都是 `.` 与 `,`。小数点用在无格式的浮点（含指数写法的尾数，de-DE 的 1.5e20 写 `1,5E+20`）与 `F`、`N` 上，分组符只用在 `N` 上；
+/// 整数无格式时不分组，`D`、`X` 与数组、对象里的数字不受区域影响，负号、`NaN`、`Infinity` 也不变。
+pub fn format_value_in(value: &Value, format: Option<&str>, locale: &str) -> String {
+    value_text(value, format, symbols(locale))
+}
+
+fn value_text(value: &Value, format: Option<&str>, symbols: Symbols) -> String {
+    format.and_then(|format| portable(format, value, symbols)).unwrap_or_else(|| display(value, symbols))
+}
+
+/// 区域的数字符号：只有小数点与分组符随区域变化。
+#[derive(Clone, Copy)]
+pub(crate) struct Symbols {
+    decimal: char,
+    group: char,
+}
+
+/// 不变文化的符号，也是表外区域的符号。
+pub(crate) const INVARIANT: Symbols = Symbols { decimal: '.', group: ',' };
+
+/// 小数点与分组符不同于不变文化的内置区域（RFC-0010「模板」，取自 .NET 10 的 ICU 实测）；en-US、zh-CN、zh-TW、ja-JP、ko-KR 同不变文化。
+const LOCALE_SYMBOLS: &[(&str, Symbols)] = &[
+    ("de-DE", Symbols { decimal: ',', group: '.' }),
+    ("es-ES", Symbols { decimal: ',', group: '.' }),
+    ("pt-BR", Symbols { decimal: ',', group: '.' }),
+    ("fr-FR", Symbols { decimal: ',', group: '\u{202F}' }),
+    ("ru-RU", Symbols { decimal: ',', group: '\u{A0}' }),
+];
+
+/// 区域名不区分大小写地查表；表外的区域按不变文化。
+fn symbols(locale: &str) -> Symbols {
+    LOCALE_SYMBOLS.iter().find(|(name, _)| name.eq_ignore_ascii_case(locale)).map_or(INVARIANT, |(_, symbols)| *symbols)
+}
+
+/// 值模型（RFC-0010「模板」）。
+enum Model<'a> {
+    Null,
+    Bool(bool),
+    Text(&'a str),
+    Integer(i64),
+    Float(f64),
+    Container,
+}
+
+fn model(value: &Value) -> Model<'_> {
     match value {
-        Value::String(text) => text.clone(),
-        Value::Null => String::new(),
-        Value::Bool(flag) => flag.to_string(),
-        Value::Number(number) => match (number.as_i64(), number.as_u64(), number.as_f64()) {
-            (Some(integer), ..) => integer.to_string(),
-            (None, Some(integer), _) => integer.to_string(),
-            // 整数按十进制，浮点按 float_text
-            (None, None, Some(float)) => float_text(float),
-            _ => number.to_string(),
+        Value::Null => Model::Null,
+        Value::Bool(flag) => Model::Bool(*flag),
+        Value::String(text) => Model::Text(text),
+        // 64 位有符号范围之外的整数（u64 的上半段）按模型是浮点
+        Value::Number(number) => match number.as_i64() {
+            Some(integer) => Model::Integer(integer),
+            None => Model::Float(number.as_f64().unwrap_or(f64::NAN)),
         },
-        other => other.to_string(),
+        Value::Array(_) | Value::Object(_) => Model::Container,
     }
 }
 
-/// 浮点的文本形式（RFC-0010「模板」，取自 .NET 10 的实测）。
+/// 值的文本形式（无格式说明符时，`Describe` 同样适用）。
+pub(crate) fn display(value: &Value, symbols: Symbols) -> String {
+    match model(value) {
+        Model::Null => String::new(),
+        Model::Bool(flag) => flag.to_string(),
+        Model::Text(text) => text.to_owned(),
+        Model::Integer(integer) => integer.to_string(),
+        Model::Float(float) => localize(&float_text(float), symbols, false),
+        Model::Container => {
+            let mut text = String::new();
+            write_json(&mut text, value, 1);
+            text
+        }
+    }
+}
+
+/// 数组与对象的紧凑 JSON 文本：没有空白，对象成员按名字的序数顺序（逐个 UTF-16 码元比较），数字的写法同顶层、按不变文化，
+/// 字符串按 JSON 字符串写法；`depth` 是这个值所在的层数，超过 64 层的容器写 `null`。
+fn write_json(out: &mut String, value: &Value, depth: usize) {
+    match value {
+        Value::Array(_) | Value::Object(_) if depth > json::MAX_DEPTH => out.push_str("null"),
+        Value::Null => out.push_str("null"),
+        Value::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Value::Number(_) => out.push_str(&display(value, INVARIANT)),
+        Value::String(text) => json::write_string(out, text),
+        Value::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_json(out, item, depth + 1);
+            }
+            out.push(']');
+        }
+        Value::Object(members) => {
+            // Value 的映射按字节序（或插入顺序）排列，与 UTF-16 码元序在基本多文种平面以外的字符上不同
+            let mut names: Vec<&String> = members.keys().collect();
+            names.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+            out.push('{');
+            for (index, name) in names.into_iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                json::write_string(out, name);
+                out.push(':');
+                write_json(out, &members[name], depth + 1);
+            }
+            out.push('}');
+        }
+    }
+}
+
+/// 浮点的文本形式（RFC-0010「模板」，取自 .NET 10 的实测），按不变文化。
 ///
 /// 1e-4 ≤ |x| < 1e17 或 x = 0 时写最短往返的十进制、不用指数，整数值不带小数点；范围之外写最短往返的有效数字加指数：
 /// `E`、总写的符号、至少两位的指数，如 `1E+17`、`9.9E-05`、`5E-324`。负零写 `-0`，非数与无穷写 `NaN`、`Infinity`、`-Infinity`。
@@ -211,66 +325,69 @@ fn float_text(number: f64) -> String {
     let exponent: i32 = exponent.parse().unwrap_or(0);
     format!("{mantissa}E{}{:02}", if exponent < 0 { '-' } else { '+' }, exponent.unsigned_abs())
 }
-/// 可移植的格式说明符；不认识的说明符或类型不合时返回 `None`，由调用方按无格式输出。
-fn portable(spec: &str, value: &Value) -> Option<String> {
-    let mut characters = spec.chars();
-    let letter = characters.next()?;
-    let digits = characters.as_str();
-    // 位数最多三位数字：说明符写错时不会为一个占位符分配巨大的缓冲
-    let precision: Option<usize> = match digits {
-        "" => None,
-        _ if digits.len() <= 3 && digits.bytes().all(digit) => Some(digits.parse().ok()?),
-        _ => return None,
-    };
-    match letter {
-        'D' | 'd' => {
-            let number = integer(value)?;
-            let width = precision.unwrap_or(0);
-            Some(format!("{}{:0>width$}", if number < 0 { "-" } else { "" }, number.unsigned_abs()))
-        }
-        'X' | 'x' => {
-            let number = u128::try_from(integer(value)?).ok()?;
-            let width = precision.unwrap_or(0);
-            Some(if letter == 'X' { format!("{number:0width$X}") } else { format!("{number:0width$x}") })
-        }
-        'F' | 'f' => fixed(value, precision.unwrap_or(2)),
-        'N' | 'n' => fixed(value, precision.unwrap_or(2)).map(|text| group_thousands(&text)),
+
+/// 可移植的格式说明符 `^[DdFfNnXx][0-9]{0,2}$`；不认识或不适用时返回 `None`，由调用方按无格式输出。
+fn portable(spec: &str, value: &Value, symbols: Symbols) -> Option<String> {
+    let (&letter, digits) = spec.as_bytes().split_first()?;
+    if digits.len() > 2 || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let precision = (!digits.is_empty()).then(|| digits.iter().fold(0, |precision, digit| precision * 10 + usize::from(digit - b'0')));
+    let width = precision.unwrap_or(0);
+    match (letter, model(value)) {
+        (b'D' | b'd', Model::Integer(number)) => Some(format!("{}{:0>width$}", if number < 0 { "-" } else { "" }, number.unsigned_abs())),
+        (b'X', Model::Integer(number)) if number >= 0 => Some(format!("{number:0width$X}")),
+        (b'x', Model::Integer(number)) if number >= 0 => Some(format!("{number:0width$x}")),
+        (b'F' | b'f', number) => fixed(number, precision.unwrap_or(2)).map(|text| localize(&text, symbols, false)),
+        (b'N' | b'n', number) => fixed(number, precision.unwrap_or(2)).map(|text| localize(&text, symbols, true)),
         _ => None,
     }
 }
 
-/// 整数值；浮点（即使是整数值）不算。
-fn integer(value: &Value) -> Option<i128> {
-    value.as_i64().map(i128::from).or_else(|| value.as_u64().map(i128::from))
-}
-
-/// 定点小数：整数按十进制补零位，浮点用 Rust 的定点格式化——它按精确的二进制值舍入、正好一半时取偶，与 .NET 一致。
-fn fixed(value: &Value, precision: usize) -> Option<String> {
-    if let Some(number) = integer(value) {
-        return Some(if precision == 0 { number.to_string() } else { format!("{number}.{}", "0".repeat(precision)) });
+/// 定点小数（按不变文化）：整数按十进制补零位；浮点用 Rust 的定点格式化——它按精确的二进制值舍入、正好一半时取偶，写出全部整数位，
+/// 负数舍入成零时保留负号（-0.001 写 F2 得 -0.00），与 .NET 一致；非数与无穷按文本形式。其余的值不适用。
+fn fixed(number: Model<'_>, precision: usize) -> Option<String> {
+    match number {
+        Model::Integer(integer) if precision == 0 => Some(integer.to_string()),
+        Model::Integer(integer) => Some(format!("{integer}.{}", "0".repeat(precision))),
+        Model::Float(float) if float.is_finite() => Some(format!("{float:.precision$}")),
+        Model::Float(float) => Some(float_text(float)),
+        _ => None,
     }
-    // 定点格式化写出全部整数位、不用指数，负数舍入成零时保留负号（-0.001 写 F2 得 -0.00）；非数与无穷按文本形式
-    value.as_f64().map(|number| if number.is_finite() { format!("{number:.precision$}") } else { float_text(number) })
 }
 
-/// 给定点小数的整数部分加千分位：`-1234567.89` 得 `-1,234,567.89`。
-fn group_thousands(text: &str) -> String {
+/// 把按不变文化写出的数换成区域的符号：小数点换成区域的小数点，`grouped` 时整数部分每三位加区域的分组符。
+///
+/// 不以数字开头（`NaN`、`Infinity`）的文本原样返回；指数写法的尾数照样换小数点（`1.5E+20` 在 de-DE 写 `1,5E+20`）。
+fn localize(text: &str, symbols: Symbols, grouped: bool) -> String {
     let (sign, unsigned) = match text.strip_prefix('-') {
         Some(rest) => ("-", rest),
         None => ("", text),
     };
-    let (whole, fraction) = unsigned.split_at(unsigned.find('.').unwrap_or(unsigned.len()));
-    let mut grouped = String::with_capacity(text.len() + whole.len() / 3);
-    grouped.push_str(sign);
-    for (index, digit) in whole.chars().enumerate() {
-        // 从右往左每三位一组：剩下的位数是三的倍数时插入分组符
-        if index > 0 && (whole.len() - index) % 3 == 0 {
-            grouped.push(',');
-        }
-        grouped.push(digit);
+    if !unsigned.starts_with(|char: char| char.is_ascii_digit()) {
+        return text.to_owned();
     }
-    grouped.push_str(fraction);
-    grouped
+    let (whole, fraction) = match unsigned.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (unsigned, None),
+    };
+    // 整数部分的数字到第一个非数字（指数写法的 E）为止
+    let digits = whole.find(|char: char| !char.is_ascii_digit()).unwrap_or(whole.len());
+    let mut localized = String::with_capacity(text.len() + digits);
+    localized.push_str(sign);
+    for (index, digit) in whole[..digits].char_indices() {
+        // 从右往左每三位一组：剩下的位数是三的倍数时插入分组符
+        if grouped && index > 0 && (digits - index) % 3 == 0 {
+            localized.push(symbols.group);
+        }
+        localized.push(digit);
+    }
+    localized.push_str(&whole[digits..]);
+    if let Some(fraction) = fraction {
+        localized.push(symbols.decimal);
+        localized.push_str(fraction);
+    }
+    localized
 }
 
 /// 把位置参数转成以 `"0"`、`"1"`… 为键的参数表。
@@ -290,7 +407,7 @@ pub fn describe(key: &str, arguments: &Details) -> String {
     // 按名字的序数顺序（逐个 UTF-16 码元比较，与 .NET 的 Ordinal 一致）：BTreeMap 的字节序在基本多文种平面以外的字符上与它不同
     let mut names: Vec<&String> = arguments.keys().collect();
     names.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
-    let parts: Vec<String> = names.into_iter().map(|name| format!("{name}={}", display(&arguments[name]))).collect();
+    let parts: Vec<String> = names.into_iter().map(|name| format!("{name}={}", display(&arguments[name], INVARIANT))).collect();
     format!("{key} ({})", parts.join(", "))
 }
 
@@ -435,7 +552,8 @@ impl Catalog {
 impl MessageResolver for Catalog {
     fn resolve(&self, key: &str, locale: &str, arguments: &Details) -> Option<String> {
         let template = self.template(locale, key).or_else(|| if locale == DEFAULT_LOCALE { None } else { self.template(DEFAULT_LOCALE, key) })?;
-        try_format_message(template, arguments)
+        // 数字的符号按请求的区域，模板回退到 en-US 时也一样
+        try_format_message_in(template, arguments, locale)
     }
 }
 
@@ -473,16 +591,19 @@ mod tests {
         assert_eq!(format_message("订单 {name} 不存在。}", &values), "订单 x 不存在。}");
         assert_eq!(format_message("}} {", &values), "} {");
         assert_eq!(format_message("{not valid} {_x} {name", &values), "{not valid} {_x} {name");
-        assert_eq!(format_message("{price:F2}|{price:f3}|{price:N0}|{count:d}|{count:F0}|{large:X}", &values), "12.35|12.346|12|7|7|FFFFFFFFFFFFFFFF");
+        assert_eq!(format_message("{price:F2}|{price:f3}|{price:N0}|{count:d}|{count:F0}|{large:X}", &values), "12.35|12.346|12|7|7|1.8446744073709552E+19");
         // 不支持的说明符与类型不合按无格式输出
         assert_eq!(format_message("{name:N2}|{count:yyyy-MM-dd}|{big:X}|{price:D}|{count:D1000}|{count:%03d}", &values), "x|7|-255|12.34567|7|7");
         assert_eq!(format_message("{missing} {missing:N2}", &values), "{missing} {missing:N2}");
         assert_eq!(try_format_message("{missing}", &values), None);
         assert_eq!(try_format_message("{name}", &values).as_deref(), Some("x"));
         assert_eq!(placeholders("{a} {b:N2} {a} {{c}} {0}"), ["a", "b", "0"]);
-        assert_eq!(group_thousands("-1234567.89"), "-1,234,567.89");
-        assert_eq!(group_thousands("123"), "123");
-        assert_eq!(group_thousands("1000"), "1,000");
+        assert_eq!(localize("-1234567.89", INVARIANT, true), "-1,234,567.89");
+        assert_eq!(localize("123", INVARIANT, true), "123");
+        assert_eq!(localize("1000", INVARIANT, true), "1,000");
+        assert_eq!(localize("1.5E+20", symbols("DE-de"), true), "1,5E+20");
+        assert_eq!(localize("-Infinity", symbols("fr-FR"), true), "-Infinity");
+        assert_eq!(localize("1234567.5", symbols("fr-FR"), true), "1 234 567,5");
         // JSON 带不出非数与无穷，直接核对
         assert_eq!(
             (float_text(f64::NAN), float_text(f64::INFINITY), float_text(f64::NEG_INFINITY)),
@@ -492,6 +613,19 @@ mod tests {
             (float_text(-1e-5), float_text(1e-4), float_text(99999999999999990.0)),
             ("-1E-05".to_owned(), "0.0001".to_owned(), "99999999999999980".to_owned())
         );
+    }
+
+    #[test]
+    fn values_follow_the_model_and_the_locale() {
+        // 超过 64 层的容器写 null：最外层是第 1 层
+        let deep = (0..65).fold(json!(1), |inner, _| json!([inner]));
+        assert_eq!(format_value(&deep, None), format!("{}null{}", "[".repeat(64), "]".repeat(64)));
+        // 单精度先换成最接近的双精度
+        assert_eq!(format_value(&Value::from(0.1f32), None), "0.10000000149011612");
+        // 目录解析按请求的区域取符号，模板回退到 en-US 时也一样
+        let catalog = Catalog::new().with("en-US", "orders.total", "{n:N2} {n}");
+        assert_eq!(catalog.resolve("orders.total", "de-DE", &arguments(json!({"n": 1234.5}))).as_deref(), Some("1.234,50 1234,5"));
+        assert_eq!(format_value_in(&json!(-1234.5), Some("N1"), "ru-ru"), "-1 234,5");
     }
 
     #[test]

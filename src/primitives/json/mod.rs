@@ -136,9 +136,40 @@ fn path_text(path: &serde_path_to_error::Path) -> String {
     text
 }
 
+/// 按 JSON 字符串写法写出（RFC-0010「模板」，清单写出也用它）：`"` 与 `\` 加反斜杠，退格、换页、换行、回车、制表符用短写，
+/// 其余 U+0000–U+001F 写成小写十六进制的 `\u001f`，别的字符（含 `/`、U+007F–U+009F、U+2028 与非 ASCII）原样。
+///
+/// Rust 的字符串里没有孤立的代理项，规范里它们的 `\ud800` 写法在这里用不到。
+pub(crate) fn write_string(out: &mut String, text: &str) {
+    out.push('"');
+    for char in text.chars() {
+        match char {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0C}' => out.push_str("\\f"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if control < ' ' => {
+                let _ = write!(out, "\\u{:04x}", u32::from(control));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strings_escape_only_what_must_be_escaped() {
+        let mut out = String::new();
+        write_string(&mut out, "q\"b\\s/\n\t\u{08}\u{0C}\r\u{01}\u{1F} é\u{7F}\u{85}\u{2028}中");
+        assert_eq!(out, "\"q\\\"b\\\\s/\\n\\t\\b\\f\\r\\u0001\\u001f é\u{7F}\u{85}\u{2028}中\"");
+    }
 
     #[test]
     fn numbers_follow_the_value_model() {

@@ -417,6 +417,8 @@ struct FormatCase {
     name: String,
     template: String,
     arguments: Option<Details>,
+    #[serde(default)]
+    locale: Option<String>,
     lenient: String,
     strict: Option<String>,
 }
@@ -439,8 +441,15 @@ fn message_templates_follow_the_vectors() {
     }
     for case in &vectors.format {
         let arguments = case.arguments.clone().unwrap_or_default();
-        assert_eq!(primitives::format_message(&case.template, &arguments), case.lenient, "lenient: {}", case.name);
-        assert_eq!(primitives::try_format_message(&case.template, &arguments), case.strict, "strict: {}", case.name);
+        // 带区域时按区域取小数点与分组符（ADR-0236），没有时按不变文化
+        let (lenient, strict) = match &case.locale {
+            Some(locale) => {
+                (primitives::format_message_in(&case.template, &arguments, locale), primitives::try_format_message_in(&case.template, &arguments, locale))
+            }
+            None => (primitives::format_message(&case.template, &arguments), primitives::try_format_message(&case.template, &arguments)),
+        };
+        assert_eq!(lenient, case.lenient, "lenient: {}", case.name);
+        assert_eq!(strict, case.strict, "strict: {}", case.name);
     }
     for case in &vectors.describe {
         assert_eq!(primitives::describe(&case.key, &case.arguments.clone().unwrap_or_default()), case.text, "{}", case.key);

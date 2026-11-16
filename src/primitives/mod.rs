@@ -41,7 +41,8 @@ pub use id::TypedId;
 pub use lifecycle::LifecycleState;
 pub use messages::{
     Catalog, DEFAULT_LOCALE, Details, MESSAGE_KEY_MAX_LENGTH, MESSAGE_UNINITIALIZED_RESULT, MessageResolver, builtin_catalog, default_locale, describe,
-    format_message, format_value, is_message_key, message_key_domain, placeholders, positional, resolve_message, set_default_messages, try_format_message,
+    format_message, format_message_in, format_value, format_value_in, is_message_key, message_key_domain, placeholders, positional, resolve_message,
+    set_default_messages, try_format_message, try_format_message_in,
 };
 pub use result::{Maybe, Result, WireResult, wire_result};
 pub use stability::Stability;
