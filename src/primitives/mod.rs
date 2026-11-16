@@ -11,12 +11,14 @@
 //! | `TypedId` | [`TypedId`] |
 //! | `FrameworkException` | [`FrameworkError`] |
 //! | `MessageTemplate` / `IMessageResolver` / `MessageScope.Default` | [`format_message`]、[`MessageResolver`]、[`set_default_messages`] |
+//! | 「JSON 文本」的共同读取检查与值模型 | [`json::check`]、[`json::from_slice`]、[`json::Model`] |
 
 mod baggage;
 mod error;
 mod error_code;
 mod framework;
 mod id;
+pub mod json;
 mod lifecycle;
 mod messages;
 mod named;

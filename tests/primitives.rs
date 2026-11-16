@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::json;
 use xihan_framework::primitives::{
     self, BAGGAGE_CORRELATION, BAGGAGE_TENANT, Catalog, Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, LifecycleState, PipelineStage,
-    REGISTERED_BAGGAGE_KEYS, Result, Stability, TypedId, WireResult,
+    REGISTERED_BAGGAGE_KEYS, Result, Stability, TypedId, WireResult, json,
 };
 
 /// 改进程默认消息设置的测试串行执行，读 `Error::message` 的测试也排在它们之间
@@ -476,4 +476,42 @@ fn framework_errors_carry_message_keys() {
     assert_eq!(converted.details(), Some(&details(json!({"capacity": 10000}))));
     let unknown = FrameworkError::with_message("ORDERS_CONFLICT_001", "orders.duplicate", details(json!({"id": "o1"})));
     assert_eq!(unknown.message(), "orders.duplicate (id=o1)");
+}
+
+#[derive(Deserialize)]
+struct JsonTextVectors {
+    cases: Vec<JsonTextCase>,
+}
+
+#[derive(Deserialize)]
+struct JsonTextCase {
+    name: String,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    hex: Option<String>,
+    expect: String,
+    #[serde(default)]
+    path: Option<String>,
+}
+
+/// 共同的 JSON 读取检查按 json-text.json（RFC-0001「JSON 文本」）：text 按 UTF-8 编码，hex 是原始字节。
+#[test]
+fn json_text_follows_the_vectors() {
+    let vectors: JsonTextVectors = common::vector("primitives/json-text.json");
+    for case in &vectors.cases {
+        let bytes = match (&case.text, &case.hex) {
+            (Some(text), None) => text.clone().into_bytes(),
+            (None, Some(hex)) => (0..hex.len()).step_by(2).map(|index| u8::from_str_radix(&hex[index..index + 2], 16).unwrap()).collect(),
+            _ => panic!("{} must give text or hex", case.name),
+        };
+        let expected = match case.expect.as_str() {
+            "valid" => Ok(()),
+            "syntax" => Err(json::ReadError::Syntax),
+            "duplicate" => Err(json::ReadError::Duplicate { path: case.path.clone().expect("a duplicate case has a path") }),
+            other => panic!("unknown expectation {other:?}"),
+        };
+        assert_eq!(json::check(&bytes), expected, "{}", case.name);
+        assert_eq!(json::check(&bytes).err().map(|error| error.path().to_owned()), expected.err().map(|error| error.path().to_owned()), "{}", case.name);
+    }
 }
