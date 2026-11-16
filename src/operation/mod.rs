@@ -478,9 +478,24 @@ struct CurrentOperation(Arc<Descriptor>);
 #[derive(Clone)]
 struct CurrentRequest(Arc<Request>);
 
-/// 对象袋里 handle 阶段之后写回的响应对象，管道结束之后才编码；只在原始调用里有。
+/// 对象袋里 handle 阶段之后写回的响应对象（与 .NET 的 `FindOperationResponse` 相同，两种调用都有）。
 #[derive(Clone)]
-struct ResponseObject(Arc<Mutex<Option<Box<dyn Response>>>>);
+struct ResponseObject(Arc<Mutex<Option<Produced>>>);
+
+/// 处理器产出的响应：XGI 调用的在管道结束之后编码，类型化调用的不经编码，原样交回调用方。
+enum Produced {
+    Encodable(Box<dyn Response>),
+    Typed(Box<dyn Any + Send>),
+}
+
+impl Produced {
+    fn as_any(&self) -> &dyn Any {
+        match self {
+            Self::Encodable(response) => response.as_any(),
+            Self::Typed(response) => &**response,
+        }
+    }
+}
 
 /// 对象袋里 Validate 阶段解码好的请求，handle 阶段之后取走；只在原始调用里有。
 #[derive(Clone)]
@@ -496,9 +511,10 @@ pub fn request_of(ctx: &Context) -> Option<Arc<Request>> {
     ctx.item::<CurrentRequest>().map(|current| Arc::clone(&current.0))
 }
 
-/// 读 handle 阶段之后写回的响应对象（编码之前，RFC-0011 规则 10「编码」）：原始调用里操作成功后，中间件在下游返回之后可读。
+/// 读 handle 阶段之后写回的响应对象（编码之前，RFC-0011 规则 10「编码」）：操作成功后，中间件在下游返回之后可读，
+/// XGI 调用与类型化调用都一样（.NET 的 `FindOperationResponse`）。
 ///
-/// `T` 是登记的响应类型；还没有响应、类型不对或是类型化调用时为 `None`。响应在管道结束之后才写成载荷，中间件看不到载荷。
+/// `T` 是登记的响应类型；还没有响应或类型不对时为 `None`。XGI 调用的响应在管道结束之后才写成载荷，中间件看不到载荷。
 pub fn with_response<T: 'static, R>(ctx: &Context, read: impl FnOnce(&T) -> R) -> Option<R> {
     let slot = ctx.item::<ResponseObject>()?;
     let response = slot.0.lock().unwrap_or_else(PoisonError::into_inner);
@@ -519,19 +535,17 @@ struct Scope<'c> {
 impl<'c> Scope<'c> {
     fn enter(ctx: &'c Context, descriptor: Arc<Descriptor>, request: Option<Arc<Request>>) -> Self {
         let operation = ctx.insert_item(CurrentOperation(descriptor));
-        let (request, decoded, response) = match request {
-            Some(request) => (
-                ctx.insert_item(CurrentRequest(request)),
-                ctx.insert_item(DecodedRequest(Arc::new(Mutex::new(None)))),
-                ctx.insert_item(ResponseObject(Arc::new(Mutex::new(None)))),
-            ),
-            None => (ctx.remove_item::<CurrentRequest>(), ctx.remove_item::<DecodedRequest>(), ctx.remove_item::<ResponseObject>()),
+        let (request, decoded) = match request {
+            Some(request) => (ctx.insert_item(CurrentRequest(request)), ctx.insert_item(DecodedRequest(Arc::new(Mutex::new(None))))),
+            None => (ctx.remove_item::<CurrentRequest>(), ctx.remove_item::<DecodedRequest>()),
         };
+        // 两种调用都有响应的槽
+        let response = ctx.insert_item(ResponseObject(Arc::new(Mutex::new(None))));
         Self { ctx, operation, request, response, decoded }
     }
 
     /// 取走这次调用写回的响应对象。
-    fn take_response(&self) -> Option<Box<dyn Response>> {
+    fn take_response(&self) -> Option<Produced> {
         self.ctx.item::<ResponseObject>().and_then(|slot| slot.0.lock().unwrap_or_else(PoisonError::into_inner).take())
     }
 }
@@ -574,19 +588,23 @@ impl Step for Dispatch<'_> {
                 None => executor.decode(id, self.payload)?,
             };
             let response = executor.run(ctx, id, request).await?;
-            if let Some(slot) = ctx.item::<ResponseObject>() {
-                *slot.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(response);
-            }
+            produced(ctx, Produced::Encodable(response));
             Ok(())
         })
     }
 }
 
-/// 类型化调用的终点：直接以请求对象调用处理器，结果留在槽里；中间件重试时每次用请求的一份克隆。
+/// 把处理器产出的响应写进对象袋的槽；中间件再次进入下游时后一次的覆盖前一次。
+fn produced(ctx: &Context, response: Produced) {
+    if let Some(slot) = ctx.item::<ResponseObject>() {
+        *slot.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(response);
+    }
+}
+
+/// 类型化调用的终点：直接以请求对象调用处理器，响应写进对象袋的槽，中间件看得到它；中间件重试时每次用请求的一份克隆。
 struct Typed<Req, Res> {
     handler: Arc<dyn Handler<Req, Res>>,
     request: Req,
-    outcome: Mutex<Option<Result<Res>>>,
 }
 
 impl<Req, Res> Step for Typed<Req, Res>
@@ -596,11 +614,9 @@ where
 {
     fn run<'a>(&'a self, ctx: &'a Context) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let result = self.handler.handle(ctx, self.request.clone()).await;
-            let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
-            // 槽只在这里整体赋值，中毒时照常使用
-            *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
-            outcome
+            let response = self.handler.handle(ctx, self.request.clone()).await?;
+            produced(ctx, Produced::Typed(Box::new(response)));
+            Ok(())
         })
     }
 }
@@ -743,7 +759,10 @@ impl Invoker {
             drop(scope);
             outcome?;
             // 管道结束之后才编码（规则 10「编码」）：写不出时以未处理失败结束，不抛给调用方
-            encode(response.ok_or_else(|| no_response(descriptor.id()))?.as_ref())
+            match response {
+                Some(Produced::Encodable(response)) => encode(response.as_ref()),
+                _ => Err(no_response(descriptor.id())),
+            }
         }
     }
 
@@ -768,12 +787,17 @@ impl Invoker {
         async move {
             let descriptor = self.registry.get(id).ok_or_else(|| not_found(id))?;
             let handler = descriptor.typed.downcast_ref::<Arc<dyn Handler<Req, Res>>>().ok_or_else(|| type_mismatch(id))?;
-            let terminal = Typed { handler: Arc::clone(handler), request, outcome: Mutex::new(None) };
+            let terminal = Typed { handler: Arc::clone(handler), request };
             let scope = Scope::enter(ctx, Arc::clone(&descriptor), None);
             let outcome = self.pipeline.run(ctx, &terminal).await;
+            let response = scope.take_response();
             drop(scope);
             outcome?;
-            terminal.outcome.into_inner().unwrap_or_else(PoisonError::into_inner).unwrap_or_else(|| Err(no_response(id)))
+            // 槽里的响应由这个终点写入，类型总是登记的类型
+            match response {
+                Some(Produced::Typed(response)) => response.downcast::<Res>().map(|response| *response).map_err(|_| no_response(id)),
+                _ => Err(no_response(id)),
+            }
         }
     }
 }

@@ -707,3 +707,56 @@ fn cancellation_only_notifies_through_the_token() {
     canceller.join().unwrap();
     assert_eq!(*after.lock().unwrap(), 3, "the middleware ran to the end every time");
 }
+
+/// 中间件在 handle 阶段之后看到编码之前的响应对象，XGI 调用与类型化调用一样（.NET 的 FindOperationResponse，RFC-0011 规则 3、10）；
+/// 类型化调用的响应不经编码，原样交回调用方。
+#[test]
+fn middlewares_see_the_response_of_both_kinds_of_invocation() {
+    #[derive(Clone, Serialize)]
+    struct Report {
+        lines: usize,
+    }
+    let registry = registry();
+    registry
+        .add(
+            Contract::new("reports.build"),
+            operation::handler_fn(|_ctx, request: CreateOrder| {
+                Box::pin(async move { Ok(Report { lines: usize::try_from(request.quantity).unwrap_or_default() }) })
+            }),
+        )
+        .unwrap_or_else(|error| panic!("{error}"));
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let reader = {
+        let seen = Arc::clone(&seen);
+        pipeline::from_fn("Reader", move |ctx, next| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                let before = operation::with_response(ctx, |_: &OrderCreated| ()).is_some();
+                let outcome = next.run(ctx).await;
+                let created = operation::with_response(ctx, |created: &OrderCreated| created.quantity);
+                let report = operation::with_response(ctx, |report: &Report| report.lines);
+                seen.lock().unwrap().push((before, created, report));
+                outcome
+            })
+        })
+    };
+    let mut builder = Builder::new();
+    builder.use_at(reader, PipelineStage::Handle, Placement::End, APP_OWNER).unwrap();
+    let invoker = Invoker::new(registry, &builder).unwrap();
+    let ctx = Context::background();
+
+    let payload = common::block_on(invoker.invoke(&ctx, Request::new("orders.create", r#"{"quantity":2}"#))).unwrap();
+    assert_eq!(payload, br#"{"id":"o-","quantity":2}"#);
+    let created = common::block_on(invoker.invoke_typed::<CreateOrder, OrderCreated>(&ctx, "orders.create", CreateOrder { quantity: 3 })).unwrap();
+    assert_eq!(created.quantity, 3, "the typed caller still receives the response");
+    let report = common::block_on(invoker.invoke_typed::<CreateOrder, Report>(&ctx, "reports.build", CreateOrder { quantity: 4 })).unwrap();
+    assert_eq!(report.lines, 4);
+    let failed = common::block_on(invoker.invoke_typed::<CreateOrder, OrderCreated>(&ctx, "orders.create", CreateOrder::default())).unwrap_err();
+    assert_eq!(failed.code(), "ORDERS_VALIDATION_001");
+    assert_eq!(
+        *seen.lock().unwrap(),
+        [(false, Some(2), None), (false, Some(3), None), (false, None, Some(4)), (false, None, None)],
+        "the response is visible after the handler in both kinds of invocation, and only then"
+    );
+    assert!(operation::with_response(&ctx, |_: &OrderCreated| ()).is_none(), "the slot is restored after the invocation");
+}
