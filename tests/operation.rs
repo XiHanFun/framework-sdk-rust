@@ -88,7 +88,10 @@ fn invoke_runs_the_pipeline_and_encodes_the_response() {
     for (payload, reason) in [
         ("null", "$"),
         (" null ", "$"),
-        ("[true]", "$[0]"),
+        // 对象位置只收 JSON 对象：数组形式的结构体是根上的类型不符（ADR-0236）
+        ("[true]", "$"),
+        // 只有空白不是 JSON，不等价于空载荷
+        (" \n", "$"),
         ("[1, 2]", "$"),
         ("{", "$"),
         (r#"{"quantity":"two"}"#, "$.quantity"),
@@ -99,7 +102,7 @@ fn invoke_runs_the_pipeline_and_encodes_the_response() {
         assert_eq!(invalid.details().unwrap()["reason"], json!(reason), "payload {payload:?}");
         common::assert_kernel_error(&invalid, MESSAGE_INVALID_PAYLOAD);
     }
-    let empty = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", " \n"))).unwrap_err();
+    let empty = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", ""))).unwrap_err();
     assert_eq!(empty.code(), "ORDERS_VALIDATION_001", "an empty payload is {{}}");
 }
 
@@ -358,24 +361,50 @@ fn expired_deadlines_stop_before_the_pipeline() {
     assert_eq!(*entered.lock().unwrap(), 1);
 }
 
-/// payload-reasons.json 的订单：lines 是数组，每项是对象，quantity 是整数。
+/// payload-reasons.json 的订单：lines 是可选的数组，每项是对象，quantity 是可选的 32 位整数。
 #[derive(Clone, Debug, Deserialize)]
 struct VectorOrder {
     #[allow(dead_code)]
-    lines: Vec<VectorLine>,
+    lines: Option<Vec<VectorLine>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
 struct VectorLine {
+    #[serde(default)]
     #[allow(dead_code)]
-    quantity: i64,
+    quantity: i32,
+}
+
+/// payload-reasons.json 的 profile，按 README 的映射声明：name 必填、接受 null；整数、浮点、布尔可选而不接受 null；
+/// 字符串、数组、对象与任意 JSON 接受 null；inner.n 必填。
+#[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
+struct VectorProfile {
+    #[serde(deserialize_with = "operation::nullable")]
+    name: Option<String>,
+    note: Option<String>,
+    #[serde(default)]
+    count: i64,
+    #[serde(default)]
+    ratio: f64,
+    #[serde(default)]
+    flag: bool,
+    tags: Option<Vec<Option<String>>>,
+    scores: Option<Vec<i64>>,
+    inner: Option<VectorInner>,
+    meta: Option<serde_json::Value>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[allow(dead_code)]
+struct VectorInner {
+    n: i64,
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct ReasonVectors {
+    requests: BTreeMap<String, String>,
     cases: Vec<ReasonCase>,
-    syntax_errors: Vec<SyntaxCase>,
 }
 
 #[derive(Deserialize)]
@@ -383,42 +412,36 @@ struct ReasonCase {
     name: String,
     request: String,
     payload: String,
-    reason: String,
+    reason: Option<String>,
 }
 
-#[derive(Deserialize)]
-struct SyntaxCase {
-    request: String,
-    payload: String,
-}
-
-/// 载荷不合法时的 reason 按 payload-reasons.json（RFC-0011 规则 2）：counts 是整数字典，order 是带明细数组的订单。
+/// 载荷的解码按 payload-reasons.json（RFC-0011 规则 2，ADR-0236）：先过共同的 JSON 读取检查，再按请求类型解码；
+/// reason 为 null 表示解码成功，否则逐字相等。counts 是 32 位整数的字典，order 是带明细数组的订单，profile 带必填成员与各种取值。
 #[test]
 fn payload_reasons_follow_the_vectors() {
     let registry = Registry::new();
-    registry.add(Contract::new("counts.set"), operation::handler_fn(|_ctx, _request: BTreeMap<String, i64>| Box::pin(async { Ok(()) }))).unwrap();
+    registry.add(Contract::new("counts.set"), operation::handler_fn(|_ctx, _request: BTreeMap<String, i32>| Box::pin(async { Ok(()) }))).unwrap();
     registry.add(Contract::new("orders.place"), operation::handler_fn(|_ctx, _request: VectorOrder| Box::pin(async { Ok(()) }))).unwrap();
+    registry.add(Contract::new("profiles.save"), operation::handler_fn(|_ctx, _request: VectorProfile| Box::pin(async { Ok(()) }))).unwrap();
     let invoker = Invoker::new(Arc::new(registry), &Builder::new()).unwrap();
-    let invoke = |request: &str, payload: &str| {
-        let id = match request {
+    let vectors: ReasonVectors = common::vector("operations/payload-reasons.json");
+    assert_eq!(vectors.requests.keys().collect::<Vec<_>>(), ["counts", "order", "profile"]);
+    for case in &vectors.cases {
+        let id = match case.request.as_str() {
             "counts" => "counts.set",
             "order" => "orders.place",
+            "profile" => "profiles.save",
             other => panic!("unknown request type {other}"),
         };
-        common::block_on(invoker.invoke(&Context::background(), Request::new(id, payload)))
-    };
-    let vectors: ReasonVectors = common::vector("operations/payload-reasons.json");
-    for case in &vectors.cases {
-        let error = invoke(&case.request, &case.payload).expect_err(&case.name);
-        common::assert_kernel_error(&error, MESSAGE_INVALID_PAYLOAD);
-        assert_eq!(error.details().unwrap()["reason"], json!(case.reason), "{}", case.name);
+        let outcome = common::block_on(invoker.invoke(&Context::background(), Request::new(id, case.payload.as_str())));
+        match (&case.reason, outcome) {
+            (None, Ok(_)) => {}
+            (None, Err(error)) => panic!("{} must decode: {error}", case.name),
+            (Some(reason), Err(error)) => {
+                common::assert_kernel_error(&error, MESSAGE_INVALID_PAYLOAD);
+                assert_eq!(error.details().unwrap()["reason"], json!(reason), "{}", case.name);
+            }
+            (Some(reason), Ok(_)) => panic!("{} must fail at {reason}", case.name),
+        }
     }
-    for case in &vectors.syntax_errors {
-        let error = invoke(&case.request, &case.payload).expect_err(&case.payload);
-        assert_eq!(error.code(), ERROR_CODE_INVALID_PAYLOAD, "{}", case.payload);
-        let reason = error.details().unwrap()["reason"].as_str().unwrap().to_owned();
-        assert!(reason.starts_with('$'), "{}: {reason}", case.payload);
-    }
-    assert!(invoke("counts", r#"{"a":1,"b":2}"#).is_ok());
-    assert!(invoke("order", r#"{"lines":[{"quantity":1}]}"#).is_ok());
 }

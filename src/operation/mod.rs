@@ -33,14 +33,14 @@ use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::Poll;
 use std::time::SystemTime;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use serde_path_to_error::Segment;
 
 use crate::BoxFuture;
 use crate::invocation::{Context, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START};
 use crate::pipeline::{self, APP_OWNER, Pipeline, Step};
+use crate::primitives::json::{self, Node};
 use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, Result, Stability, is_error_code};
 
 /// 操作未登记。
@@ -588,8 +588,7 @@ impl Invoker {
     /// `kernel.invocation.deadline_before_start`（按时钟判断，不进管道）；否则把操作与请求放进上下文，经完整管道执行，handle 阶段之后解码、
     /// 执行、编码。中间件以成功短路、没有执行操作时返回 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response`（规则 9）；载荷不合法时 `reason` 是出错位置的 JSON 路径（如 `$.quantity`）。
     ///
-    /// 载荷按请求类型自己的 `Deserialize` 解码：serde 派生的结构体除了 JSON 对象，也接受字段同序的数组（如 `[1]`）；
-    /// 要只收对象时在请求类型上自行实现 `Deserialize`。
+    /// 载荷先过共同的 JSON 读取检查，再按请求类型的 `Deserialize` 解码；必填、可选与接受 `null` 的成员怎么声明见 [`nullable`]。
     // 返回类型写明 Send：签名即承诺 future 可以跨线程（gRPC 服务端要求），实现改动不会悄悄破坏这一点
     #[allow(clippy::manual_async_fn)]
     pub fn invoke<'a>(&'a self, ctx: &'a Context, request: Request) -> impl Future<Output = Result<Vec<u8>>> + Send + 'a {
@@ -644,46 +643,55 @@ impl fmt::Debug for Invoker {
     }
 }
 
-/// 解码请求载荷：空等价于 `{}`；非 JSON、`null` 或类型不匹配为 `KERNEL_VALIDATION_001`。
+/// 解码请求载荷（RFC-0011 规则 2）：空载荷等价于 `{}`；先过共同的 JSON 读取检查，再按请求类型解码，失败为 `KERNEL_VALIDATION_001`。
+///
+/// `reason` 是出错位置的路径：语法错误（含 BOM、嵌套过深、孤立的代理项）与 `null` 载荷写 `$`，重复成员写第一处重复的路径、
+/// 先于一切类型问题；其余按文本顺序报第一处类型不符，缺少必填成员在所在对象结束时报该对象的路径（根上为 `$`）。
 fn decode<Req: DeserializeOwned>(id: &str, payload: &[u8]) -> Result<Req> {
-    let trimmed = payload.trim_ascii();
-    let trimmed = if trimmed.is_empty() { b"{}".as_slice() } else { trimmed };
-    if trimmed == b"null" {
+    // 只有长度为 0 的载荷等价于 {}：只有空白的不是 JSON
+    let payload = if payload.is_empty() { b"{}".as_slice() } else { payload };
+    let node = json::parse(payload).map_err(|error| invalid_payload(id, error.path().to_owned()))?;
+    if node == Node::Null {
         return Err(invalid_payload(id, "$".to_owned()));
     }
-    let mut deserializer = serde_json::Deserializer::from_slice(trimmed);
-    let request = serde_path_to_error::deserialize(&mut deserializer).map_err(|error| invalid_payload(id, json_path(error.path())))?;
-    // 值之后还有别的内容（如两个 JSON 值）也不合法，位置是根
-    deserializer.end().map_err(|_| invalid_payload(id, "$".to_owned()))?;
-    Ok(request)
+    json::decode(&node).map_err(|error| invalid_payload(id, error.path().to_owned()))
 }
 
-/// 出错位置的 JSON 路径（RFC-0011 规则 2，ADR-0124、ADR-0235，照 System.Text.Json 的实测）：根是 `$`，成员 `.名字`，下标 `[i]`。
+/// 请求类型里必填而接受 `null` 的成员：`#[serde(deserialize_with = "operation::nullable")] name: Option<String>`（RFC-0011 规则 2）。
 ///
-/// 成员名含 [`QUOTED`] 里的任一字符时写成 `['名字']`，名字原样、不转义；其余字符照写（含 `-`、`:`、汉字与其他控制字符），
-/// 空的成员名写成 `$.`。不带 Rust 类型名，也不带解析器的错误文本。
-fn json_path(path: &serde_path_to_error::Path) -> String {
-    let mut text = String::from("$");
-    for segment in path.iter() {
-        match segment {
-            Segment::Seq { index } => text.push_str(&format!("[{index}]")),
-            Segment::Map { key } | Segment::Enum { variant: key } => {
-                if key.chars().any(|char| QUOTED.contains(&char)) {
-                    text.push_str(&format!("['{key}']"));
-                } else {
-                    text.push('.');
-                    text.push_str(key);
-                }
-            }
-            // 路径不明的一段（如未标记的枚举内部）不写出
-            Segment::Unknown => {}
-        }
-    }
-    text
+/// 必填只要求成员出现：缺少时解码失败、报所在对象的路径，写成 `null` 为 `None`。其余的声明照 serde 的惯例：
+///
+/// | 规范 | Rust 的请求类型 |
+/// | --- | --- |
+/// | 必填，不接受 `null` | 不带 `#[serde(default)]` 的非 `Option` 成员：`n: i64` |
+/// | 必填，接受 `null` | `#[serde(deserialize_with = "operation::nullable")] name: Option<String>` |
+/// | 可选，不接受 `null`（整数、浮点、布尔） | `#[serde(default)] count: i64`，缺少时取缺省值 |
+/// | 可选，接受 `null`（字符串、数组、对象） | `Option<T>`：缺少与 `null` 都是 `None` |
+/// | 任意 JSON | `serde_json::Value` 或 `Option<Value>` |
+///
+/// 数组项同理：接受 `null` 的字符串项写 `Vec<Option<String>>`。成员名区分大小写，未知成员忽略，数字不从字符串读，整数不接受
+/// `1.0` 与 `1e2`、超出类型的范围即不符，浮点接受整数写法、上溢为无穷；对象位置只收 JSON 对象。
+///
+/// ```
+/// use serde::Deserialize;
+/// use xihan_framework::operation;
+/// use xihan_framework::primitives::json;
+///
+/// #[derive(Debug, Deserialize)]
+/// struct Profile {
+///     #[serde(deserialize_with = "operation::nullable")]
+///     name: Option<String>,
+///     #[serde(default)]
+///     count: i64,
+/// }
+///
+/// assert_eq!(json::from_str::<Profile>(r#"{"name":null}"#).unwrap().name, None);
+/// assert_eq!(json::from_str::<Profile>(r#"{"count":1}"#).unwrap_err().path(), "$");
+/// assert_eq!(json::from_str::<Profile>(r#"{"name":"a","count":null}"#).unwrap_err().path(), "$.count");
+/// ```
+pub fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> std::result::Result<Option<T>, D::Error> {
+    Option::<T>::deserialize(deserializer)
 }
-
-/// 成员名里需要写成 `['名字']` 的字符（RFC-0011 规则 2）。
-const QUOTED: &[char] = &['.', ' ', '\'', '/', '"', '[', ']', '(', ')', '\\', '\t', '\n', '\r', '\u{0C}', '\u{08}', '\u{85}', '\u{2028}', '\u{2029}'];
 
 fn invalid_payload(id: &str, reason: String) -> Error {
     Error::validation(ERROR_CODE_INVALID_PAYLOAD, MESSAGE_INVALID_PAYLOAD).with_detail("id", id).with_detail("reason", reason)
