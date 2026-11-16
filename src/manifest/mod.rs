@@ -1,7 +1,8 @@
 //! `xihan.manifest.json` 的模型（RFC-0002，Schema 见 `spec/manifest/manifest.schema.json`）。
 //!
-//! 只做数据与格式校验；收集、解析与求解是宿主的职责。[`read`] 解析并校验，[`write()`] 校验后输出规范化的 JSON
-//! （两空格缩进，字段按 Schema 顺序，缺省值省略），二者对同一份清单往返不变。
+//! 只做数据与格式校验；收集、解析与求解是宿主的职责。[`read`] 按 RFC-0002 解析规则 2 的顺序读取并校验，错误都是
+//! [`ERROR_CODE_INVALID_MANIFEST`] 加消息键与路径；[`write()`] 校验后按规范的排版写出（两空格缩进、LF、成员顺序固定、列表总写），
+//! 各语言逐字相同，再读得到同一份清单。
 //!
 //! ```
 //! use xihan_framework::manifest::{self, Isolation, Kind};
@@ -22,14 +23,50 @@ use std::str::FromStr;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
-use crate::grammar::{all, digit, lower, lower_digit, lower_digit_hyphen, operation_id, positive, upper, word};
-use crate::primitives::{ERROR_CODE_INVALID_ARGUMENT, FrameworkError, PipelineStage, Stability};
+mod shape;
+
+use crate::grammar::positive;
+use crate::primitives::json::{self, Node};
+use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, FrameworkError, PipelineStage, Stability};
 
 /// 清单文件名。
 pub const FILE_NAME: &str = "xihan.manifest.json";
 
 /// 缺省的激活事件：宿主启动时激活。
 pub const ACTIVATION_ON_STARTUP: &str = "onStartup";
+
+/// 写出的 `$schema`。
+pub const SCHEMA_URI: &str = "https://spec.xihanfun.com/manifest/v1.json";
+
+/// 读取清单失败的错误码（RFC-0002 解析规则 2）：不是 JSON、为空、不合 Schema、跨字段约束与文件不存在都用它。
+pub const ERROR_CODE_INVALID_MANIFEST: &str = "KERNEL_CAPABILITY_006";
+
+/// 不是 JSON，或有重复成员；参数 `reason`：`$` 或第一处重复的路径。
+pub const MESSAGE_INVALID_JSON: &str = "kernel.manifest.invalid_json";
+
+/// 根是字面量 `null`；没有参数。
+pub const MESSAGE_EMPTY: &str = "kernel.manifest.empty";
+
+/// 不合 Schema；参数 `reason`：第一处问题的路径。
+pub const MESSAGE_INVALID: &str = "kernel.manifest.invalid";
+
+/// 清单文件不存在；参数 `path`。
+pub const MESSAGE_FILE_MISSING: &str = "kernel.manifest.file_missing";
+
+/// 插件没有声明隔离级别；参数 `id`。
+pub const MESSAGE_ISOLATION_REQUIRED: &str = "primitives.manifest.isolation_required";
+
+/// 非插件声明了隔离级别或权限；参数 `id`。
+pub const MESSAGE_ISOLATION_NOT_ALLOWED: &str = "primitives.manifest.isolation_not_allowed";
+
+/// 提供的能力 ID 重复；参数 `id`。
+pub const MESSAGE_DUPLICATE_PROVIDES: &str = "primitives.manifest.duplicate_provides";
+
+/// 依赖的能力 ID 重复；参数 `id`。
+pub const MESSAGE_DUPLICATE_REQUIRES: &str = "primitives.manifest.duplicate_requires";
+
+/// 绑定名重复；参数 `id`。
+pub const MESSAGE_DUPLICATE_BINDINGS: &str = "primitives.manifest.duplicate_bindings";
 
 /// 清单种类。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -123,12 +160,12 @@ impl fmt::Display for Isolation {
 
 /// 判断清单 ID 是否符合 `xihan.<领域>.<名称>`：`^xihan\.[a-z][a-z0-9]*\.[a-z][a-z0-9-]*$`。
 pub fn is_manifest_id(id: &str) -> bool {
-    id.strip_prefix("xihan.").is_some_and(is_capability_id)
+    shape::is_manifest_id(id)
 }
 
 /// 判断能力 ID 是否符合 `<领域>.<能力>`：`^[a-z][a-z0-9]*\.[a-z][a-z0-9-]*$`。
 pub fn is_capability_id(id: &str) -> bool {
-    id.split_once('.').is_some_and(|(domain, capability)| word(domain, lower, lower_digit) && word(capability, lower, lower_digit_hyphen))
+    shape::is_capability_id(id)
 }
 
 /// 返回清单 ID 或能力 ID 的领域段；都不合法时为 `None`。
@@ -439,147 +476,224 @@ impl Manifest {
         self.contributes.as_ref()?.config.as_ref().map(|config| config.section.as_str())
     }
 
-    /// 校验格式与跨字段约束；失败为 `PRIMITIVES_VALIDATION_001`。
+    /// 校验字段的格式与跨字段约束；失败为 `PRIMITIVES_VALIDATION_001`（与 .NET 的 `Manifest.Validate` 同码）。
     ///
-    /// 插件必须声明隔离，非插件不得声明隔离或权限，只有 Wasm 插件可以贡献中间件，提供、依赖与绑定不得重复。
+    /// 字段的格式按 [`read`] 第 3 步的同一套 Schema 核对，说明里带出第一处问题的路径，如 `$.provides[0].version`。跨字段约束按这个
+    /// 顺序（RFC-0002 解析规则 2 第 4 步）：插件必须声明隔离（[`MESSAGE_ISOLATION_REQUIRED`]），非插件不得声明隔离或权限
+    /// （[`MESSAGE_ISOLATION_NOT_ALLOWED`]），提供、依赖的能力 ID 与绑定名不得重复（[`MESSAGE_DUPLICATE_PROVIDES`]、
+    /// [`MESSAGE_DUPLICATE_REQUIRES`]、[`MESSAGE_DUPLICATE_BINDINGS`]），带消息键，参数只有 `id`。
     pub fn validate(&self) -> Result<(), FrameworkError> {
-        let id = self.id.as_str();
-        if !is_manifest_id(id) {
-            return invalid(format!("the manifest ID '{id}' must match xihan.<domain>.<name>"));
+        // 写出的文本总是 JSON；再按读取的同一套 Schema 核对，字段的格式与读取报得一样
+        let node = json::parse(render(self).as_bytes())
+            .map_err(|error| FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, format!("The manifest could not be checked: {error}.")))?;
+        if let Err(path) = shape::check(&node) {
+            return Err(FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, format!("The manifest '{}' is not valid at '{path}'.", self.id)));
         }
-        if !is_semver(&self.version) {
-            return invalid(format!("the version '{}' of '{id}' must be a semantic version", self.version));
+        match self.constraint() {
+            Some(key) => Err(FrameworkError::with_message(ERROR_CODE_INVALID_ARGUMENT, key, id_argument(&self.id))),
+            None => Ok(()),
         }
-        if self.primitives < 1 {
-            return invalid(format!("the primitives version of '{id}' must be a positive integer"));
-        }
-        match (self.kind, self.isolation) {
-            (Kind::Plugin, None) => return invalid(format!("the plugin '{id}' must declare its isolation")),
-            (kind, Some(_)) if kind != Kind::Plugin => return invalid(format!("'{id}' is not a plugin and must not declare an isolation")),
-            _ => {}
-        }
-        if self.kind != Kind::Plugin && !self.permissions.is_empty() {
-            return invalid(format!("'{id}' is not a plugin and must not declare permissions"));
-        }
+    }
 
-        // 去重集合只活在一次校验里，大小以清单本身为上限
-        let mut seen = HashSet::new();
-        for declaration in &self.provides {
-            if !is_capability_id(&declaration.id) || declaration.version < 1 {
-                return invalid(format!("the provided capability '{}' of '{id}' is not valid", declaration.id));
-            }
-            if !seen.insert(declaration.id.as_str()) {
-                return invalid(format!("'{id}' provides '{}' more than once", declaration.id));
-            }
+    /// 第一个不满足的跨字段约束的消息键。
+    fn constraint(&self) -> Option<&'static str> {
+        if self.kind == Kind::Plugin && self.isolation.is_none() {
+            return Some(MESSAGE_ISOLATION_REQUIRED);
         }
-        seen.clear();
-        for requirement in &self.requires {
-            if !is_capability_id(&requirement.id) || requirement.version < 1 {
-                return invalid(format!("the required capability '{}' of '{id}' is not valid", requirement.id));
-            }
-            if !seen.insert(requirement.id.as_str()) {
-                return invalid(format!("'{id}' requires '{}' more than once", requirement.id));
-            }
+        if self.kind != Kind::Plugin && (self.isolation.is_some() || !self.permissions.is_empty()) {
+            return Some(MESSAGE_ISOLATION_NOT_ALLOWED);
         }
-        seen.clear();
-        for binding in &self.bindings {
-            if !is_binding_name(&binding.name) || !is_binding_type(&binding.resource_type) {
-                return invalid(format!("the binding '{}' ({}) of '{id}' is not valid", binding.name, binding.resource_type));
-            }
-            if !seen.insert(binding.name.as_str()) {
-                return invalid(format!("'{id}' declares the binding '{}' more than once", binding.name));
-            }
+        if has_duplicates(self.provides.iter().map(|declaration| declaration.id.as_str())) {
+            return Some(MESSAGE_DUPLICATE_PROVIDES);
         }
-        if let Some(event) = self.activation.iter().find(|event| !is_activation_event(event)) {
-            return invalid(format!("the activation event '{event}' of '{id}' is not valid"));
+        if has_duplicates(self.requires.iter().map(|requirement| requirement.id.as_str())) {
+            return Some(MESSAGE_DUPLICATE_REQUIRES);
         }
-        if let Some(permission) = self.permissions.iter().find(|permission| !is_permission(permission)) {
-            return invalid(format!("the permission '{permission}' of '{id}' is not valid"));
+        if has_duplicates(self.bindings.iter().map(|binding| binding.name.as_str())) {
+            return Some(MESSAGE_DUPLICATE_BINDINGS);
         }
-        if let Some(contributes) = &self.contributes {
-            contributes.validate(id)?;
-            // 只有 Wasm 插件能贡献中间件（RFC-0017「范围」）：进程外与进程内插件的清单写了 contributes.pipeline，
-            // .NET 宿主在发现或加载时以 PLUGINS_VALIDATION_001 拒绝；读清单时同样拒绝，不让作者以为中间件生效了、等到宿主那里才失败
-            if let (Kind::Plugin, Some(isolation)) = (self.kind, self.isolation) {
-                if isolation != Isolation::Wasm && !contributes.pipeline.is_empty() {
-                    let names: Vec<&str> = contributes.pipeline.iter().map(|contribution| contribution.middleware.as_str()).collect();
-                    return invalid(format!(
-                        "the plugin '{id}' with isolation '{isolation}' must not declare 'contributes.pipeline' ({}): only wasm plugins can contribute middleware",
-                        names.join(", ")
-                    ));
-                }
-            }
-        }
-        Ok(())
+        None
     }
 }
 
-impl Contributions {
-    /// 校验贡献点；`id` 是所在清单的 ID。
-    fn validate(&self, id: &str) -> Result<(), FrameworkError> {
-        if self.pipeline.iter().any(|contribution| contribution.middleware.is_empty()) {
-            return invalid(format!("a pipeline contribution of '{id}' has no middleware name"));
-        }
-        if let Some(operation) = self.operations.iter().find(|operation| !operation_id(operation)) {
-            return invalid(format!("the operation '{operation}' of '{id}' must match <resource>.<verb>"));
-        }
-        if let Some(config) = self.config.as_ref().filter(|config| !is_config_section(&config.section)) {
-            return invalid(format!(
-                "the configuration section '{}' of '{id}' must match XiHan:<Domain> or XiHan:<Domain>:<Section>..., with PascalCase segments",
-                config.section
-            ));
-        }
-        // 插件定义的权限码由宿主在登记代理操作时一并登记（plugin/invocation.md §1）：不合文法或重复的码，
-        // 宿主在发现时拒绝整个插件；读清单时同样拒绝，不让它等到宿主那里才失败
-        let mut seen = HashSet::new();
-        for code in &self.permissions {
-            if !is_permission_code(code) {
-                return invalid(format!(
-                    "the permission code '{code}' in 'contributes.permissions' of '{id}' must be a lowercase dot-separated code with at least two segments, such as 'orders.read'"
-                ));
-            }
-            if !seen.insert(code.as_str()) {
-                return invalid(format!("the permission code '{code}' appears more than once in 'contributes.permissions' of '{id}'"));
-            }
-        }
-        if let Some(health) = self.health.iter().find(|health| !word(health, lower, |byte| lower_digit_hyphen(byte) || byte == b'.')) {
-            return invalid(format!("the health item '{health}' of '{id}' is not valid"));
-        }
-        Ok(())
-    }
+/// 去重集合只活在一次校验里，大小以清单本身为上限。
+fn has_duplicates<'a>(items: impl Iterator<Item = &'a str>) -> bool {
+    let mut seen = HashSet::new();
+    items.into_iter().any(|item| !seen.insert(item))
 }
 
-/// 解析并校验清单 JSON；未知字段、格式与跨字段约束都算失败（`PRIMITIVES_VALIDATION_001`）。
+/// 跨字段约束的参数：清单 ID。
+fn id_argument(id: &str) -> Details {
+    Details::from([("id".to_owned(), Value::from(id))])
+}
+
+/// 读取清单失败：[`ERROR_CODE_INVALID_MANIFEST`] 加消息键与一个参数。
+fn reading_error(key: &str, name: &str, value: &str) -> FrameworkError {
+    FrameworkError::with_message(ERROR_CODE_INVALID_MANIFEST, key, Details::from([(name.to_owned(), Value::from(value))]))
+}
+
+/// 从 JSON 文本读取清单（RFC-0002 解析规则 2）：按下面的顺序逐项核对，报第一处问题，错误码都是 [`ERROR_CODE_INVALID_MANIFEST`]。
+///
+/// 1. JSON 文本：过共同的读取检查（[`json::check`]）。不是 JSON 时为 [`MESSAGE_INVALID_JSON`]，`reason` 为 `$`；任何一层有重复成员
+///    时同一个键，`reason` 为第一处重复的路径。文本按原样检查，开头的 BOM 是语法错误（[`read_file`] 会跳过它）。
+/// 2. 根是字面量 `null`：[`MESSAGE_EMPTY`]，没有参数。
+/// 3. 形状：按 Schema 逐项核对，第一处问题为 [`MESSAGE_INVALID`]，`reason` 是该处的路径；根不是对象时为 `$`。成员按在文本里出现的
+///    顺序，每个成员依次查 Schema 之外的成员（成员名区分大小写）→ `null` → 类型 → 取值，对象与数组进到里面再查；对象的成员查完后
+///    按 Schema 里 `required` 的顺序报缺少的成员。接口版本是不带前导零的正整数、不超过 2147483647，只有 `requires[].version` 可以带
+///    一个 `^`；`activation` 至少一项；`contributes.permissions` 不得重复，路径是第二次出现的项。
+/// 4. 跨字段约束：同 [`Manifest::validate`] 的顺序与消息键，参数只有 `id`。
+///
+/// 只有 Wasm 插件能贡献中间件是宿主在发现插件时的核对（`PLUGINS_VALIDATION_001`），读取不管。
 pub fn read(data: impl AsRef<[u8]>) -> Result<Manifest, FrameworkError> {
-    let data = data.as_ref();
-    let not_valid = || FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, "The manifest is not valid JSON for the schema.");
-    // 先按 JSON 值核对对象位置，再按类型读入：后者报出重复成员、未知成员、大小写不对的成员名与 null
-    let value: Value = serde_json::from_slice(data).map_err(|error| not_valid().with_cause(error))?;
-    if let Some(path) = array_in_object_position(&value) {
-        return Err(not_valid().with_cause(format!("'{path}' must be a JSON object")));
+    let node = json::parse(data.as_ref()).map_err(|error| reading_error(MESSAGE_INVALID_JSON, "reason", error.path()))?;
+    if node == Node::Null {
+        return Err(FrameworkError::with_message(ERROR_CODE_INVALID_MANIFEST, MESSAGE_EMPTY, Details::new()));
     }
-    let manifest: Manifest = serde_json::from_slice(data).map_err(|error| not_valid().with_cause(error))?;
-    manifest.validate()?;
-    Ok(manifest)
+    shape::check(&node).map_err(|path| reading_error(MESSAGE_INVALID, "reason", &path))?;
+    // 形状核对过，按类型读入不会再失败；万一失败也按同一个键报出位置
+    let manifest: Manifest = json::decode(&node).map_err(|error| reading_error(MESSAGE_INVALID, "reason", error.path()))?;
+    match manifest.constraint() {
+        Some(key) => Err(FrameworkError::with_message(ERROR_CODE_INVALID_MANIFEST, key, id_argument(&manifest.id))),
+        None => Ok(manifest),
+    }
 }
 
-/// 读取并校验清单文件。
+/// 读取清单文件：按 UTF-8 读、跳过开头的 UTF-8 BOM，其余同 [`read`]；文件不存在（或不是文件）为 [`MESSAGE_FILE_MISSING`]，参数 `path`。
 pub fn read_file(path: impl AsRef<Path>) -> Result<Manifest, FrameworkError> {
-    let data =
-        std::fs::read(path).map_err(|error| FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, "The manifest file could not be read.").with_cause(error))?;
-    read(data)
+    let path = path.as_ref();
+    if !path.is_file() {
+        return Err(reading_error(MESSAGE_FILE_MISSING, "path", &path.display().to_string()));
+    }
+    let data = std::fs::read(path).map_err(|error| {
+        FrameworkError::new(ERROR_CODE_INVALID_MANIFEST, format!("The manifest file '{}' could not be read.", path.display())).with_cause(error)
+    })?;
+    read(data.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&data))
 }
 
-/// 校验后输出规范化的清单 JSON：两空格缩进，字段按 Schema 顺序，缺省值省略，末尾没有换行。
+/// 校验（[`Manifest::validate`]）后按规范的排版写出（RFC-0002「写出」），各语言逐字相同。
+///
+/// 两个空格缩进，换行只用 LF，末尾不换行，成员名与值之间是 `: `；空数组写 `[]`，非空数组每项一行。成员顺序固定：`$schema`
+/// （总写 [`SCHEMA_URI`]）、`id`、`package`、`version`、`primitives`、`stability`、`kind`、`role`（缺省写 `provider`）、`isolation`、
+/// `provides`、`requires`（每项都写 `optional`）、`bindings`（每项都写 `required`）、`contributes`（`pipeline`、`operations`、
+/// `config`、`permissions`、`health`）、`activation`（缺省写 `["onStartup"]`）、`permissions`、`entry`；没有值的可选成员不写，
+/// 列表总写。接口版本写成不带 `^` 的十进制文本，字符串只转义 `"`、`\` 与控制字符。
 pub fn write(manifest: &Manifest) -> Result<String, FrameworkError> {
     manifest.validate()?;
-    serde_json::to_string_pretty(manifest)
-        .map_err(|error| FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, "The manifest could not be encoded.").with_cause(error))
+    Ok(render(manifest))
 }
 
-/// 清单校验失败的配置错误：消息补上句号。
-fn invalid(message: String) -> Result<(), FrameworkError> {
-    Err(FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, message + "."))
+/// 写出时的值：借用清单里的文本。
+enum Out<'a> {
+    Text(&'a str),
+    Number(u32),
+    Bool(bool),
+    List(Vec<Out<'a>>),
+    Object(Vec<(&'static str, Out<'a>)>),
+}
+
+fn texts(items: &[String]) -> Out<'_> {
+    Out::List(items.iter().map(|item| Out::Text(item)).collect())
+}
+
+/// 按规范的排版写出，不校验。
+fn render(manifest: &Manifest) -> String {
+    let empty = Contributions::default();
+    let contributes = manifest.contributes.as_ref().unwrap_or(&empty);
+    let mut root = vec![("$schema", Out::Text(SCHEMA_URI)), ("id", Out::Text(&manifest.id))];
+    if let Some(package) = &manifest.package {
+        root.push(("package", Out::Text(package)));
+    }
+    root.extend([
+        ("version", Out::Text(&manifest.version)),
+        ("primitives", Out::Number(manifest.primitives)),
+        ("stability", Out::Text(manifest.stability.name())),
+        ("kind", Out::Text(manifest.kind.name())),
+        ("role", Out::Text(manifest.effective_role().name())),
+    ]);
+    if let Some(isolation) = manifest.isolation {
+        root.push(("isolation", Out::Text(isolation.name())));
+    }
+    let provides = manifest.provides.iter().map(|item| Out::Object(vec![("id", Out::Text(&item.id)), ("version", Out::Number(item.version))]));
+    let requires = manifest
+        .requires
+        .iter()
+        .map(|item| Out::Object(vec![("id", Out::Text(&item.id)), ("version", Out::Number(item.version)), ("optional", Out::Bool(item.optional))]));
+    let bindings = manifest
+        .bindings
+        .iter()
+        .map(|item| Out::Object(vec![("name", Out::Text(&item.name)), ("type", Out::Text(&item.resource_type)), ("required", Out::Bool(item.is_required()))]));
+    let pipeline = contributes.pipeline.iter().map(|item| {
+        Out::Object(vec![
+            ("middleware", Out::Text(&item.middleware)),
+            ("stage", Out::Text(item.stage.manifest_name())),
+            ("before", texts(&item.before)),
+            ("after", texts(&item.after)),
+        ])
+    });
+    let mut contributions = vec![("pipeline", Out::List(pipeline.collect())), ("operations", texts(&contributes.operations))];
+    if let Some(config) = &contributes.config {
+        let mut members = vec![("section", Out::Text(&config.section))];
+        if let Some(schema) = &config.schema {
+            members.push(("schema", Out::Text(schema)));
+        }
+        contributions.push(("config", Out::Object(members)));
+    }
+    contributions.extend([("permissions", texts(&contributes.permissions)), ("health", texts(&contributes.health))]);
+    root.extend([
+        ("provides", Out::List(provides.collect())),
+        ("requires", Out::List(requires.collect())),
+        ("bindings", Out::List(bindings.collect())),
+        ("contributes", Out::Object(contributions)),
+        ("activation", Out::List(manifest.effective_activation().into_iter().map(Out::Text).collect())),
+        ("permissions", texts(&manifest.permissions)),
+    ]);
+    if let Some(entry) = &manifest.entry {
+        root.push(("entry", Out::Text(entry)));
+    }
+    let mut text = String::new();
+    emit(&mut text, &Out::Object(root), 0);
+    text
+}
+
+fn emit(out: &mut String, value: &Out<'_>, indent: usize) {
+    let newline = |out: &mut String, indent: usize| {
+        out.push('\n');
+        for _ in 0..indent {
+            out.push_str("  ");
+        }
+    };
+    match value {
+        Out::Text(text) => json::write_string(out, text),
+        Out::Number(number) => json::write_string(out, &number.to_string()),
+        Out::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Out::List(items) if items.is_empty() => out.push_str("[]"),
+        Out::List(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                newline(out, indent + 1);
+                emit(out, item, indent + 1);
+            }
+            newline(out, indent);
+            out.push(']');
+        }
+        Out::Object(members) => {
+            out.push('{');
+            for (index, (name, member)) in members.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                newline(out, indent + 1);
+                json::write_string(out, name);
+                out.push_str(": ");
+                emit(out, member, indent + 1);
+            }
+            newline(out, indent);
+            out.push('}');
+        }
+    }
 }
 
 fn invalid_text(message: String) -> FrameworkError {
@@ -588,50 +702,6 @@ fn invalid_text(message: String) -> FrameworkError {
 
 fn is_false(value: &bool) -> bool {
     !*value
-}
-
-/// 语义化版本 `^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$`（与 Schema 一致，允许前导零）。
-fn is_semver(version: &str) -> bool {
-    let identifier = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-';
-    // 预发布与构建段都不含 '+'，第一个 '+' 之后是构建段
-    let (rest, build) = match version.split_once('+') {
-        Some((rest, build)) => (rest, Some(build)),
-        None => (version, None),
-    };
-    // 核心三段不含 '-'，第一个 '-' 之后是预发布段
-    let (core, pre_release) = match rest.split_once('-') {
-        Some((core, pre_release)) => (core, Some(pre_release)),
-        None => (rest, None),
-    };
-    let mut numbers = core.split('.');
-    let core_valid = (0..3).all(|_| numbers.next().is_some_and(|number| all(number, digit))) && numbers.next().is_none();
-    core_valid && pre_release.is_none_or(|text| all(text, identifier)) && build.is_none_or(|text| all(text, identifier))
-}
-
-/// 激活事件 `^(onStartup|onOperation:[a-z0-9.*-]+|onEvent:[a-z0-9.*-]+)$`。
-fn is_activation_event(event: &str) -> bool {
-    let pattern = |text: &str| all(text, |byte| lower_digit(byte) || matches!(byte, b'.' | b'*' | b'-'));
-    event == ACTIVATION_ON_STARTUP || event.strip_prefix("onOperation:").is_some_and(pattern) || event.strip_prefix("onEvent:").is_some_and(pattern)
-}
-
-/// 插件权限 `^(net\.outbound|fs\.read|fs\.write|capability):.+$`；`.` 不匹配换行。
-fn is_permission(permission: &str) -> bool {
-    permission
-        .split_once(':')
-        .is_some_and(|(scope, target)| matches!(scope, "net.outbound" | "fs.read" | "fs.write" | "capability") && !target.is_empty() && !target.contains('\n'))
-}
-
-/// 绑定名 `^[a-z][a-z0-9-]*$`。
-fn is_binding_name(name: &str) -> bool {
-    word(name, lower, lower_digit_hyphen)
-}
-
-/// 资源类型 `^[a-z]+(:[a-z]+)?$`。
-fn is_binding_type(resource_type: &str) -> bool {
-    match resource_type.split_once(':') {
-        Some((kind, detail)) => all(kind, lower) && all(detail, lower),
-        None => all(resource_type, lower),
-    }
 }
 
 /// 可选成员写了就必须有值：缺失表示没有，写成 `null` 不合法（RFC-0002 解析规则 2）。
@@ -646,44 +716,6 @@ fn non_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, 
         return Err(serde::de::Error::custom("the activation must list at least one event"));
     }
     Ok(events)
-}
-
-/// 找出写成数组的对象位置：serde 派生的结构体也接受字段同序的数组，清单的对象位置只收 JSON 对象。
-///
-/// 其他类型不对由读入本身报出，这里只看数组；返回出错位置的 JSON 路径。
-fn array_in_object_position(value: &Value) -> Option<String> {
-    let Value::Object(root) = value else {
-        return value.is_array().then(|| "$".to_owned());
-    };
-    let items = |object: &serde_json::Map<String, Value>, name: &str, prefix: &str| {
-        object.get(name).and_then(Value::as_array).and_then(|items| items.iter().position(Value::is_array).map(|index| format!("{prefix}.{name}[{index}]")))
-    };
-    for name in ["provides", "requires", "bindings"] {
-        if let Some(path) = items(root, name, "$") {
-            return Some(path);
-        }
-    }
-    match root.get("contributes") {
-        Some(Value::Array(_)) => Some("$.contributes".to_owned()),
-        Some(Value::Object(contributes)) => items(contributes, "pipeline", "$.contributes")
-            .or_else(|| contributes.get("config").filter(|config| config.is_array()).map(|_| "$.contributes.config".to_owned())),
-        _ => None,
-    }
-}
-
-/// 配置节 `^XiHan:[A-Z][A-Za-z0-9]*(:[A-Z][A-Za-z0-9]*)*$`。
-fn is_config_section(section: &str) -> bool {
-    section.strip_prefix("XiHan:").is_some_and(|rest| rest.split(':').all(|segment| word(segment, upper, |byte| byte.is_ascii_alphanumeric())))
-}
-
-/// 权限码 `^[a-z][a-z0-9-]*(\.[a-z][a-z0-9-]*)+$`（RFC-0008）。
-fn is_permission_code(code: &str) -> bool {
-    let mut parts = code.split('.');
-    let segment = |part: &str| word(part, lower, lower_digit_hyphen);
-    parts.next().is_some_and(segment) && {
-        let mut rest = parts.peekable();
-        rest.peek().is_some() && rest.all(segment)
-    }
 }
 
 /// 接口版本的线上编码：数字字符串。
@@ -709,42 +741,5 @@ mod version_text {
         let text = String::deserialize(deserializer)?;
         positive(text.strip_prefix('^').unwrap_or(&text))
             .ok_or_else(|| D::Error::custom(format!("the interface version '{text}' must be a positive integer, optionally prefixed with ^")))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn grammars_match_the_schema() {
-        for version in ["1.0.0", "5.0.0-preview.1", "1.2.3+build.7", "1.2.3-rc-1+a.b", "01.2.3"] {
-            assert!(is_semver(version), "{version}");
-        }
-        for version in ["", "1.0", "1.0.0.0", "1.0.0-", "1.0.0+", "v1.0.0", "1.0.0-é", "1..0"] {
-            assert!(!is_semver(version), "{version}");
-        }
-        for event in ["onStartup", "onOperation:orders.*", "onEvent:a-b.c"] {
-            assert!(is_activation_event(event), "{event}");
-        }
-        for event in ["", "onBoot", "onOperation:", "onEvent:Orders", "onStartup:x"] {
-            assert!(!is_activation_event(event), "{event}");
-        }
-        for permission in ["net.outbound:api.example.com", "fs.read:/tmp", "capability:kernel.pipeline", "fs.write::"] {
-            assert!(is_permission(permission), "{permission}");
-        }
-        for permission in ["sudo", "capability:", "net.inbound:x", "fs.read:a\nb"] {
-            assert!(!is_permission(permission), "{permission}");
-        }
-        for resource_type in ["queue", "connection:relational"] {
-            assert!(is_binding_type(resource_type), "{resource_type}");
-        }
-        for resource_type in ["", "a:", ":a", "a:b:c", "Queue", "cache-x"] {
-            assert!(!is_binding_type(resource_type), "{resource_type}");
-        }
-        assert!(operation_id("orders-x.create-1") && !operation_id("orders") && !operation_id("a.b.c") && !operation_id("orders-.create"));
-        assert_eq!(domain("xihan.samples.echo"), Some("samples"));
-        assert_eq!(domain("caching.distributed"), Some("caching"));
-        assert_eq!(domain("Caching"), None);
     }
 }

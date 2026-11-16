@@ -24,6 +24,10 @@ serde_path_to_error = "0.1"
 # 追踪 ID 与 Span ID 的随机数
 getrandom = "0.3"
 
+[dev-dependencies]
+# 一致性测试保留向量里清单的原文（成员顺序是文档顺序，Value 会按键排序）；只多出 RawValue 类型，不改变库的行为
+serde_json = { version = "1", features = ["raw_value"] }
+
 [lints.rust]
 unsafe_code = "forbid"
 missing_docs = "warn"

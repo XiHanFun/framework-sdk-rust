@@ -475,7 +475,7 @@ pub fn resolve_message(key: &str, arguments: &Details) -> Option<String> {
 pub const MESSAGE_UNINITIALIZED_RESULT: &str = "primitives.result.uninitialized";
 
 /// SDK 自带的 en-US 模板：SDK 与宿主共用的内核错误（RFC-0011「错误码」），逐字取自向量 `kernel-messages.json`；
-/// 另加调用期间未处理失败的模板（规则 5），取自 .NET 的语言文件。
+/// 另加清单读取的错误（RFC-0002 解析规则 2），取自 .NET 的语言文件。
 const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     (MESSAGE_UNINITIALIZED_RESULT, "The result is uninitialized: a default value is not a valid result."),
     ("kernel.invocation.deadline_exceeded", "The invocation exceeded its deadline."),
@@ -489,6 +489,16 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     ("kernel.operation.registry_full", "The operation registry has reached its capacity of {capacity}."),
     // 不在向量里：调用期间的未处理失败（RFC-0011 规则 5），模板取自 .NET 的 Localization/en-US.json
     ("kernel.invocation.unhandled_exception", "An unhandled exception occurred during the invocation."),
+    // 不在向量里：清单读取的错误（RFC-0002 解析规则 2），模板取自 .NET 内核与原语的 Localization/en-US.json
+    ("kernel.manifest.empty", "The manifest is empty."),
+    ("kernel.manifest.file_missing", "Manifest file '{path}' does not exist."),
+    ("kernel.manifest.invalid", "The manifest is not valid: {reason}"),
+    ("kernel.manifest.invalid_json", "The manifest is not valid JSON: {reason}"),
+    ("primitives.manifest.duplicate_bindings", "Manifest '{id}' declares the same binding name more than once in 'bindings'."),
+    ("primitives.manifest.duplicate_provides", "Manifest '{id}' declares the same capability ID more than once in 'provides'."),
+    ("primitives.manifest.duplicate_requires", "Manifest '{id}' declares the same capability ID more than once in 'requires'."),
+    ("primitives.manifest.isolation_not_allowed", "Manifest '{id}' is not a plugin and must not declare 'isolation' or 'permissions'."),
+    ("primitives.manifest.isolation_required", "Plugin manifest '{id}' must declare 'isolation'."),
 ];
 
 /// SDK 自带的消息目录：只有 [`DEFAULT_LOCALE`]，内容是 SDK 与宿主共用的内核错误模板。

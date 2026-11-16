@@ -2,11 +2,16 @@
 
 mod common;
 
-use serde::Deserialize;
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Deserializer};
+use serde_json::value::RawValue;
 use xihan_framework::manifest::{
-    self, Binding, CapabilityDeclaration, CapabilityRequirement, Contributions, Isolation, Kind, Manifest, PipelineContribution, Role,
+    self, Binding, CapabilityDeclaration, CapabilityRequirement, ERROR_CODE_INVALID_MANIFEST, Isolation, Kind, MESSAGE_DUPLICATE_BINDINGS,
+    MESSAGE_DUPLICATE_PROVIDES, MESSAGE_DUPLICATE_REQUIRES, MESSAGE_EMPTY, MESSAGE_FILE_MISSING, MESSAGE_INVALID, MESSAGE_INVALID_JSON,
+    MESSAGE_ISOLATION_NOT_ALLOWED, MESSAGE_ISOLATION_REQUIRED, Manifest, Role,
 };
-use xihan_framework::primitives::{ERROR_CODE_INVALID_ARGUMENT, PipelineStage, Stability};
+use xihan_framework::primitives::{ERROR_CODE_INVALID_ARGUMENT, FrameworkError, PipelineStage, Stability};
 
 const ECHO_MANIFEST: &str = r#"{
   "$schema": "https://spec.xihanfun.com/manifest/v1.json",
@@ -17,7 +22,7 @@ const ECHO_MANIFEST: &str = r#"{
   "stability": "experimental",
   "kind": "plugin",
   "isolation": "out-of-process",
-  "requires": [ { "id": "kernel.plugins", "version": "1" } ],
+  "requires": [ { "id": "kernel.plugins", "version": "^1" } ],
   "contributes": {
     "operations": [ "echoes.create", "echoes.relay", "echoes.crash", "events.list" ],
     "config": { "section": "XiHan:Echo" },
@@ -28,7 +33,7 @@ const ECHO_MANIFEST: &str = r#"{
   "entry": "EchoPlugin"
 }"#;
 
-/// 规范化输出：字段按 Schema 顺序，缺省值省略，两空格缩进。
+/// 规范的排版（RFC-0002「写出」）：成员顺序固定，缺省值写出，列表总写，版本不带 ^。
 const ECHO_WRITTEN: &str = r#"{
   "$schema": "https://spec.xihanfun.com/manifest/v1.json",
   "id": "xihan.samples.echo",
@@ -37,14 +42,19 @@ const ECHO_WRITTEN: &str = r#"{
   "primitives": "1",
   "stability": "experimental",
   "kind": "plugin",
+  "role": "provider",
   "isolation": "out-of-process",
+  "provides": [],
   "requires": [
     {
       "id": "kernel.plugins",
-      "version": "1"
+      "version": "1",
+      "optional": false
     }
   ],
+  "bindings": [],
   "contributes": {
+    "pipeline": [],
     "operations": [
       "echoes.create",
       "echoes.relay",
@@ -54,6 +64,7 @@ const ECHO_WRITTEN: &str = r#"{
     "config": {
       "section": "XiHan:Echo"
     },
+    "permissions": [],
     "health": [
       "echo"
     ]
@@ -66,6 +77,18 @@ const ECHO_WRITTEN: &str = r#"{
   ],
   "entry": "EchoPlugin"
 }"#;
+
+/// 核对读取失败的错误：码、消息键与参数。
+fn assert_error(error: &FrameworkError, key: &str, arguments: &[(&str, &str)], context: &str) {
+    assert_eq!((error.code(), error.message_key()), (ERROR_CODE_INVALID_MANIFEST, Some(key)), "{context}: {error}");
+    let actual: BTreeMap<&str, &str> = error.details().into_iter().flatten().map(|(name, value)| (name.as_str(), value.as_str().unwrap())).collect();
+    assert_eq!(actual, arguments.iter().copied().collect(), "{context}: {error}");
+}
+
+/// 一份最小的能力清单，`extra` 接在必填成员后面。
+fn minimal(extra: &str) -> String {
+    format!(r#"{{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability"{extra}}}"#)
+}
 
 #[test]
 fn read_parses_a_plugin_manifest() {
@@ -84,8 +107,9 @@ fn read_parses_a_plugin_manifest() {
 
     let written = manifest::write(&m).unwrap();
     assert_eq!(written, ECHO_WRITTEN);
+    // 写出的缺省值再读回来是显式的值，含义相同，再写出逐字相同
     let again = manifest::read(&written).unwrap();
-    assert_eq!(again, m, "round trip");
+    assert_eq!((again.effective_role(), again.effective_activation()), (m.effective_role(), m.effective_activation()));
     assert_eq!(manifest::write(&again).unwrap(), written);
 }
 
@@ -103,18 +127,14 @@ fn defaults_follow_the_schema() {
     assert_eq!(minimal.effective_activation(), ["onStartup"]);
     assert_eq!(
         manifest::write(&minimal).unwrap(),
-        "{\n  \"id\": \"xihan.a.b\",\n  \"version\": \"1.0.0\",\n  \"primitives\": \"1\",\n  \"stability\": \"stable\",\n  \"kind\": \"capability\"\n}"
+        "{\n  \"$schema\": \"https://spec.xihanfun.com/manifest/v1.json\",\n  \"id\": \"xihan.a.b\",\n  \"version\": \"1.0.0\",\n  \"primitives\": \"1\",\n  \"stability\": \"stable\",\n  \"kind\": \"capability\",\n  \"role\": \"provider\",\n  \"provides\": [],\n  \"requires\": [],\n  \"bindings\": [],\n  \"contributes\": {\n    \"pipeline\": [],\n    \"operations\": [],\n    \"permissions\": [],\n    \"health\": []\n  },\n  \"activation\": [\n    \"onStartup\"\n  ],\n  \"permissions\": []\n}"
     );
 }
 
 /// 配置节文法与宿主一致：领域节后可接任意层 PascalCase 子节（RFC-0002「配置节」）。
 #[test]
 fn config_section_may_have_subsections() {
-    let template = |section: &str| {
-        format!(
-            r#"{{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","contributes":{{"config":{{"section":"{section}"}}}}}}"#
-        )
-    };
+    let template = |section: &str| minimal(&format!(r#","contributes":{{"config":{{"section":"{section}"}}}}"#));
     for section in ["XiHan:Caching", "XiHan:Caching:Redis", "XiHan:Protocols:CloudEvents", "XiHan:ObjectStorage:SignedUrls", "XiHan:A:B2:C"] {
         let m = manifest::read(template(section)).unwrap_or_else(|error| panic!("{section:?} must be accepted: {error}"));
         assert_eq!(m.config_section(), Some(section));
@@ -131,127 +151,106 @@ fn config_section_may_have_subsections() {
         "xihan:Caching",
         "XiHan:Caching:Redis:",
     ] {
-        assert!(manifest::read(template(section)).is_err(), "{section:?} must be rejected");
+        let error = manifest::read(template(section)).expect_err(section);
+        assert_error(&error, MESSAGE_INVALID, &[("reason", "$.contributes.config.section")], section);
     }
 }
 
 #[test]
 fn contributed_permission_codes_follow_the_host_grammar() {
-    let template = |codes: &str| {
-        format!(
-            r#"{{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"plugin","isolation":"out-of-process","contributes":{{"permissions":{codes}}}}}"#
-        )
-    };
+    let template = |codes: &str| minimal(&format!(r#","contributes":{{"permissions":{codes}}}"#));
     for codes in [r#"[]"#, r#"["orders.read"]"#, r#"["sales.orders.read","sales.orders.write"]"#, r#"["echo2.items-v2.read"]"#] {
         let m = manifest::read(template(codes)).unwrap_or_else(|error| panic!("{codes} must be accepted: {error}"));
         assert!(m.contributes.is_some(), "{codes} read without contributions");
     }
-    for codes in [
-        r#"["orders"]"#,
-        r#"["Orders.read"]"#,
-        r#"["orders.Read"]"#,
-        r#"["orders..read"]"#,
-        r#"["orders.read."]"#,
-        r#"[".orders.read"]"#,
-        r#"["1orders.read"]"#,
-        r#"["orders.1read"]"#,
-        r#"["orders_x.read"]"#,
-        r#"["orders:read"]"#,
-        r#"["orders.read","orders.read"]"#,
-        r#"["orders.read","orders.write","orders.read"]"#,
+    for (codes, path) in [
+        (r#"["orders"]"#, "$.contributes.permissions[0]"),
+        (r#"["Orders.read"]"#, "$.contributes.permissions[0]"),
+        (r#"["orders.Read"]"#, "$.contributes.permissions[0]"),
+        (r#"["orders..read"]"#, "$.contributes.permissions[0]"),
+        (r#"["orders.read."]"#, "$.contributes.permissions[0]"),
+        (r#"[".orders.read"]"#, "$.contributes.permissions[0]"),
+        (r#"["1orders.read"]"#, "$.contributes.permissions[0]"),
+        (r#"["orders.1read"]"#, "$.contributes.permissions[0]"),
+        (r#"["orders_x.read"]"#, "$.contributes.permissions[0]"),
+        (r#"["orders:read"]"#, "$.contributes.permissions[0]"),
+        // 重复时报第二次出现的项
+        (r#"["orders.read","orders.read"]"#, "$.contributes.permissions[1]"),
+        (r#"["orders.read","orders.write","orders.read"]"#, "$.contributes.permissions[2]"),
     ] {
-        assert!(manifest::read(template(codes)).is_err(), "{codes} must be rejected");
+        assert_error(&manifest::read(template(codes)).expect_err(codes), MESSAGE_INVALID, &[("reason", path)], codes);
     }
 }
 
+/// 读取的错误都是 KERNEL_CAPABILITY_006（RFC-0002 解析规则 2）：形状问题写路径，跨字段约束带清单 ID。
 #[test]
 fn read_rejects_invalid_manifests() {
+    let base = r#""id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable""#;
     let cases = [
-        ("unknown field", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","extra":1}"#),
-        (
-            "unknown nested field",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","requires":[{"id":"a.b","version":"1","extra":true}]}"#,
-        ),
-        ("field names are case-sensitive", r#"{"ID":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability"}"#),
-        ("missing kind", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable"}"#),
-        ("bad id", r#"{"id":"a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability"}"#),
-        ("bad version", r#"{"id":"xihan.a.b","version":"1.0","primitives":"1","stability":"stable","kind":"capability"}"#),
-        ("bad primitives", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"0","stability":"stable","kind":"capability"}"#),
-        ("numeric primitives", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":1,"stability":"stable","kind":"capability"}"#),
-        ("caret primitives", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"^1","stability":"stable","kind":"capability"}"#),
-        ("bad stability", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"solid","kind":"capability"}"#),
-        ("bad kind", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"thing"}"#),
-        ("bad role", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"provider","role":"main"}"#),
-        ("plugin needs isolation", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"plugin"}"#),
-        ("bad isolation", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"plugin","isolation":"vm"}"#),
-        ("non-plugin isolation", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","isolation":"wasm"}"#),
-        (
-            "non-plugin permissions",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","permissions":["capability:x"]}"#,
-        ),
-        (
-            "duplicate provides",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","provides":[{"id":"a.b","version":"1"},{"id":"a.b","version":"2"}]}"#,
-        ),
-        (
-            "caret provides",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","provides":[{"id":"a.b","version":"^1"}]}"#,
-        ),
-        (
-            "bad provides",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","provides":[{"id":"A.b","version":"1"}]}"#,
-        ),
-        (
-            "duplicate requires",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","requires":[{"id":"a.b","version":"1"},{"id":"a.b","version":"^1"}]}"#,
-        ),
-        (
-            "bad requires",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","requires":[{"id":"a","version":"1"}]}"#,
-        ),
-        (
-            "bad activation",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"plugin","isolation":"wasm","activation":["onBoot"]}"#,
-        ),
-        (
-            "bad permission",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"plugin","isolation":"wasm","permissions":["sudo"]}"#,
-        ),
-        (
-            "bad operation",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","contributes":{"operations":["Orders.Create"]}}"#,
-        ),
-        (
-            "bad section",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","contributes":{"config":{"section":"Orders"}}}"#,
-        ),
-        (
-            "bad stage",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","contributes":{"pipeline":[{"middleware":"x","stage":"middle"}]}}"#,
-        ),
-        (
-            "empty middleware",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","contributes":{"pipeline":[{"middleware":"","stage":"observe"}]}}"#,
-        ),
-        ("bad health", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","contributes":{"health":["Echo"]}}"#),
-        (
-            "bad binding",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","bindings":[{"name":"Db","type":"connection:relational"}]}"#,
-        ),
-        (
-            "duplicate binding",
-            r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","bindings":[{"name":"db","type":"queue"},{"name":"db","type":"blob"}]}"#,
-        ),
-        ("null list", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","provides":null}"#),
-        ("trailing data", r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability"} {}"#),
-        ("not json", "{"),
+        (r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","extra":1}"#, "$.extra"),
+        (&*minimal(r#","requires":[{"id":"a.b","version":"1","extra":true}]"#), "$.requires[0].extra"),
+        (r#"{"ID":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability"}"#, "$.ID"),
+        (r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable"}"#, "$.kind"),
+        (r#"{"id":"a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability"}"#, "$.id"),
+        (r#"{"id":"xihan.a.b","version":"1.0","primitives":"1","stability":"stable","kind":"capability"}"#, "$.version"),
+        (r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"0","stability":"stable","kind":"capability"}"#, "$.primitives"),
+        (r#"{"id":"xihan.a.b","version":"1.0.0","primitives":1,"stability":"stable","kind":"capability"}"#, "$.primitives"),
+        (r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"^1","stability":"stable","kind":"capability"}"#, "$.primitives"),
+        (r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"solid","kind":"capability"}"#, "$.stability"),
+        (r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"thing"}"#, "$.kind"),
+        (r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"provider","role":"main"}"#, "$.role"),
+        (r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"plugin","isolation":"vm"}"#, "$.isolation"),
+        (&*minimal(r#","provides":[{"id":"a.b","version":"^1"}]"#), "$.provides[0].version"),
+        (&*minimal(r#","provides":[{"id":"A.b","version":"1"}]"#), "$.provides[0].id"),
+        (&*minimal(r#","requires":[{"id":"a","version":"1"}]"#), "$.requires[0].id"),
+        (&*minimal(r#","activation":["onBoot"]"#), "$.activation[0]"),
+        (&*minimal(r#","permissions":["sudo"]"#), "$.permissions[0]"),
+        (&*minimal(r#","contributes":{"operations":["Orders.Create"]}"#), "$.contributes.operations[0]"),
+        (&*minimal(r#","contributes":{"pipeline":[{"middleware":"x","stage":"middle"}]}"#), "$.contributes.pipeline[0].stage"),
+        (&*minimal(r#","contributes":{"pipeline":[{"middleware":"","stage":"observe"}]}"#), "$.contributes.pipeline[0].middleware"),
+        (&*minimal(r#","contributes":{"health":["Echo"]}"#), "$.contributes.health[0]"),
+        (&*minimal(r#","bindings":[{"name":"Db","type":"connection:relational"}]"#), "$.bindings[0].name"),
+        (&*minimal(r#","provides":null"#), "$.provides"),
     ];
-    for (name, data) in cases {
-        let error = manifest::read(data).expect_err(name);
-        assert_eq!(error.code(), ERROR_CODE_INVALID_ARGUMENT, "{name}");
+    for (data, path) in cases {
+        assert_error(&manifest::read(data).expect_err(data), MESSAGE_INVALID, &[("reason", path)], data);
     }
-    let missing = manifest::read_file("does-not-exist/xihan.manifest.json").unwrap_err();
-    assert_eq!((missing.code(), missing.message()), (ERROR_CODE_INVALID_ARGUMENT, "The manifest file could not be read."));
+    for (data, key) in [
+        (format!(r#"{{{base},"kind":"plugin"}}"#), MESSAGE_ISOLATION_REQUIRED),
+        (minimal(r#","isolation":"wasm""#), MESSAGE_ISOLATION_NOT_ALLOWED),
+        (minimal(r#","permissions":["capability:x"]"#), MESSAGE_ISOLATION_NOT_ALLOWED),
+        (minimal(r#","provides":[{"id":"a.b","version":"1"},{"id":"a.b","version":"2"}]"#), MESSAGE_DUPLICATE_PROVIDES),
+        (minimal(r#","requires":[{"id":"a.b","version":"1"},{"id":"a.b","version":"^1"}]"#), MESSAGE_DUPLICATE_REQUIRES),
+        (minimal(r#","bindings":[{"name":"db","type":"queue"},{"name":"db","type":"blob"}]"#), MESSAGE_DUPLICATE_BINDINGS),
+    ] {
+        assert_error(&manifest::read(&data).expect_err(&data), key, &[("id", "xihan.a.b")], &data);
+    }
+    for data in [format!("{} {{}}", minimal("")), "{".to_owned(), String::new()] {
+        assert_error(&manifest::read(&data).expect_err(&data), MESSAGE_INVALID_JSON, &[("reason", "$")], &data);
+    }
+    assert_error(&manifest::read("null").unwrap_err(), MESSAGE_EMPTY, &[], "null");
+    let error = manifest::read(minimal(r#","provides":[]"#).replace(r#""kind":"capability""#, r#""kind":"capability","kind":"plugin""#)).unwrap_err();
+    assert_error(&error, MESSAGE_INVALID_JSON, &[("reason", "$.kind")], "duplicate member");
+    assert_eq!(error.message(), "The manifest is not valid JSON: $.kind", "the built-in en-US template");
+}
+
+/// 文件按 UTF-8 读、跳过开头的 UTF-8 BOM；文本里的 BOM 是语法错误；文件不存在为 file_missing。
+#[test]
+fn read_file_skips_the_bom() {
+    let directory = std::env::temp_dir().join(format!("xihan-manifest-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join(manifest::FILE_NAME);
+    std::fs::write(&path, [b"\xEF\xBB\xBF".as_slice(), minimal("").as_bytes()].concat()).unwrap();
+    assert_eq!(manifest::read_file(&path).unwrap().id, "xihan.a.b");
+    assert_error(&manifest::read(std::fs::read(&path).unwrap()).unwrap_err(), MESSAGE_INVALID_JSON, &[("reason", "$")], "BOM in the text");
+    std::fs::write(&path, b"{\"id\":\"\xFF\"}").unwrap();
+    assert_error(&manifest::read_file(&path).unwrap_err(), MESSAGE_INVALID_JSON, &[("reason", "$")], "invalid UTF-8");
+    std::fs::remove_dir_all(&directory).unwrap();
+
+    let missing = "does-not-exist/xihan.manifest.json";
+    let error = manifest::read_file(missing).unwrap_err();
+    assert_error(&error, MESSAGE_FILE_MISSING, &[("path", missing)], missing);
+    assert_eq!(error.message(), "Manifest file 'does-not-exist/xihan.manifest.json' does not exist.");
 }
 
 #[derive(Deserialize)]
@@ -268,6 +267,7 @@ struct RequirementCase {
     optional: bool,
 }
 
+/// 能力依赖按 capability-requirements.json：版本不带前导零、符号与空白，不超过 2147483647，按整串匹配（ADR-0236）。
 #[test]
 fn requirements_follow_the_vectors() {
     let vectors: RequirementVectors = common::vector("primitives/capability-requirements.json");
@@ -285,50 +285,28 @@ fn requirements_follow_the_vectors() {
     assert!(requirement.is_satisfied_by(&declaration));
     assert_eq!(requirement.to_string(), "caching.distributed@2?");
     assert!(!requirement.is_satisfied_by(&CapabilityDeclaration::parse("caching.distributed@1").unwrap()), "versions must match");
-    for text in ["caching.distributed@^2", "caching.distributed", "caching.distributed@0", "Caching.x@1"] {
+    for text in ["caching.distributed@^2", "caching.distributed", "caching.distributed@0", "Caching.x@1", "caching.distributed@2147483648"] {
         assert!(CapabilityDeclaration::parse(text).is_none(), "{text:?} must not parse as a declaration");
     }
 }
 
-/// 与 .NET 宿主同一规则（RFC-0017「范围」）：只有 Wasm 插件能贡献中间件，进程外与进程内插件的清单写了非空
-/// `contributes.pipeline` 在读清单时即被拒绝；能力包等非插件照常可以写。
+/// 只有 Wasm 插件能贡献中间件是宿主在发现插件时的核对（PLUGINS_VALIDATION_001，RFC-0017「范围」）；
+/// 读取清单只按 RFC-0002 解析规则 2，与 .NET 的 ManifestReader 一样不管它。
 #[test]
-fn only_wasm_plugins_may_contribute_middleware() {
-    let template = |kind: &str, isolation: &str, pipeline: &str| {
-        format!(
-            r#"{{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"{kind}"{isolation},"contributes":{{"pipeline":{pipeline}}}}}"#
-        )
-    };
-    let audit = r#"[{"middleware":"audit","stage":"observe"},{"middleware":"tenant-guard","stage":"tenant"}]"#;
-    for isolation in [Isolation::OutOfProcess, Isolation::InProcess] {
-        let error = manifest::read(template("plugin", &format!(r#","isolation":"{isolation}""#), audit))
-            .expect_err("a non-wasm plugin contributing middleware must be rejected");
-        assert_eq!(error.code(), ERROR_CODE_INVALID_ARGUMENT);
-        for fragment in ["'xihan.a.b'", "'contributes.pipeline'", "audit, tenant-guard", isolation.name()] {
-            assert!(error.message().contains(fragment), "the message for a {isolation} plugin must mention {fragment}: {}", error.message());
-        }
+fn pipeline_contributions_are_left_to_the_host() {
+    for isolation in ["out-of-process", "in-process", "wasm"] {
+        let data = format!(
+            r#"{{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"plugin","isolation":"{isolation}","contributes":{{"pipeline":[{{"middleware":"audit","stage":"observe","before":["x"]}},{{"middleware":"tenant-guard","stage":"tenant"}}]}}}}"#
+        );
+        let m = manifest::read(&data).unwrap_or_else(|error| panic!("{isolation}: {error}"));
+        let pipeline = &m.contributes.as_ref().unwrap().pipeline;
+        assert_eq!((pipeline[0].before.as_slice(), pipeline[1].stage), (["x".to_owned()].as_slice(), PipelineStage::Tenant));
+        let written = manifest::write(&m).unwrap();
+        assert!(
+            written.contains("\"pipeline\": [\n      {\n        \"middleware\": \"audit\",\n        \"stage\": \"observe\",\n        \"before\": [\n          \"x\"\n        ],\n        \"after\": []\n      },"),
+            "{written}"
+        );
     }
-    let accepted = [
-        ("wasm plugin", template("plugin", r#","isolation":"wasm""#, audit)),
-        ("capability", template("capability", "", audit)),
-        ("provider", template("provider", "", audit)),
-        ("out-of-process, empty list", template("plugin", r#","isolation":"out-of-process""#, "[]")),
-        ("in-process, empty list", template("plugin", r#","isolation":"in-process""#, "[]")),
-    ];
-    for (name, data) in accepted {
-        let m = manifest::read(&data).unwrap_or_else(|error| panic!("{name} must be accepted: {error}"));
-        if name == "wasm plugin" {
-            assert_eq!(m.contributes.as_ref().unwrap().pipeline[1].stage, PipelineStage::Tenant);
-        }
-    }
-
-    // 写出同样核对：不生成宿主会拒绝的清单
-    let mut written = Manifest::new("xihan.a.b", "1.0.0", 1, Stability::Stable, Kind::Plugin);
-    written.isolation = Some(Isolation::OutOfProcess);
-    let mut contributes = Contributions::new();
-    contributes.pipeline.push(PipelineContribution::new("audit", PipelineStage::Observe));
-    written.contributes = Some(contributes);
-    assert!(manifest::write(&written).is_err(), "writing an out-of-process plugin manifest that contributes middleware must fail");
 }
 
 #[test]
@@ -342,37 +320,45 @@ fn write_validates_programmatic_manifests() {
     m.bindings.push(Binding::new("db", "connection:relational"));
     let written = manifest::write(&m).unwrap();
     assert!(written.contains(r#""version": "2","#) && written.contains(r#""optional": true"#), "{written}");
-    assert_eq!(manifest::read(&written).unwrap(), m);
+    assert_eq!(manifest::write(&manifest::read(&written).unwrap()).unwrap(), written);
 
+    // 格式按读取的同一套 Schema 核对，说明带路径；跨字段约束带消息键，码与 .NET 的 Manifest.Validate 一样
     m.provides.push(CapabilityDeclaration::new("cache.local", 0));
-    assert!(manifest::write(&m).unwrap_err().message().contains("the provided capability 'cache.local' of 'xihan.a.b' is not valid."));
+    let error = manifest::write(&m).unwrap_err();
+    assert_eq!((error.code(), error.message()), (ERROR_CODE_INVALID_ARGUMENT, "The manifest 'xihan.a.b' is not valid at '$.provides[1].version'."));
     m.provides.pop();
-    m.primitives = 0;
-    assert_eq!(manifest::write(&m).unwrap_err().message(), "the primitives version of 'xihan.a.b' must be a positive integer.");
+    m.primitives = 2_147_483_648;
+    assert_eq!(manifest::write(&m).unwrap_err().message(), "The manifest 'xihan.a.b' is not valid at '$.primitives'.");
+    m.primitives = 1;
+    m.isolation = Some(Isolation::Wasm);
+    let error = manifest::write(&m).unwrap_err();
+    assert_eq!((error.code(), error.message_key()), (ERROR_CODE_INVALID_ARGUMENT, Some(MESSAGE_ISOLATION_NOT_ALLOWED)));
+    assert_eq!(error.message(), "Manifest 'xihan.a.b' is not a plugin and must not declare 'isolation' or 'permissions'.");
 }
 
 /// 读取按 Schema 逐字执行（RFC-0002 解析规则 2）：可选成员写成 null 不合法，contributes.operations 按操作 ID 文法。
 #[test]
 fn reading_follows_the_schema_verbatim() {
     let base = r#""id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable""#;
-    for member in [
-        r#""$schema":null"#,
-        r#""package":null"#,
-        r#""role":null"#,
-        r#""contributes":null"#,
-        r#""entry":null"#,
-        r#""activation":null"#,
-        r#""requires":[{"id":"a.b","version":"1","optional":null}]"#,
-        r#""bindings":[{"name":"db","type":"queue","required":null}]"#,
-        r#""contributes":{"config":null}"#,
-        r#""contributes":{"config":{"section":"XiHan:A","schema":null}}"#,
+    for (member, path) in [
+        (r#""$schema":null"#, "$.$schema"),
+        (r#""package":null"#, "$.package"),
+        (r#""role":null"#, "$.role"),
+        (r#""contributes":null"#, "$.contributes"),
+        (r#""entry":null"#, "$.entry"),
+        (r#""activation":null"#, "$.activation"),
+        (r#""requires":[{"id":"a.b","version":"1","optional":null}]"#, "$.requires[0].optional"),
+        (r#""bindings":[{"name":"db","type":"queue","required":null}]"#, "$.bindings[0].required"),
+        (r#""contributes":{"config":null}"#, "$.contributes.config"),
+        (r#""contributes":{"config":{"section":"XiHan:A","schema":null}}"#, "$.contributes.config.schema"),
     ] {
         let data = format!(r#"{{{base},"kind":"provider",{member}}}"#);
-        assert!(manifest::read(&data).is_err(), "{member} must be rejected");
+        assert_error(&manifest::read(&data).expect_err(member), MESSAGE_INVALID, &[("reason", path)], member);
     }
-    assert!(manifest::read(format!(r#"{{{base},"kind":"plugin","isolation":null}}"#)).is_err(), "a null isolation is not a missing one");
+    let error = manifest::read(format!(r#"{{{base},"kind":"plugin","isolation":null}}"#)).unwrap_err();
+    assert_error(&error, MESSAGE_INVALID, &[("reason", "$.isolation")], "a null isolation is not a missing one");
 
-    let operations = |operation: &str| format!(r#"{{{base},"kind":"capability","contributes":{{"operations":["{operation}"]}}}}"#);
+    let operations = |operation: &str| minimal(&format!(r#","contributes":{{"operations":["{operation}"]}}"#));
     for operation in ["orders.create", "order-lines.list", "a1.b2", "tenant-members.list-online"] {
         assert!(manifest::read(operations(operation)).is_ok(), "{operation} must be accepted");
     }
@@ -381,6 +367,23 @@ fn reading_follows_the_schema_verbatim() {
     {
         assert!(manifest::read(operations(operation)).is_err(), "{operation} must be rejected");
     }
+}
+
+/// 对象位置只收 JSON 对象：serde 派生的结构体会把字段同序的数组读成结构体，形状核对按类型不符报出路径。
+#[test]
+fn object_positions_reject_arrays() {
+    for (member, path) in [
+        (r#","provides":[["orders.store","1"]]"#, "$.provides[0]"),
+        (r#","requires":[{"id":"a.b","version":"1"},["a.c","1",false]]"#, "$.requires[1]"),
+        (r#","bindings":[["db","queue"]]"#, "$.bindings[0]"),
+        (r#","contributes":[[],[],null,[],[]]"#, "$.contributes"),
+        (r#","contributes":{"pipeline":[["audit","observe"]]}"#, "$.contributes.pipeline[0]"),
+        (r#","contributes":{"config":["XiHan:A"]}"#, "$.contributes.config"),
+    ] {
+        assert_error(&manifest::read(minimal(member)).expect_err(member), MESSAGE_INVALID, &[("reason", path)], member);
+    }
+    let root = r#"["xihan.a.b","1.0.0","1","stable","capability",null,null,null,null,null,null,null,null,null,null,null]"#;
+    assert_error(&manifest::read(root).unwrap_err(), MESSAGE_INVALID, &[("reason", "$")], "the array form of the root");
 }
 
 #[derive(Deserialize)]
@@ -392,50 +395,80 @@ struct ManifestVectors {
 #[derive(Deserialize)]
 struct ManifestCase {
     name: String,
-    #[serde(default)]
-    manifest: Option<serde_json::Value>,
+    /// 清单的 JSON 值，保留原文以保留成员在文档里的顺序；`null` 根也是一份原文。
+    #[serde(default, deserialize_with = "raw")]
+    manifest: Option<Box<RawValue>>,
+    /// JSON 值表达不了的原文；空串是合法的原文，与没有给出不同。
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    written: Option<String>,
+    #[serde(default)]
+    error: Option<ManifestError>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManifestError {
+    code: String,
+    message_key: String,
+    arguments: BTreeMap<String, String>,
+}
+
+/// `manifest` 写成 `null` 也保留原文，不读成「没有」。
+fn raw<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<Box<RawValue>>, D::Error> {
+    Box::<RawValue>::deserialize(deserializer).map(Some)
+}
+
+/// 去掉字符串以外的空白：向量里的清单按紧凑写法交给读取，成员顺序照写。
+fn compact(text: &str) -> String {
+    let (mut output, mut quoted, mut escaped) = (String::with_capacity(text.len()), false, false);
+    for char in text.chars() {
+        if quoted {
+            output.push(char);
+            match char {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+        } else if char == '"' {
+            quoted = true;
+            output.push(char);
+        } else if !matches!(char, ' ' | '\t' | '\n' | '\r') {
+            output.push(char);
+        }
+    }
+    output
 }
 
 impl ManifestCase {
-    /// 清单的原文：有 text 用 text（重复成员），否则是 manifest 的 JSON 文本（含 null 根）。
+    /// 清单的原文：有 text 用 text，否则是 manifest 的紧凑文本。
     fn source(&self) -> String {
-        self.text.clone().unwrap_or_else(|| serde_json::to_string(self.manifest.as_ref().unwrap_or(&serde_json::Value::Null)).unwrap())
+        match (&self.text, &self.manifest) {
+            (Some(text), None) => text.clone(),
+            (None, Some(manifest)) => compact(manifest.get()),
+            _ => panic!("{} must give exactly one of manifest and text", self.name),
+        }
     }
 }
 
-/// 清单的读取按 manifests.json（RFC-0002 解析规则 2）：合法的读得出且写出后再读得到同一份，不合法的一律拒绝。
+/// 清单的读取与写出按 manifests.json（RFC-0002 解析规则 2 与「写出」）：合法的读出后再写出与 written 逐字相等，
+/// 不合法的错误码、消息键与参数逐字相等。
 #[test]
 fn manifests_follow_the_vectors() {
     let vectors: ManifestVectors = common::vector("manifest/manifests.json");
     for case in &vectors.valid {
         let read = manifest::read(case.source()).unwrap_or_else(|error| panic!("{} must be read: {error}", case.name));
         let written = manifest::write(&read).unwrap();
-        assert_eq!(manifest::read(&written).unwrap(), read, "{} round trip", case.name);
+        assert_eq!(Some(&written), case.written.as_ref(), "{}", case.name);
+        assert_eq!(manifest::write(&manifest::read(&written).unwrap()).unwrap(), written, "{} reads back", case.name);
     }
     for case in &vectors.invalid {
         let error = manifest::read(case.source()).expect_err(&case.name);
-        assert_eq!(error.code(), ERROR_CODE_INVALID_ARGUMENT, "{}", case.name);
+        let expected = case.error.as_ref().unwrap_or_else(|| panic!("{} has no expected error", case.name));
+        assert_eq!(error.code(), expected.code, "{}", case.name);
+        let arguments: Vec<(&str, &str)> = expected.arguments.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        assert_error(&error, &expected.message_key, &arguments, &case.name);
     }
-}
-
-/// 对象位置只收 JSON 对象：serde 派生的结构体会把字段同序的数组读成结构体，清单读取在读入之前拒绝它。
-#[test]
-fn object_positions_reject_arrays() {
-    let base = r#""id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability""#;
-    for (member, path) in [
-        (r#""provides":[["orders.store","1"]]"#, "$.provides[0]"),
-        (r#""requires":[{"id":"a.b","version":"1"},["a.c","1",false]]"#, "$.requires[1]"),
-        (r#""bindings":[["db","queue"]]"#, "$.bindings[0]"),
-        (r#""contributes":[[],[],null,[],[]]"#, "$.contributes"),
-        (r#""contributes":{"pipeline":[["audit","observe"]]}"#, "$.contributes.pipeline[0]"),
-        (r#""contributes":{"config":["XiHan:A"]}"#, "$.contributes.config"),
-    ] {
-        let error = manifest::read(format!("{{{base},{member}}}")).expect_err(member);
-        let cause = error.cause().map(ToString::to_string).unwrap_or_default();
-        assert!(cause.contains(path), "{member}: {cause}");
-    }
-    let root = r#"["xihan.a.b","1.0.0","1","stable","capability",null,null,null,null,null,null,null,null,null,null,null]"#;
-    assert!(manifest::read(root).is_err(), "the array form of the root is rejected");
 }

@@ -60,12 +60,12 @@ pub(crate) fn operation_id(id: &str) -> bool {
     id.split_once('.').is_some_and(|(resource, verb)| kebab(resource) && kebab(verb))
 }
 
-/// 正整数 `[1-9][0-9]*`，并且能放进 `u32`。
+/// 接口版本 `[1-9][0-9]*`：不带前导零、符号与空白，在 32 位有符号整数范围内（不超过 2147483647，ADR-0236）。
 pub(crate) fn positive(text: &str) -> Option<u32> {
     if !word(text, |byte| (b'1'..=b'9').contains(&byte), digit) {
         return None;
     }
-    text.parse().ok()
+    text.parse::<i32>().ok().and_then(|version| u32::try_from(version).ok())
 }
 
 #[cfg(test)]
@@ -73,11 +73,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn positive_parses_within_u32() {
+    fn positive_parses_within_i32() {
         assert_eq!(positive("1"), Some(1));
         assert_eq!(positive("12"), Some(12));
-        assert_eq!(positive("4294967295"), Some(u32::MAX));
-        for text in ["", "0", "01", "-1", "+1", "1.0", "^1", "4294967296"] {
+        assert_eq!(positive("2147483647"), Some(2_147_483_647));
+        for text in [
+            "",
+            "0",
+            "01",
+            "-1",
+            "+1",
+            "1.0",
+            "^1",
+            "2147483648",
+            "4294967295",
+            " 1",
+            "1
+",
+        ] {
             assert_eq!(positive(text), None, "{text}");
         }
     }
