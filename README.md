@@ -75,7 +75,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 1. 中间件、处理器与管道终点返回 `BoxFuture`（`Pin<Box<dyn Future + Send>>`），写 `Box::pin(async move { … })`；本 crate 不依赖任何异步运行时，future 交给 tokio、`futures::executor::block_on` 或任何执行器。`Invoker::invoke` 与 `invoke_typed` 的签名写明返回 `Send` 的 future，`invoke_owned` 返回 `'static` 的 future，可以直接 `tokio::spawn`。
 2. 可恢复失败返回 `Err(Error)`，错误码按 `<领域大写>_<KIND>_<NNN>`，文案用消息键 + 参数（`Error::validation(code, key).with_detail(…)`）；`Error::message` 先按 `primitives::set_default_messages` 设置的解析器解析，再按 SDK 自带的 en-US 模板（`primitives::builtin_catalog()`，即 SDK 与宿主共用的内核错误，逐字同向量 `kernel-messages.json`），都没有时是「键 (参数)」。配置期有登记键的错误（如操作重复登记）以 `FrameworkError::with_message` 带上键与参数，`to_error()` 一并转出。
 3. 编程错误（不合文法的错误码、消息键或 Baggage 键）panic，各函数的文档写明 panic 条件；来自不可信输入的值先用 `is_error_code`、`is_baggage_key_well_formed` 判断，或用 `Error::try_new`。清单校验、管道排序、操作登记等配置期失败返回 `FrameworkError`。
-4. `Context` 的截止时间由进程里一个后台线程（`xihan-deadline-timer`，第一次登记截止时间时启动）按时触发；`Context::done()` 在调用方取消或到达截止时间时完成，`Context::cancellation()` 给出 `KERNEL_TIMEOUT_001`（消息键 `kernel.invocation.deadline_exceeded`；构建上下文时截止时间已经过去的是 `kernel.invocation.deadline_before_start`）或 `KERNEL_CANCELLED_001`（`kernel.invocation.cancelled`）。
+4. `Context` 的截止时间由进程里一个后台线程（`xihan-deadline-timer`，第一次登记截止时间时启动）按时触发；`Context::done()` 在调用方取消或到达截止时间时完成，`Context::cancellation()` 给出 `KERNEL_TIMEOUT_001`（`kernel.invocation.deadline_exceeded`）或 `KERNEL_CANCELLED_001`（`kernel.invocation.cancelled`）。调用开始时截止时间已过由调用器在第一个中间件之前按时钟判断，报 `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_before_start`，管道不执行。
 
 线上编码与 .NET 参考实现一致：
 

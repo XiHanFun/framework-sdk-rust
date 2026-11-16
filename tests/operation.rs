@@ -325,3 +325,34 @@ fn framework_panics_become_inner_errors() {
     assert_eq!((inner.code(), inner.message_key()), (ERROR_CODE_INVALID_ARGUMENT, None));
     assert!(inner.message().contains("'not-a-code'"), "{}", inner.message());
 }
+
+/// 截止时间在调用开始时已过：调用器在第一个中间件之前按时钟判断，报 deadline_before_start，管道与操作都不执行（RFC-0011 规则 10）。
+#[test]
+fn expired_deadlines_stop_before_the_pipeline() {
+    let entered = Arc::new(Mutex::new(0));
+    let count = {
+        let entered = Arc::clone(&entered);
+        pipeline::from_fn("Count", move |ctx, next| {
+            let entered = Arc::clone(&entered);
+            Box::pin(async move {
+                *entered.lock().unwrap() += 1;
+                next.run(ctx).await
+            })
+        })
+    };
+    let invoker = Invoker::new(registry(), &Builder::new().use_at(count, PipelineStage::Observe, Placement::Beginning, APP_OWNER)).unwrap();
+    let late = Context::builder().deadline(std::time::SystemTime::now() - std::time::Duration::from_millis(1)).build();
+    let error = common::block_on(invoker.invoke(&late, Request::new("orders.create", r#"{"quantity":1}"#))).unwrap_err();
+    common::assert_kernel_error(&error, xihan_framework::invocation::MESSAGE_DEADLINE_BEFORE_START);
+    let typed = common::block_on(invoker.invoke_typed::<CreateOrder, OrderCreated>(&late, "orders.create", CreateOrder { quantity: 1 })).unwrap_err();
+    common::assert_kernel_error(&typed, xihan_framework::invocation::MESSAGE_DEADLINE_BEFORE_START);
+    assert_eq!(*entered.lock().unwrap(), 0, "the pipeline does not run");
+    assert!(operation::current(&late).is_none());
+
+    let missing = common::block_on(invoker.invoke(&late, Request::new("orders.missing", "{}"))).unwrap_err();
+    assert_eq!(missing.code(), ERROR_CODE_NOT_FOUND, "an unknown operation is reported first");
+
+    let in_time = Context::builder().timeout(std::time::Duration::from_secs(60)).build();
+    assert!(common::block_on(invoker.invoke(&in_time, Request::new("orders.create", r#"{"quantity":1}"#))).is_ok());
+    assert_eq!(*entered.lock().unwrap(), 1);
+}

@@ -31,6 +31,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::task::Poll;
+use std::time::SystemTime;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -38,7 +39,7 @@ use serde_json::Value;
 use serde_path_to_error::Segment;
 
 use crate::BoxFuture;
-use crate::invocation::Context;
+use crate::invocation::{Context, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START};
 use crate::pipeline::{self, APP_OWNER, Pipeline, Step};
 use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, Result, Stability, is_error_code};
 
@@ -583,7 +584,8 @@ impl Invoker {
 
     /// 执行一个 XGI 请求，成功时返回响应载荷。
     ///
-    /// 未登记返回 `KERNEL_NOTFOUND_001`（不进管道）；否则把操作与请求放进上下文，经完整管道执行，handle 阶段之后解码、
+    /// 未登记返回 `KERNEL_NOTFOUND_001`（不进管道）；调用开始时截止时间已过返回 `KERNEL_TIMEOUT_001` +
+    /// `kernel.invocation.deadline_before_start`（按时钟判断，不进管道）；否则把操作与请求放进上下文，经完整管道执行，handle 阶段之后解码、
     /// 执行、编码。中间件以成功短路、没有执行操作时返回 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response`（规则 9）；载荷不合法时 `reason` 是出错位置的 JSON 路径（如 `$.quantity`）。
     ///
     /// 载荷按请求类型自己的 `Deserialize` 解码：serde 派生的结构体除了 JSON 对象，也接受字段同序的数组（如 `[1]`）；
@@ -593,6 +595,7 @@ impl Invoker {
     pub fn invoke<'a>(&'a self, ctx: &'a Context, request: Request) -> impl Future<Output = Result<Vec<u8>>> + Send + 'a {
         async move {
             let descriptor = self.registry.get(&request.id).ok_or_else(|| not_found(&request.id))?;
+            started_in_time(ctx)?;
             let request = Arc::new(request);
             let scope = Scope::enter(ctx, Arc::clone(&descriptor), Some(Arc::clone(&request)));
             let terminal = Dispatch { descriptor: &descriptor, payload: &request.payload };
@@ -624,6 +627,7 @@ impl Invoker {
         async move {
             let descriptor = self.registry.get(id).ok_or_else(|| not_found(id))?;
             let handler = descriptor.typed.downcast_ref::<Arc<dyn Handler<Req, Res>>>().ok_or_else(|| type_mismatch::<Req, Res>(&descriptor))?;
+            started_in_time(ctx)?;
             let terminal = Typed { handler: Arc::clone(handler), request, outcome: Mutex::new(None) };
             let scope = Scope::enter(ctx, Arc::clone(&descriptor), None);
             let outcome = CatchPanic(self.pipeline.run(ctx, &terminal)).await;
@@ -689,6 +693,15 @@ fn type_mismatch<Req, Res>(descriptor: &Descriptor) -> Error {
         .with_detail("id", descriptor.id())
         .with_detail("expected", format!("{} -> {}", descriptor.request_type, descriptor.response_type))
         .with_detail("actual", format!("{} -> {}", short_type_name::<Req>(), short_type_name::<Res>()))
+}
+
+/// 调用开始时按时钟核对截止时间（RFC-0011 规则 10）：SDK 没有截止时间中间件，已到即以 `KERNEL_TIMEOUT_001` +
+/// `kernel.invocation.deadline_before_start` 结束，管道与操作都不执行。调用途中到达的截止时间按上下文的截止令牌归因。
+fn started_in_time(ctx: &Context) -> Result<()> {
+    if ctx.is_expired(SystemTime::now()) {
+        return Err(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START));
+    }
+    Ok(())
 }
 
 /// 管道以成功结束而没有响应：某个中间件以成功短路、操作没有执行（规则 9）。

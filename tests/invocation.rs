@@ -6,8 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use xihan_framework::invocation::{
-    CancellationToken, Context, ERROR_CODE_CANCELLED, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_CANCELLED, MESSAGE_DEADLINE_BEFORE_START,
-    MESSAGE_DEADLINE_EXCEEDED, TraceContext,
+    CancellationToken, Context, ERROR_CODE_CANCELLED, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_CANCELLED, MESSAGE_DEADLINE_EXCEEDED, TraceContext,
 };
 use xihan_framework::primitives::{BAGGAGE_CORRELATION, BAGGAGE_IDEMPOTENCY_KEY, BAGGAGE_LOCALE, BAGGAGE_TENANT, ERROR_CODE_INVALID_ARGUMENT};
 
@@ -176,13 +175,9 @@ fn cancellation_errors_follow_kernel_messages() {
     common::block_on(ctx.done());
     common::assert_kernel_error(&ctx.cancellation().unwrap(), MESSAGE_DEADLINE_EXCEEDED);
 
+    // 构建上下文时不判断「开始前已过」：截止时间已过的上下文立即超时，键仍是 deadline_exceeded；before_start 由调用器判断
     let late = Context::builder().deadline(SystemTime::now() - Duration::from_millis(1)).build();
-    common::assert_kernel_error(&late.cancellation().unwrap(), MESSAGE_DEADLINE_BEFORE_START);
-    assert_eq!(
-        late.with_baggage(BAGGAGE_LOCALE, "en-US").cancellation().unwrap().message_key(),
-        Some(MESSAGE_DEADLINE_BEFORE_START),
-        "derived contexts share it"
-    );
+    common::assert_kernel_error(&late.cancellation().unwrap(), MESSAGE_DEADLINE_EXCEEDED);
 
     let caller = CancellationToken::new();
     let cancelled = Context::builder().cancellation(&caller).build();
