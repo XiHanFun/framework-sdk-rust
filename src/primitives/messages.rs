@@ -156,8 +156,8 @@ fn render(template: &str, arguments: &Details, strict: bool) -> Option<String> {
 
 /// 按格式说明符输出一个值（RFC-0010「模板」，按不变文化）。
 ///
-/// 没有说明符时是值的文本形式：字符串原样，整数十进制，布尔 `true` / `false`，`null` 为空串，浮点写最短往返的十进制、
-/// 不用指数（`2.0` 写 `2`）；数组与对象写 JSON 文本（规范不作规定）。
+/// 没有说明符时是值的文本形式：字符串原样，整数十进制，布尔 `true` / `false`，`null` 为空串；浮点在 1e-4 ≤ |x| < 1e17
+/// 时写最短往返的十进制、不用指数（`2.0` 写 `2`），范围之外写 `1E+17`、`9.9E-05` 这样的指数形式，负零写 `-0`；数组与对象写 JSON 文本（规范不作规定）。
 ///
 /// 可移植的说明符（`n` 是可选的位数，最多三位数字）：
 ///
@@ -182,14 +182,35 @@ pub(crate) fn display(value: &Value) -> String {
         Value::Number(number) => match (number.as_i64(), number.as_u64(), number.as_f64()) {
             (Some(integer), ..) => integer.to_string(),
             (None, Some(integer), _) => integer.to_string(),
-            // f64 的 Display 是能往返的最短十进制、不用指数，整数值不带小数点
-            (None, None, Some(float)) => float.to_string(),
+            // 整数按十进制，浮点按 float_text
+            (None, None, Some(float)) => float_text(float),
             _ => number.to_string(),
         },
         other => other.to_string(),
     }
 }
 
+/// 浮点的文本形式（RFC-0010「模板」，取自 .NET 10 的实测）。
+///
+/// 1e-4 ≤ |x| < 1e17 或 x = 0 时写最短往返的十进制、不用指数，整数值不带小数点；范围之外写最短往返的有效数字加指数：
+/// `E`、总写的符号、至少两位的指数，如 `1E+17`、`9.9E-05`、`5E-324`。负零写 `-0`，非数与无穷写 `NaN`、`Infinity`、`-Infinity`。
+fn float_text(number: f64) -> String {
+    if number.is_nan() {
+        return "NaN".to_owned();
+    }
+    if number.is_infinite() {
+        return if number > 0.0 { "Infinity" } else { "-Infinity" }.to_owned();
+    }
+    // f64 的 Display 就是能往返的最短十进制、不用指数（负零写 -0）
+    if number == 0.0 || (1e-4..1e17).contains(&number.abs()) {
+        return number.to_string();
+    }
+    // `{:e}` 给出最短往返的有效数字与指数，如 1.5e-7；改写成 .NET 的 1.5E-07
+    let scientific = format!("{number:e}");
+    let (mantissa, exponent) = scientific.split_once('e').unwrap_or((&scientific, "0"));
+    let exponent: i32 = exponent.parse().unwrap_or(0);
+    format!("{mantissa}E{}{:02}", if exponent < 0 { '-' } else { '+' }, exponent.unsigned_abs())
+}
 /// 可移植的格式说明符；不认识的说明符或类型不合时返回 `None`，由调用方按无格式输出。
 fn portable(spec: &str, value: &Value) -> Option<String> {
     let mut characters = spec.chars();
@@ -228,7 +249,8 @@ fn fixed(value: &Value, precision: usize) -> Option<String> {
     if let Some(number) = integer(value) {
         return Some(if precision == 0 { number.to_string() } else { format!("{number}.{}", "0".repeat(precision)) });
     }
-    value.as_f64().map(|number| format!("{number:.precision$}"))
+    // 定点格式化写出全部整数位、不用指数，负数舍入成零时保留负号（-0.001 写 F2 得 -0.00）；非数与无穷按文本形式
+    value.as_f64().map(|number| if number.is_finite() { format!("{number:.precision$}") } else { float_text(number) })
 }
 
 /// 给定点小数的整数部分加千分位：`-1234567.89` 得 `-1,234,567.89`。
@@ -260,12 +282,15 @@ where
     values.into_iter().enumerate().map(|(index, value)| (index.to_string(), value.into())).collect()
 }
 
-/// 在没有文案时描述一个消息：`键 (k=v, ...)`，参数按名字排序；没有参数时只有键。
+/// 在没有文案时描述一个消息：`键 (k=v, ...)`，参数按名字的序数顺序（逐个 UTF-16 码元）排列，值按文本形式；没有参数时只有键。
 pub fn describe(key: &str, arguments: &Details) -> String {
     if arguments.is_empty() {
         return key.to_owned();
     }
-    let parts: Vec<String> = arguments.iter().map(|(name, value)| format!("{name}={}", display(value))).collect();
+    // 按名字的序数顺序（逐个 UTF-16 码元比较，与 .NET 的 Ordinal 一致）：BTreeMap 的字节序在基本多文种平面以外的字符上与它不同
+    let mut names: Vec<&String> = arguments.keys().collect();
+    names.sort_by(|left, right| left.encode_utf16().cmp(right.encode_utf16()));
+    let parts: Vec<String> = names.into_iter().map(|name| format!("{name}={}", display(&arguments[name]))).collect();
     format!("{key} ({})", parts.join(", "))
 }
 
@@ -458,6 +483,15 @@ mod tests {
         assert_eq!(group_thousands("-1234567.89"), "-1,234,567.89");
         assert_eq!(group_thousands("123"), "123");
         assert_eq!(group_thousands("1000"), "1,000");
+        // JSON 带不出非数与无穷，直接核对
+        assert_eq!(
+            (float_text(f64::NAN), float_text(f64::INFINITY), float_text(f64::NEG_INFINITY)),
+            ("NaN".to_owned(), "Infinity".to_owned(), "-Infinity".to_owned())
+        );
+        assert_eq!(
+            (float_text(-1e-5), float_text(1e-4), float_text(99999999999999990.0)),
+            ("-1E-05".to_owned(), "0.0001".to_owned(), "99999999999999980".to_owned())
+        );
     }
 
     #[test]

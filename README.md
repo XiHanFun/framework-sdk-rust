@@ -90,7 +90,7 @@ assert_eq!(failed, r#"{"ok":false,"error":{"code":"ORDERS_CONFLICT_001","message
 
 读写按 RFC-0001「Result」与向量 `wire-encoding.json`：不带值的成功 `Result<()>` 只写 `{"ok":true}`，读入时带了 `value` 即拒绝；有值成功的 `value` 必填，只有值类型是 `Maybe<T>`（`Option<T>`）时可以是 `null`；`Error` 的 `code` 与非空的 `message` 必填，可选成员写成 `null` 不合法；Result 与 Error 只收 JSON 对象（serde 派生的数组形式也拒绝），未知成员忽略。`Maybe<T>` 有值为值本身、无值为 `null`；`TypedId` 编码为底层值。
 
-消息模板按 RFC-0010「模板」与向量 `message-templates.json`：`{name}` / `{0}`，`{{`、`}}` 转义；值的文本形式是字符串原样、布尔 `true` / `false`、`null` 为空串、浮点写最短往返的十进制（`2.0` 写 `2`）；可移植的格式说明符 `D`、`X` / `x`、`F`、`N`（`{n:D5}`、`{n:x4}`、`{n:F2}`、`{n:N2}`），`F` 与 `N` 正好一半时取偶，按不变文化格式化；其余说明符（如 `yyyy-MM-dd`）留给宿主，SDK 按无格式输出。插件要在本地格式化的目录只用可移植的这组。清单用 `manifest::read` 读入、`manifest::write` 写出规范化文本（两空格缩进，字段按 Schema 顺序，缺省值省略）。
+消息模板按 RFC-0010「模板」与向量 `message-templates.json`：`{name}` / `{0}`，`{{`、`}}` 转义；值的文本形式是字符串原样、布尔 `true` / `false`、`null` 为空串、浮点在 1e-4 ≤ |x| < 1e17 时写最短往返的十进制（`2.0` 写 `2`），范围之外写 `1E+17`、`9.9E-05`，负零写 `-0`；可移植的格式说明符 `D`、`X` / `x`、`F`、`N`（`{n:D5}`、`{n:x4}`、`{n:F2}`、`{n:N2}`，`D`、`F`、`N` 不区分大小写，精度 0–99），`F` 与 `N` 正好一半时取偶、写出全部整数位，按不变文化格式化；`Describe` 的参数按名字的序数顺序（UTF-16 码元）；其余说明符（如 `yyyy-MM-dd`）留给宿主，SDK 按无格式输出。插件要在本地格式化的目录只用可移植的这组。清单用 `manifest::read` 读入、`manifest::write` 写出规范化文本（两空格缩进，字段按 Schema 顺序，缺省值省略）。
 
 ## 依赖
 
