@@ -19,7 +19,7 @@
 //! let _outcome = pipeline.run(&ctx, &terminal); // 交给执行器 await
 //! ```
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
 
@@ -196,21 +196,15 @@ impl Descriptor {
     }
 }
 
-/// 一次登记。
+/// 一次登记，连同它作为主体声明的顺序约束（目标按名字，排序时解析）。
 #[derive(Clone)]
 struct Registration {
     middleware: Arc<dyn Middleware>,
     descriptor: Descriptor,
-}
-
-/// 一条顺序约束：主体 `name` 在目标之前（`before`）或之后。
-#[derive(Clone)]
-struct Constraint {
-    name: String,
-    // 主体在声明时解析成登记的下标
-    subject: usize,
-    target: String,
-    before: bool,
+    // 主体在目标之前
+    before: Vec<String>,
+    // 主体在目标之后
+    after: Vec<String>,
 }
 
 /// 收集中间件与顺序约束，按规范排序后构建管道。
@@ -218,12 +212,12 @@ struct Constraint {
 /// 报错的时机照 RFC-0004 排序规则第 8 条：登记时立即报的是重复登记、空的名字或归属、约束主体未登记或按名字有歧义
 /// （登记方法返回 `Err`，这一项不生效，构建器照常可用）；排序时（[`Builder::describe`]、[`Builder::dump`]、[`Builder::build`]）
 /// 报的是约束目标未登记、有歧义或不在同一阶段，以及约束成环。登记方法返回 `&mut Self`，可以接着 `?` 链式调用。
+/// 错误的消息是英文原文，与 .NET 逐字相同（ADR-0236），按名字登记的实例写成 `中间件名[实例名]`。
 /// 克隆共享已登记的中间件实例（`Arc`），可以从同一份基础登记派生几条管道。
 #[derive(Clone, Default)]
 pub struct Builder {
     // 下标即登记顺序（排序规则第 4 条）
     registrations: Vec<Registration>,
-    constraints: Vec<Constraint>,
 }
 
 impl Builder {
@@ -273,14 +267,15 @@ impl Builder {
         owner: &str,
     ) -> std::result::Result<&mut Self, FrameworkError> {
         let descriptor = Descriptor { stage, middleware: middleware.name().to_owned(), instance, owner: owner.to_owned(), placement };
+        // 空的名字与归属在 .NET 是参数异常，Rust 一并报登记错误
         if descriptor.middleware.is_empty() {
-            return Err(registration_error("a middleware has an empty name".to_owned()));
+            return Err(registration_error("A middleware has an empty name.".to_owned()));
         }
         if descriptor.instance.as_deref() == Some("") {
-            return Err(registration_error(format!("a named instance of the middleware '{}' has an empty name", descriptor.middleware)));
+            return Err(registration_error(format!("A named instance of middleware '{}' has an empty name.", descriptor.middleware)));
         }
         if descriptor.owner.is_empty() {
-            return Err(registration_error(format!("the middleware '{}' has an empty owner", descriptor.display_name())));
+            return Err(registration_error(format!("Middleware '{}' has an empty owner.", descriptor.display_name())));
         }
         // 同一中间件的默认实例只登记一次，命名实例的名字在中间件内唯一；登记数有限，逐个比较即可
         let duplicate = self
@@ -288,21 +283,31 @@ impl Builder {
             .iter()
             .any(|registration| registration.descriptor.middleware == descriptor.middleware && registration.descriptor.instance == descriptor.instance);
         if duplicate {
-            return Err(registration_error(format!("the middleware '{}' is registered more than once", descriptor.display_name())));
+            return Err(registration_error(match &descriptor.instance {
+                None => format!(
+                    "Middleware '{}' is already registered; each middleware type may appear only once in a pipeline unless its instances are named.",
+                    descriptor.middleware
+                ),
+                Some(instance) => {
+                    format!("Middleware '{}' named '{instance}' is already registered; instance names must be unique within a type.", descriptor.middleware)
+                }
+            }));
         }
-        self.registrations.push(Registration { middleware, descriptor });
+        self.registrations.push(Registration { middleware, descriptor, before: Vec::new(), after: Vec::new() });
         Ok(self)
     }
 
     /// 接上另一个构建器的全部登记与约束，排在已有的登记之后；重复登记同样报 `KERNEL_PIPELINE_003`。
     pub(crate) fn extend_from(&mut self, other: &Builder) -> std::result::Result<(), FrameworkError> {
-        let offset = self.registrations.len();
         for registration in &other.registrations {
             let descriptor = &registration.descriptor;
             self.add(Arc::clone(&registration.middleware), descriptor.instance.clone(), descriptor.stage, descriptor.placement, &descriptor.owner)?;
+            // 约束跟着它的主体走
+            if let Some(added) = self.registrations.last_mut() {
+                added.before.clone_from(&registration.before);
+                added.after.clone_from(&registration.after);
+            }
         }
-        // 约束的主体在声明时解析成下标，接上之后整体后移
-        self.constraints.extend(other.constraints.iter().map(|constraint| Constraint { subject: constraint.subject + offset, ..constraint.clone() }));
         Ok(())
     }
 
@@ -311,17 +316,15 @@ impl Builder {
     /// 两端都是名字：按名字登记的实例用实例名，没有名字的登记用中间件名（RFC-0004 排序规则第 7 条）。主体 `middleware`
     /// 在声明时就必须已登记，没有或有歧义立即返回 `KERNEL_PIPELINE_003`；目标 `other` 在排序时解析。
     pub fn before(&mut self, middleware: &str, other: &str) -> std::result::Result<&mut Self, FrameworkError> {
-        self.constrain(middleware, other, true)
+        let subject = self.subject(middleware)?;
+        self.registrations[subject].before.push(other.to_owned());
+        Ok(self)
     }
 
     /// 约束 `middleware` 在 `other` 之后；名字的解析与报错的时机同 [`Builder::before`]。
     pub fn after(&mut self, middleware: &str, other: &str) -> std::result::Result<&mut Self, FrameworkError> {
-        self.constrain(middleware, other, false)
-    }
-
-    fn constrain(&mut self, middleware: &str, other: &str, before: bool) -> std::result::Result<&mut Self, FrameworkError> {
         let subject = self.subject(middleware)?;
-        self.constraints.push(Constraint { name: middleware.to_owned(), subject, target: other.to_owned(), before });
+        self.registrations[subject].after.push(other.to_owned());
         Ok(self)
     }
 
@@ -345,17 +348,10 @@ impl Builder {
     }
 
     /// 按规则排序，返回登记的下标：先阶段；阶段内先位置，再归属的序数字典序，再登记顺序；最后按约束做稳定拓扑排序。
+    ///
+    /// 与 .NET 一样逐个阶段处理：阶段内按基准次序逐个中间件解析它的约束，先 `before` 后 `after`，再排序；所以几处错误同时存在时
+    /// 报出的是同一个（前面阶段的成环先于后面阶段的目标未登记）。
     fn sorted(&self) -> std::result::Result<Vec<usize>, FrameworkError> {
-        let mut edges = Vec::with_capacity(self.constraints.len());
-        for constraint in &self.constraints {
-            let (subject, target) = (constraint.subject, self.target(&constraint.target)?);
-            if self.registrations[subject].descriptor.stage != self.registrations[target].descriptor.stage {
-                let (first, second) = if constraint.before { (&constraint.name, &constraint.target) } else { (&constraint.target, &constraint.name) };
-                return Err(registration_error(format!("the ordering constraint between '{first}' and '{second}' crosses stages")));
-            }
-            edges.push(if constraint.before { (subject, target) } else { (target, subject) });
-        }
-
         let mut result = Vec::with_capacity(self.registrations.len());
         for &stage in PipelineStage::ALL {
             let mut members: Vec<usize> = (0..self.registrations.len()).filter(|&index| self.registrations[index].descriptor.stage == stage).collect();
@@ -364,9 +360,51 @@ impl Builder {
                 let (a, b) = (&self.registrations[left].descriptor, &self.registrations[right].descriptor);
                 a.placement.cmp(&b.placement).then_with(|| a.owner.encode_utf16().cmp(b.owner.encode_utf16())).then(left.cmp(&right))
             });
-            result.extend(topological_sort(stage, members, &edges)?);
+            let mut edges = Vec::new();
+            for &source in &members {
+                let registration = &self.registrations[source];
+                for target in &registration.before {
+                    edges.push((source, self.target(source, target, stage)?));
+                }
+                for target in &registration.after {
+                    edges.push((self.target(source, target, stage)?, source));
+                }
+            }
+            result.extend(self.topological_sort(stage, members, &edges)?);
         }
         Ok(result)
+    }
+
+    /// 在基准次序上应用约束做稳定拓扑排序（Kahn，每次取基准次序里最靠前的、没有前驱的中间件）。
+    ///
+    /// 约束只调整必要的相对位置，其余保持基准次序（排序规则第 5 条）。成环时按基准次序列出全部仍被卡住的中间件。
+    fn topological_sort(&self, stage: PipelineStage, members: Vec<usize>, edges: &[(usize, usize)]) -> std::result::Result<Vec<usize>, FrameworkError> {
+        let mut incoming: HashMap<usize, usize> = HashMap::new();
+        let mut outgoing: HashMap<usize, Vec<usize>> = HashMap::new();
+        for &(first, second) in edges {
+            outgoing.entry(first).or_default().push(second);
+            *incoming.entry(second).or_default() += 1;
+        }
+        let mut remaining = members;
+        let mut ordered = Vec::with_capacity(remaining.len());
+        while !remaining.is_empty() {
+            // 剩下的每个都有前驱即成环
+            let Some(position) = remaining.iter().position(|member| incoming.get(member).is_none_or(|&count| count == 0)) else {
+                let stuck: Vec<String> = remaining.iter().map(|&index| format!("'{}'", self.registrations[index].descriptor.display_name())).collect();
+                return Err(FrameworkError::new(
+                    ERROR_CODE_CYCLE,
+                    format!("Middleware ordering constraints in stage '{stage}' form a cycle: {}.", stuck.join(", ")),
+                ));
+            };
+            let node = remaining.remove(position);
+            ordered.push(node);
+            for successor in outgoing.get(&node).into_iter().flatten() {
+                if let Some(count) = incoming.get_mut(successor) {
+                    *count -= 1;
+                }
+            }
+        }
+        Ok(ordered)
     }
 
     /// 在登记里按名字找唯一的一个：按名字登记的实例只认实例名，没有名字的登记认中间件名（RFC-0004 排序规则第 7 条）。
@@ -381,57 +419,39 @@ impl Builder {
             (None, _) => Ok(None),
             (Some(index), None) => Ok(Some(index)),
             _ => Err(registration_error(format!(
-                "the middleware name '{name}' matches several registrations, so ordering constraints by name are ambiguous for it"
+                "The middleware name '{name}' matches several registrations, so ordering constraints by name are ambiguous for it."
             ))),
         }
     }
 
     /// 解析约束的主体：声明时就必须已登记（排序规则第 7、8 条）。
     fn subject(&self, name: &str) -> std::result::Result<usize, FrameworkError> {
-        self.find(name)?
-            .ok_or_else(|| registration_error(format!("the middleware '{name}' is not registered, so no ordering constraint can be declared for it")))
+        self.find(name)?.ok_or_else(|| registration_error(format!("Middleware '{name}' is not registered, so no ordering constraint can be declared for it.")))
     }
 
-    /// 解析约束的目标：在排序时按当时的登记解析。
-    fn target(&self, name: &str) -> std::result::Result<usize, FrameworkError> {
-        self.find(name)?.ok_or_else(|| registration_error(format!("the ordering constraint references the unregistered middleware '{name}'")))
+    /// 解析约束的目标：排序时按当时的登记解析，必须与主体 `source` 在同一阶段。
+    fn target(&self, source: usize, name: &str, stage: PipelineStage) -> std::result::Result<usize, FrameworkError> {
+        let label = self.registrations[source].descriptor.display_name();
+        let target = self
+            .find(name)?
+            .ok_or_else(|| registration_error(format!("The ordering constraint of middleware '{label}' references unregistered middleware '{name}'.")))?;
+        // 跨阶段的先后由阶段顺序决定，相对约束只在阶段内有意义
+        let other = self.registrations[target].descriptor.stage;
+        if other != stage {
+            return Err(registration_error(format!(
+                "Middleware '{label}' (stage '{stage}') and '{name}' (stage '{other}') are not in the same stage, so no relative order can be declared between them."
+            )));
+        }
+        Ok(target)
     }
 }
 
 impl fmt::Debug for Builder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let descriptors: Vec<&Descriptor> = self.registrations.iter().map(|registration| &registration.descriptor).collect();
-        formatter.debug_struct("Builder").field("registrations", &descriptors).field("constraints", &self.constraints.len()).finish()
+        let constraints: usize = self.registrations.iter().map(|registration| registration.before.len() + registration.after.len()).sum();
+        formatter.debug_struct("Builder").field("registrations", &descriptors).field("constraints", &constraints).finish()
     }
-}
-
-/// 在基准次序上应用约束做稳定拓扑排序（Kahn，每次取基准次序里最靠前的、没有前驱的中间件）。
-///
-/// 约束只调整必要的相对位置，其余保持基准次序（排序规则第 5 条）；跨阶段的约束已在之前拒绝，这里只看本阶段的边。
-fn topological_sort(stage: PipelineStage, members: Vec<usize>, edges: &[(usize, usize)]) -> std::result::Result<Vec<usize>, FrameworkError> {
-    let in_stage: HashSet<usize> = members.iter().copied().collect();
-    let mut incoming: HashMap<usize, usize> = HashMap::new();
-    let mut outgoing: HashMap<usize, Vec<usize>> = HashMap::new();
-    for &(first, second) in edges.iter().filter(|(first, _)| in_stage.contains(first)) {
-        outgoing.entry(first).or_default().push(second);
-        *incoming.entry(second).or_default() += 1;
-    }
-    let mut remaining = members;
-    let mut ordered = Vec::with_capacity(remaining.len());
-    while !remaining.is_empty() {
-        // 剩下的每个都有前驱即成环
-        let Some(position) = remaining.iter().position(|member| incoming.get(member).is_none_or(|&count| count == 0)) else {
-            return Err(FrameworkError::new(ERROR_CODE_CYCLE, format!("the ordering constraints in stage '{stage}' form a cycle.")));
-        };
-        let node = remaining.remove(position);
-        ordered.push(node);
-        for successor in outgoing.get(&node).into_iter().flatten() {
-            if let Some(count) = incoming.get_mut(successor) {
-                *count -= 1;
-            }
-        }
-    }
-    Ok(ordered)
 }
 
 /// 按打印格式输出描述。
@@ -440,12 +460,12 @@ fn dump(descriptors: &[Descriptor]) -> String {
 }
 
 fn registration_error(message: String) -> FrameworkError {
-    FrameworkError::new(ERROR_CODE_REGISTRATION, message + ".")
+    FrameworkError::new(ERROR_CODE_REGISTRATION, message)
 }
 
 /// 解析清单里的阶段名；未知阶段返回 `KERNEL_PIPELINE_002`。
 pub fn parse_stage(name: &str) -> std::result::Result<PipelineStage, FrameworkError> {
-    PipelineStage::parse(name).ok_or_else(|| FrameworkError::new(ERROR_CODE_UNKNOWN_STAGE, format!("'{name}' is not a pipeline stage.")))
+    PipelineStage::parse(name).ok_or_else(|| FrameworkError::new(ERROR_CODE_UNKNOWN_STAGE, format!("Unknown pipeline stage '{name}'.")))
 }
 
 /// 已排序的管道：每次调用经 [`Pipeline::run`] 依次穿过全部中间件，最后进入调用方给出的终点。

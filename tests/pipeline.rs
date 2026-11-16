@@ -118,18 +118,38 @@ fn constraints_reorder_within_a_stage() {
 fn sort_errors_are_reported_when_sorting() {
     let mut cycle = validate_stage(&["A", "B"]);
     cycle.before("A", "B").unwrap().before("B", "A").unwrap();
-    assert_eq!(assert_sort_error(&cycle, ERROR_CODE_CYCLE), "the ordering constraints in stage 'validate' form a cycle.");
+    assert_eq!(assert_sort_error(&cycle, ERROR_CODE_CYCLE), "Middleware ordering constraints in stage 'validate' form a cycle: 'A', 'B'.");
     let mut itself = validate_stage(&["A"]);
     itself.before("A", "A").unwrap();
-    assert_sort_error(&itself, ERROR_CODE_CYCLE);
+    assert_eq!(assert_sort_error(&itself, ERROR_CODE_CYCLE), "Middleware ordering constraints in stage 'validate' form a cycle: 'A'.");
+    // 成环时列出全部仍被卡住的中间件，含排在环后面的
+    let mut downstream = validate_stage(&["A", "B", "C", "D"]);
+    downstream.before("B", "C").unwrap().before("C", "B").unwrap().before("C", "D").unwrap();
+    assert_eq!(assert_sort_error(&downstream, ERROR_CODE_CYCLE), "Middleware ordering constraints in stage 'validate' form a cycle: 'B', 'C', 'D'.");
 
     let mut unregistered = validate_stage(&["A"]);
     unregistered.before("A", "Missing").unwrap();
-    assert_eq!(assert_sort_error(&unregistered, ERROR_CODE_REGISTRATION), "the ordering constraint references the unregistered middleware 'Missing'.");
+    assert_eq!(
+        assert_sort_error(&unregistered, ERROR_CODE_REGISTRATION),
+        "The ordering constraint of middleware 'A' references unregistered middleware 'Missing'."
+    );
 
     let mut cross_stage = validate_stage(&["A"]);
     cross_stage.use_at(passthrough("B"), PipelineStage::Egress, Placement::End, APP_OWNER).unwrap().before("A", "B").unwrap();
-    assert_sort_error(&cross_stage, ERROR_CODE_REGISTRATION);
+    assert_eq!(
+        assert_sort_error(&cross_stage, ERROR_CODE_REGISTRATION),
+        "Middleware 'A' (stage 'validate') and 'B' (stage 'egress') are not in the same stage, so no relative order can be declared between them."
+    );
+
+    // 与 .NET 一样逐个阶段处理：前面阶段的成环先于后面阶段的目标未登记
+    let mut both = validate_stage(&["A", "B"]);
+    both.before("A", "B").unwrap().before("B", "A").unwrap();
+    both.use_at(passthrough("H"), PipelineStage::Handle, Placement::End, APP_OWNER).unwrap().before("H", "Missing").unwrap();
+    assert_sort_error(&both, ERROR_CODE_CYCLE);
+    let mut first = Builder::new();
+    first.use_at(passthrough("H"), PipelineStage::Handle, Placement::End, APP_OWNER).unwrap().before("H", "Missing").unwrap();
+    first.use_at(passthrough("V"), PipelineStage::Validate, Placement::End, APP_OWNER).unwrap().before("V", "Gone").unwrap();
+    assert!(assert_sort_error(&first, ERROR_CODE_REGISTRATION).contains("'V' references unregistered middleware 'Gone'"));
 }
 
 /// 登记时立即报出的错误：这一项不生效，构建器照常可用（RFC-0004 排序规则第 8 条）。
@@ -137,7 +157,13 @@ fn sort_errors_are_reported_when_sorting() {
 fn registration_errors_are_reported_immediately() {
     let mut builder = validate_stage(&["A"]);
     let error = builder.use_at(passthrough("A"), PipelineStage::Observe, Placement::End, APP_OWNER).map(|_| ()).unwrap_err();
-    assert_eq!((error.code(), error.message()), (ERROR_CODE_REGISTRATION, "the middleware 'A' is registered more than once."));
+    assert_eq!(
+        (error.code(), error.message()),
+        (
+            ERROR_CODE_REGISTRATION,
+            "Middleware 'A' is already registered; each middleware type may appear only once in a pipeline unless its instances are named."
+        )
+    );
     assert_eq!(order(&builder), ["A"], "the failed registration is not applied");
 
     for error in [
@@ -151,13 +177,13 @@ fn registration_errors_are_reported_immediately() {
     }
     assert_eq!(
         builder.before("Missing", "A").map(|_| ()).unwrap_err().message(),
-        "the middleware 'Missing' is not registered, so no ordering constraint can be declared for it."
+        "Middleware 'Missing' is not registered, so no ordering constraint can be declared for it."
     );
     builder.use_at(passthrough("B"), PipelineStage::Validate, Placement::End, APP_OWNER).unwrap().before("B", "A").unwrap();
     assert_eq!(order(&builder), ["B", "A"], "the builder keeps working after errors");
 
     let error = pipeline::parse_stage("middle").unwrap_err();
-    assert_eq!((error.code(), error.message()), (ERROR_CODE_UNKNOWN_STAGE, "'middle' is not a pipeline stage."));
+    assert_eq!((error.code(), error.message()), (ERROR_CODE_UNKNOWN_STAGE, "Unknown pipeline stage 'middle'."));
     assert_eq!(pipeline::parse_stage("handle").unwrap(), PipelineStage::Handle);
 }
 
@@ -197,7 +223,7 @@ fn named_instances_are_distinct_and_constrained_by_instance_name() {
     clash.before("Third", "Other").unwrap();
     assert_eq!(
         assert_sort_error(&clash, ERROR_CODE_REGISTRATION),
-        "the middleware name 'Other' matches several registrations, so ordering constraints by name are ambiguous for it."
+        "The middleware name 'Other' matches several registrations, so ordering constraints by name are ambiguous for it."
     );
 }
 
@@ -282,6 +308,7 @@ struct OrderingError {
     steps: Vec<OrderingStep>,
     error: String,
     at: serde_json::Value,
+    message: String,
 }
 
 #[derive(Deserialize)]
@@ -343,12 +370,14 @@ fn ordering_follows_the_vectors() {
                 break;
             }
         }
+        // 消息是英文原文，逐字相等（ADR-0236）
+        let message = case.message.replace("{type}", PROBE);
         match (&case.at, failed) {
             (serde_json::Value::String(at), None) if at == "sort" => {
-                assert_sort_error(&builder, &case.error);
+                assert_eq!(assert_sort_error(&builder, &case.error), message, "{}", case.name);
             }
             (serde_json::Value::Number(at), Some((index, error))) => {
-                assert_eq!((Some(index as u64), error.code()), (at.as_u64(), case.error.as_str()), "{}", case.name);
+                assert_eq!((Some(index as u64), error.code(), error.message()), (at.as_u64(), case.error.as_str(), message.as_str()), "{}", case.name);
             }
             (at, failed) => panic!("{}: expected the error at {at}, got {:?}", case.name, failed.map(|(index, error)| (index, error.to_string()))),
         }
