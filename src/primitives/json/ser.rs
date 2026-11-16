@@ -6,8 +6,8 @@ use serde::ser::{
 };
 use serde_json::Value;
 
-/// 按值模型写出任意可序列化的值：单精度浮点先换成最接近的双精度（0.1 写 `0.10000000149011612`），非有限的浮点写成字符串
-/// `NaN`、`Infinity`、`-Infinity`，其余照原样交给内层的序列化器。
+/// 按值模型写出任意可序列化的值：单精度浮点先换成最接近的双精度（0.1 写 `0.10000000149011612`），`i128` / `u128` 超出 64 位的
+/// 是双精度浮点，非有限的浮点写成字符串 `NaN`、`Infinity`、`-Infinity`，其余照原样交给内层的序列化器。
 ///
 /// `serde_json` 自己把非有限的浮点写成 `null`，对方就读不回同一个值；整数值的浮点它写成 `2.0`、`-0.0`、`1e17`，
 /// 对方按模型读回的仍是浮点，不用另做处理。[`WireResult`](crate::primitives::WireResult) 的值经它写出。
@@ -17,6 +17,7 @@ use serde_json::Value;
 ///
 /// assert_eq!(serde_json::to_string(&Model(&[f64::NAN, 2.0])).unwrap(), r#"["NaN",2.0]"#);
 /// assert_eq!(serde_json::to_string(&Model(&0.1f32)).unwrap(), "0.10000000149011612");
+/// assert_eq!(serde_json::to_string(&Model(&(u128::from(u64::MAX) + 1))).unwrap(), "1.8446744073709552e+19");
 /// ```
 #[derive(Clone, Copy, Debug)]
 pub struct Model<'a, T: ?Sized>(pub &'a T);
@@ -82,7 +83,12 @@ impl<S: Serializer> Serializer for ModelSerializer<S> {
     }
 
     fn serialize_i128(self, value: i128) -> Result<S::Ok, S::Error> {
-        self.0.serialize_i128(value)
+        // 64 位之外的整数按值模型是双精度浮点（serde_json 本来也写不出）
+        match (i64::try_from(value), u64::try_from(value)) {
+            (Ok(small), _) => self.0.serialize_i64(small),
+            (_, Ok(unsigned)) => self.0.serialize_u64(unsigned),
+            _ => self.serialize_f64(value as f64),
+        }
     }
 
     fn serialize_u8(self, value: u8) -> Result<S::Ok, S::Error> {
@@ -102,7 +108,10 @@ impl<S: Serializer> Serializer for ModelSerializer<S> {
     }
 
     fn serialize_u128(self, value: u128) -> Result<S::Ok, S::Error> {
-        self.0.serialize_u128(value)
+        match u64::try_from(value) {
+            Ok(small) => self.0.serialize_u64(small),
+            Err(_) => self.serialize_f64(value as f64),
+        }
     }
 
     fn serialize_f32(self, value: f32) -> Result<S::Ok, S::Error> {
