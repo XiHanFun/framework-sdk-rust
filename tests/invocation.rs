@@ -220,22 +220,62 @@ fn correlated_context() -> Context {
     Context::builder().baggage(BAGGAGE_CORRELATION, "c1").build()
 }
 
-/// 写出的 traceparent 总带标志：没有上游时写 01，上游给的标志全部位原样写出，采样只看最低位（RFC-0003 规则 7）。
-#[test]
-fn trace_flags_are_written_as_received() {
-    let root = Context::background();
-    assert_eq!(root.trace().flags(), None, "a generated trace has no upstream flags");
-    assert!(root.trace().is_sampled());
-    assert!(root.trace_parent().ends_with("-01"), "{}", root.trace_parent());
+#[derive(serde::Deserialize)]
+struct TraceVectors {
+    parse: TraceParseCases,
+    format: Vec<TraceFormatCase>,
+}
 
-    for (flags, sampled) in [("00", false), ("01", true), ("02", false), ("03", true), ("ff", true)] {
-        let header = format!("00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-{flags}");
-        let ctx = Context::builder().trace_parent(&header).build();
-        assert_eq!((ctx.trace_parent(), ctx.trace().is_sampled()), (header.clone(), sampled), "{flags}");
-        assert_eq!(ctx.trace().flags(), Some(u8::from_str_radix(flags, 16).unwrap()));
+#[derive(serde::Deserialize)]
+struct TraceParseCases {
+    valid: Vec<TraceParseCase>,
+    invalid: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceParseCase {
+    text: String,
+    trace_id: String,
+    span_id: String,
+    sampled: bool,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TraceFormatCase {
+    trace_id: String,
+    span_id: String,
+    sampled: Option<bool>,
+    text: String,
+}
+
+/// traceparent 的解析与写出按 trace-context.json（RFC-0003 规则 7）：不合法的当作没有给出，写出只带采样位。
+#[test]
+fn trace_context_follows_the_vectors() {
+    let vectors: TraceVectors = common::vector("primitives/trace-context.json");
+    for case in &vectors.parse.valid {
+        let parsed = TraceContext::parse(&case.text).unwrap_or_else(|| panic!("{} must parse", case.text));
+        assert_eq!(
+            (parsed.trace_id(), parsed.span_id(), parsed.sampled()),
+            (case.trace_id.as_str(), case.span_id.as_str(), Some(case.sampled)),
+            "{}",
+            case.text
+        );
+        let ctx = Context::builder().trace_parent(&case.text).build();
+        assert_eq!(ctx.trace_id(), case.trace_id);
+        assert!(ctx.trace_parent().ends_with(if case.sampled { "-01" } else { "-00" }), "only the sampled bit is written: {}", ctx.trace_parent());
     }
-    let unsampled = TraceContext::new("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", false).unwrap();
-    assert_eq!(unsampled.trace_parent(), "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-00");
-    let unknown = TraceContext::with_flags("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331", None).unwrap();
-    assert!(unknown.trace_parent().ends_with("-01") && unknown.is_sampled());
+    for text in &vectors.parse.invalid {
+        assert!(TraceContext::parse(text).is_none(), "{text:?} must be invalid");
+        let ctx = Context::builder().trace_parent(text).build();
+        assert_eq!((ctx.trace().sampled(), ctx.trace_id().len()), (None, 32), "an invalid traceparent is treated as absent: {text:?}");
+    }
+    for case in &vectors.format {
+        let trace = TraceContext::with_sampling(case.trace_id.as_str(), case.span_id.as_str(), case.sampled).unwrap();
+        assert_eq!(trace.trace_parent(), case.text);
+    }
+    let root = Context::background();
+    assert_eq!((root.trace().sampled(), root.trace().is_sampled()), (None, true));
+    assert!(root.trace_parent().ends_with("-01"));
 }
