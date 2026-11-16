@@ -382,3 +382,60 @@ fn reading_follows_the_schema_verbatim() {
         assert!(manifest::read(operations(operation)).is_err(), "{operation} must be rejected");
     }
 }
+
+#[derive(Deserialize)]
+struct ManifestVectors {
+    valid: Vec<ManifestCase>,
+    invalid: Vec<ManifestCase>,
+}
+
+#[derive(Deserialize)]
+struct ManifestCase {
+    name: String,
+    #[serde(default)]
+    manifest: Option<serde_json::Value>,
+    #[serde(default)]
+    text: Option<String>,
+}
+
+impl ManifestCase {
+    /// 清单的原文：有 text 用 text（重复成员），否则是 manifest 的 JSON 文本（含 null 根）。
+    fn source(&self) -> String {
+        self.text.clone().unwrap_or_else(|| serde_json::to_string(self.manifest.as_ref().unwrap_or(&serde_json::Value::Null)).unwrap())
+    }
+}
+
+/// 清单的读取按 manifests.json（RFC-0002 解析规则 2）：合法的读得出且写出后再读得到同一份，不合法的一律拒绝。
+#[test]
+fn manifests_follow_the_vectors() {
+    let vectors: ManifestVectors = common::vector("manifest/manifests.json");
+    for case in &vectors.valid {
+        let read = manifest::read(case.source()).unwrap_or_else(|error| panic!("{} must be read: {error}", case.name));
+        let written = manifest::write(&read).unwrap();
+        assert_eq!(manifest::read(&written).unwrap(), read, "{} round trip", case.name);
+    }
+    for case in &vectors.invalid {
+        let error = manifest::read(case.source()).expect_err(&case.name);
+        assert_eq!(error.code(), ERROR_CODE_INVALID_ARGUMENT, "{}", case.name);
+    }
+}
+
+/// 对象位置只收 JSON 对象：serde 派生的结构体会把字段同序的数组读成结构体，清单读取在读入之前拒绝它。
+#[test]
+fn object_positions_reject_arrays() {
+    let base = r#""id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability""#;
+    for (member, path) in [
+        (r#""provides":[["orders.store","1"]]"#, "$.provides[0]"),
+        (r#""requires":[{"id":"a.b","version":"1"},["a.c","1",false]]"#, "$.requires[1]"),
+        (r#""bindings":[["db","queue"]]"#, "$.bindings[0]"),
+        (r#""contributes":[[],[],null,[],[]]"#, "$.contributes"),
+        (r#""contributes":{"pipeline":[["audit","observe"]]}"#, "$.contributes.pipeline[0]"),
+        (r#""contributes":{"config":["XiHan:A"]}"#, "$.contributes.config"),
+    ] {
+        let error = manifest::read(format!("{{{base},{member}}}")).expect_err(member);
+        let cause = error.cause().map(ToString::to_string).unwrap_or_default();
+        assert!(cause.contains(path), "{member}: {cause}");
+    }
+    let root = r#"["xihan.a.b","1.0.0","1","stable","capability",null,null,null,null,null,null,null,null,null,null,null]"#;
+    assert!(manifest::read(root).is_err(), "the array form of the root is rejected");
+}

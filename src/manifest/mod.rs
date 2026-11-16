@@ -20,6 +20,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::grammar::{all, digit, lower, lower_digit, lower_digit_hyphen, operation_id, positive, upper, word};
 use crate::primitives::{ERROR_CODE_INVALID_ARGUMENT, FrameworkError, PipelineStage, Stability};
@@ -374,8 +375,8 @@ pub struct Manifest {
     /// 贡献点。
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub contributes: Option<Contributions>,
-    /// 激活事件；空即缺省的 `onStartup`。
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// 激活事件；空即没有声明，按缺省的 `onStartup`。读入时写了就至少一项，空数组不合法。
+    #[serde(default, deserialize_with = "non_empty", skip_serializing_if = "Vec::is_empty")]
     pub activation: Vec<String>,
     /// 插件所需权限，宿主配置授予。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -550,8 +551,14 @@ impl Contributions {
 
 /// 解析并校验清单 JSON；未知字段、格式与跨字段约束都算失败（`PRIMITIVES_VALIDATION_001`）。
 pub fn read(data: impl AsRef<[u8]>) -> Result<Manifest, FrameworkError> {
-    let manifest: Manifest = serde_json::from_slice(data.as_ref())
-        .map_err(|error| FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, "The manifest is not valid JSON for the schema.").with_cause(error))?;
+    let data = data.as_ref();
+    let not_valid = || FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, "The manifest is not valid JSON for the schema.");
+    // 先按 JSON 值核对对象位置，再按类型读入：后者报出重复成员、未知成员、大小写不对的成员名与 null
+    let value: Value = serde_json::from_slice(data).map_err(|error| not_valid().with_cause(error))?;
+    if let Some(path) = array_in_object_position(&value) {
+        return Err(not_valid().with_cause(format!("'{path}' must be a JSON object")));
+    }
+    let manifest: Manifest = serde_json::from_slice(data).map_err(|error| not_valid().with_cause(error))?;
     manifest.validate()?;
     Ok(manifest)
 }
@@ -630,6 +637,38 @@ fn is_binding_type(resource_type: &str) -> bool {
 /// 可选成员写了就必须有值：缺失表示没有，写成 `null` 不合法（RFC-0002 解析规则 2）。
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<Option<T>, D::Error> {
     T::deserialize(deserializer).map(Some)
+}
+
+/// 写了就至少一项：`activation` 缺失才是缺省的 `onStartup`，空数组不合法（RFC-0002 解析规则 2，ADR-0235）。
+fn non_empty<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let events = Vec::<String>::deserialize(deserializer)?;
+    if events.is_empty() {
+        return Err(serde::de::Error::custom("the activation must list at least one event"));
+    }
+    Ok(events)
+}
+
+/// 找出写成数组的对象位置：serde 派生的结构体也接受字段同序的数组，清单的对象位置只收 JSON 对象。
+///
+/// 其他类型不对由读入本身报出，这里只看数组；返回出错位置的 JSON 路径。
+fn array_in_object_position(value: &Value) -> Option<String> {
+    let Value::Object(root) = value else {
+        return value.is_array().then(|| "$".to_owned());
+    };
+    let items = |object: &serde_json::Map<String, Value>, name: &str, prefix: &str| {
+        object.get(name).and_then(Value::as_array).and_then(|items| items.iter().position(Value::is_array).map(|index| format!("{prefix}.{name}[{index}]")))
+    };
+    for name in ["provides", "requires", "bindings"] {
+        if let Some(path) = items(root, name, "$") {
+            return Some(path);
+        }
+    }
+    match root.get("contributes") {
+        Some(Value::Array(_)) => Some("$.contributes".to_owned()),
+        Some(Value::Object(contributes)) => items(contributes, "pipeline", "$.contributes")
+            .or_else(|| contributes.get("config").filter(|config| config.is_array()).map(|_| "$.contributes.config".to_owned())),
+        _ => None,
+    }
 }
 
 /// 配置节 `^XiHan:[A-Z][A-Za-z0-9]*(:[A-Z][A-Za-z0-9]*)*$`。
