@@ -27,6 +27,7 @@
 mod de;
 mod reader;
 mod ser;
+mod value;
 
 use std::fmt::{self, Write as _};
 
@@ -35,6 +36,7 @@ use serde_path_to_error::Segment;
 
 pub(crate) use reader::{Node, parse};
 pub use ser::{Model, to_value};
+pub use value::Json;
 
 /// 嵌套的最大层数（RFC-0001「JSON 文本」）。
 pub const MAX_DEPTH: usize = 64;
@@ -175,7 +177,7 @@ mod tests {
     fn numbers_follow_the_value_model() {
         use reader::Number;
         let numbers = |text: &str| match parse(text.as_bytes()).unwrap() {
-            Node::Number(number) => number,
+            Node::Number(number, _) => number,
             other => panic!("{other:?}"),
         };
         assert_eq!(numbers("-0"), Number::Integer(0));

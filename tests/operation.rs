@@ -14,7 +14,7 @@ use xihan_framework::operation::{
     MESSAGE_REGISTRY_FULL, MESSAGE_TYPE_MISMATCH, Registry, Request, Schema, VALIDATION_MIDDLEWARE,
 };
 use xihan_framework::pipeline::{self, APP_OWNER, Builder, Placement};
-use xihan_framework::primitives::{BAGGAGE_CORRELATION, ERROR_CODE_INVALID_ARGUMENT, Error, PipelineStage, Stability};
+use xihan_framework::primitives::{BAGGAGE_CORRELATION, ERROR_CODE_INVALID_ARGUMENT, Error, PipelineStage, Stability, json};
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
@@ -486,6 +486,26 @@ fn built_in_steps_sit_where_the_reference_puts_them() {
     assert_eq!(String::from_utf8(response).unwrap(), r#"{"id":"o-","quantity":4}"#);
 }
 
+/// 任意 JSON 的成员原样保留读到的值（RFC-0011 规则 2，ADR-0236）：处理器原样返回，响应载荷与原文的 JSON 值相等，
+/// 1e400 不变成 null 或无穷，超出双精度的整数保持精确，2.0 与 2 的区别保留。
+#[test]
+fn any_json_members_keep_what_was_read() {
+    #[derive(Deserialize)]
+    struct Echo {
+        data: json::Json,
+    }
+    let registry = Registry::new();
+    registry.add(Contract::new("echoes.create"), operation::handler_fn(|_ctx, request: Echo| Box::pin(async move { Ok(request.data) }))).unwrap();
+    let invoker = Invoker::new(Arc::new(registry), &Builder::new()).unwrap();
+    let data = r#"{"big":1e400,"exact":9007199254740993,"huge":123456789012345678901234567890,"float":2.0,"integer":2,"zero":-0.0,"tiny":1E-400,"text":"é\/\t","nested":[{"b":1,"a":null}]}"#;
+    let payload = format!(r#"{{ "data" : {data} }}"#);
+    let response = common::block_on(invoker.invoke(&Context::background(), Request::new("echoes.create", payload))).unwrap();
+    let response = String::from_utf8(response).unwrap();
+    // 数字照原文，成员照文档顺序；字符串的转义按 JSON 字符串写法重写，JSON 值不变
+    assert_eq!(response, data.replace(r"\/", "/"));
+    assert_eq!(json::Json::from_text(&response).unwrap(), json::Json::from_text(data).unwrap());
+}
+
 /// payload-reasons.json 的订单：lines 是可选的数组，每项是对象，quantity 是可选的 32 位整数。
 #[derive(Clone, Debug, Deserialize)]
 struct VectorOrder {
@@ -517,7 +537,7 @@ struct VectorProfile {
     tags: Option<Vec<Option<String>>>,
     scores: Option<Vec<i64>>,
     inner: Option<VectorInner>,
-    meta: Option<serde_json::Value>,
+    meta: Option<json::Json>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

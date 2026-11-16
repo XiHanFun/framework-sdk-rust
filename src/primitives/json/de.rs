@@ -9,7 +9,8 @@ use serde::de::value::BorrowedStrDeserializer;
 use serde::de::{self, DeserializeSeed, EnumAccess, Error as _, Expected, MapAccess, SeqAccess, Unexpected, VariantAccess, Visitor};
 use serde::forward_to_deserialize_any;
 
-use super::reader::{Node, Number};
+use super::reader::{Node, Number, write_node};
+use super::value::JSON_TOKEN;
 
 /// 反序列化的错误：借用 `serde_json` 的错误类型，调用方只关心出错的路径。
 type Error = serde_json::Error;
@@ -19,9 +20,9 @@ impl Node {
         match self {
             Node::Null => Unexpected::Unit,
             Node::Bool(flag) => Unexpected::Bool(*flag),
-            Node::Number(Number::Integer(number)) => Unexpected::Signed(*number),
-            Node::Number(Number::Unsigned(number)) => Unexpected::Unsigned(*number),
-            Node::Number(Number::Float(number)) => Unexpected::Float(*number),
+            Node::Number(Number::Integer(number), _) => Unexpected::Signed(*number),
+            Node::Number(Number::Unsigned(number), _) => Unexpected::Unsigned(*number),
+            Node::Number(Number::Float(number), _) => Unexpected::Float(*number),
             Node::String(text) => Unexpected::Str(text),
             Node::Array(_) => Unexpected::Seq,
             Node::Object(_) => Unexpected::Map,
@@ -41,12 +42,12 @@ impl<'de> de::Deserializer<'de> for &'de Node {
             Node::Null => visitor.visit_unit(),
             Node::Bool(flag) => visitor.visit_bool(*flag),
             // 与 serde_json 一样：非负整数按 u64、负整数按 i64 交给访问者
-            Node::Number(Number::Integer(number)) => match u64::try_from(*number) {
+            Node::Number(Number::Integer(number), _) => match u64::try_from(*number) {
                 Ok(unsigned) => visitor.visit_u64(unsigned),
                 Err(_) => visitor.visit_i64(*number),
             },
-            Node::Number(Number::Unsigned(number)) => visitor.visit_u64(*number),
-            Node::Number(Number::Float(number)) => visitor.visit_f64(*number),
+            Node::Number(Number::Unsigned(number), _) => visitor.visit_u64(*number),
+            Node::Number(Number::Float(number), _) => visitor.visit_f64(*number),
             Node::String(text) => visitor.visit_borrowed_str(text),
             Node::Array(items) => visit_array(items, visitor),
             Node::Object(members) => visit_object(members, visitor),
@@ -71,7 +72,13 @@ impl<'de> de::Deserializer<'de> for &'de Node {
         self.deserialize_unit(visitor)
     }
 
-    fn deserialize_newtype_struct<V: Visitor<'de>>(self, _name: &'static str, visitor: V) -> Result<V::Value, Error> {
+    /// [`Json`](super::Json) 以约定的名字要原文：交给它照原文写成的紧凑文本，数字一字不改。
+    fn deserialize_newtype_struct<V: Visitor<'de>>(self, name: &'static str, visitor: V) -> Result<V::Value, Error> {
+        if name == JSON_TOKEN {
+            let mut text = String::new();
+            write_node(&mut text, self);
+            return visitor.visit_string(text);
+        }
         visitor.visit_newtype_struct(self)
     }
 

@@ -353,6 +353,25 @@ fn wire_values_follow_the_value_model() {
     assert!(json::from_str::<Error>(r#"["KERNEL_UNEXPECTED_001","x"]"#).is_err());
 }
 
+/// 任意 JSON（json::Json）照原文保留数字：从本 SDK 的读取与从 serde_json 读都一样，写出照原文，也能作线上结果的值。
+#[test]
+fn any_json_keeps_the_numbers() {
+    let text = r#"{"big":1e400,"exact":9007199254740993,"huge":123456789012345678901234567890,"float":2.0}"#;
+    let ours: json::Json = json::from_str(text).unwrap();
+    let theirs: json::Json = serde_json::from_str(&format!(" {text} ")).unwrap();
+    assert_eq!((ours.as_str(), theirs.as_str()), (text, text));
+    assert_eq!(serde_json::to_string(&ours).unwrap(), text);
+    assert_eq!(serde_json::to_string(&WireResult::<json::Json>(Ok(ours.clone()))).unwrap(), format!(r#"{{"ok":true,"value":{text}}}"#));
+    let read: WireResult<json::Json> = json::from_str(&format!(r#"{{"ok":true,"value":{text}}}"#)).unwrap();
+    assert_eq!(read.into_inner().unwrap(), ours);
+    // null 是一个值；接受 null 表示没有时用 Option
+    assert_eq!(json::from_str::<json::Json>("null").unwrap().as_str(), "null");
+    assert_eq!(json::from_str::<Option<json::Json>>("null").unwrap(), None);
+    // 共同读取检查照样适用
+    assert_eq!(json::Json::from_text(r#"{"a":1,"a":2}"#).unwrap_err().path(), "$.a");
+    assert!(serde_json::from_str::<json::Json>(r#"{"a":1,"a":2}"#).is_err());
+}
+
 #[test]
 fn maybe_wire_encoding() {
     assert_eq!(serde_json::to_string(&Some("x")).unwrap(), r#""x""#);

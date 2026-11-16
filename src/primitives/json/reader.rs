@@ -2,14 +2,15 @@
 
 use std::collections::HashSet;
 
-use super::{MAX_DEPTH, ReadError, push_index, push_member};
+use super::{MAX_DEPTH, ReadError, push_index, push_member, write_string};
 
-/// 读出的 JSON 值：对象的成员保留在文本里的顺序，数字按值模型分成整数与浮点（RFC-0010「模板」）。
+/// 读出的 JSON 值：对象的成员保留在文本里的顺序，数字按值模型分成整数与浮点（RFC-0010「模板」），并保留原文，
+/// 任意 JSON 的成员（[`Json`](super::Json)）照原文写回（RFC-0011 规则 2）。
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum Node {
     Null,
     Bool(bool),
-    Number(Number),
+    Number(Number, Box<str>),
     String(String),
     Array(Vec<Node>),
     Object(Vec<(String, Node)>),
@@ -67,7 +68,7 @@ impl Reader<'_> {
             b'{' => self.object(depth + 1),
             b'[' => self.array(depth + 1),
             b'"' => self.string().map(Node::String),
-            b'-' | b'0'..=b'9' => self.number().map(Node::Number),
+            b'-' | b'0'..=b'9' => self.number(),
             b't' => self.literal(b"true", Node::Bool(true)),
             b'f' => self.literal(b"false", Node::Bool(false)),
             b'n' => self.literal(b"null", Node::Null),
@@ -223,7 +224,7 @@ impl Reader<'_> {
     }
 
     /// 读一个数 `-? (0 | [1-9][0-9]*) (.[0-9]+)? ([eE][+-]?[0-9]+)?`，按值模型分类。
-    fn number(&mut self) -> Option<Number> {
+    fn number(&mut self) -> Option<Node> {
         let start = self.at;
         if self.peek() == Some(b'-') {
             self.at += 1;
@@ -254,17 +255,7 @@ impl Reader<'_> {
             integer = false;
         }
         let text = std::str::from_utf8(&self.data[start..self.at]).ok()?;
-        if integer {
-            // -0 是整数 0；超出 i64 的整数写法按模型是浮点，u64 范围内的另记一类
-            if let Ok(number) = text.parse::<i64>() {
-                return Some(Number::Integer(number));
-            }
-            if let Ok(number) = text.parse::<u64>() {
-                return Some(Number::Unsigned(number));
-            }
-        }
-        // 上溢为无穷、下溢为 0（Rust 的解析就是这样，不报错）
-        text.parse::<f64>().ok().map(Number::Float)
+        Some(Node::Number(classify(text, integer)?, text.into()))
     }
 
     /// 读至少一位十进制数字。
@@ -282,5 +273,52 @@ impl Reader<'_> {
             return Some(node);
         }
         None
+    }
+}
+
+/// 按值模型给合文法的数分类。
+fn classify(text: &str, integer: bool) -> Option<Number> {
+    if integer {
+        // -0 是整数 0；超出 i64 的整数写法按模型是浮点，u64 范围内的另记一类
+        if let Ok(number) = text.parse::<i64>() {
+            return Some(Number::Integer(number));
+        }
+        if let Ok(number) = text.parse::<u64>() {
+            return Some(Number::Unsigned(number));
+        }
+    }
+    // 上溢为无穷、下溢为 0（Rust 的解析就是这样，不报错）
+    text.parse::<f64>().ok().map(Number::Float)
+}
+
+/// 把值树写成紧凑的 JSON 文本：成员按文档顺序，数字照原文，字符串按 JSON 字符串写法。
+pub(crate) fn write_node(out: &mut String, node: &Node) {
+    match node {
+        Node::Null => out.push_str("null"),
+        Node::Bool(flag) => out.push_str(if *flag { "true" } else { "false" }),
+        Node::Number(_, text) => out.push_str(text),
+        Node::String(text) => write_string(out, text),
+        Node::Array(items) => {
+            out.push('[');
+            for (index, item) in items.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_node(out, item);
+            }
+            out.push(']');
+        }
+        Node::Object(members) => {
+            out.push('{');
+            for (index, (name, value)) in members.iter().enumerate() {
+                if index > 0 {
+                    out.push(',');
+                }
+                write_string(out, name);
+                out.push(':');
+                write_node(out, value);
+            }
+            out.push('}');
+        }
     }
 }

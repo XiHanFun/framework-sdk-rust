@@ -766,7 +766,7 @@ fn decode<Req: DeserializeOwned>(id: &str, payload: &[u8]) -> Result<Req> {
 /// | 必填，接受 `null` | `#[serde(deserialize_with = "operation::nullable")] name: Option<String>` |
 /// | 可选，不接受 `null`（整数、浮点、布尔） | `#[serde(default)] count: i64`，缺少时取缺省值 |
 /// | 可选，接受 `null`（字符串、数组、对象） | `Option<T>`：缺少与 `null` 都是 `None` |
-/// | 任意 JSON | `serde_json::Value` 或 `Option<Value>` |
+/// | 任意 JSON | [`json::Json`]（照原文保留数字）或 `Option<Json>`；`serde_json::Value` 会把 `1e400` 读成 `null` |
 ///
 /// 数组项同理：接受 `null` 的字符串项写 `Vec<Option<String>>`。成员名区分大小写，未知成员忽略，数字不从字符串读，整数不接受
 /// `1.0` 与 `1e2`、超出类型的范围即不符，浮点接受整数写法、上溢为无穷；对象位置只收 JSON 对象。
