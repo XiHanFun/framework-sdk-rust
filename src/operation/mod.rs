@@ -39,9 +39,9 @@ use serde_json::Value;
 
 use crate::BoxFuture;
 use crate::invocation::{Context, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START};
-use crate::pipeline::{self, APP_OWNER, Pipeline, Step};
+use crate::pipeline::{self, APP_OWNER, Middleware, Next, Pipeline, Placement, Step};
 use crate::primitives::json::{self, Node};
-use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, Result, Stability, is_error_code};
+use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, PipelineStage, Result, Stability, is_error_code};
 
 /// 操作未登记。
 pub const ERROR_CODE_NOT_FOUND: &str = "KERNEL_NOTFOUND_001";
@@ -71,6 +71,18 @@ pub const MESSAGE_DUPLICATE: &str = "kernel.operation.duplicate";
 pub const MESSAGE_REGISTRY_FULL: &str = "kernel.operation.registry_full";
 /// 中间件或处理器在调用期间 panic 的消息键（与 .NET 的未处理异常同键）；没有参数。
 pub const MESSAGE_UNHANDLED_PANIC: &str = "kernel.invocation.unhandled_exception";
+
+/// 调用器内置步骤的归属（RFC-0011 规则 10），与 .NET 内置中间件的归属相同。
+pub const KERNEL_OWNER: &str = "xihan.kernel.core";
+
+/// Observe 阶段 `Beginning` 上的内置步骤：把排在它之后的中间件与处理器的 panic 翻译成未处理失败（规则 5）。
+pub const OBSERVE_MIDDLEWARE: &str = "ObserveMiddleware";
+
+/// Resilience 阶段 `Beginning` 上的内置步骤：进入时截止时间已到即结束调用。
+pub const DEADLINE_MIDDLEWARE: &str = "DeadlineMiddleware";
+
+/// Validate 阶段 `Beginning` 上的内置步骤：原始调用在这里解码载荷（规则 2），类型化调用跳过。
+pub const VALIDATION_MIDDLEWARE: &str = "ValidationMiddleware";
 
 /// 登记表的容量。
 pub const CAPACITY: usize = 10_000;
@@ -221,8 +233,11 @@ impl<Req, Res, F> fmt::Debug for HandlerFn<Req, Res, F> {
 }
 
 /// 解码载荷、执行、编码响应：登记时按请求与响应类型生成，不经反射。
+///
+/// 解码与执行分开：原始调用在 Validate 阶段的内置步骤里解码，handle 阶段之后执行（RFC-0011 规则 10）。
 trait Execute: Send + Sync {
-    fn execute<'a>(&'a self, ctx: &'a Context, id: &'a str, payload: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>>;
+    fn decode(&self, id: &str, payload: &[u8]) -> Result<Box<dyn Any + Send>>;
+    fn run<'a>(&'a self, ctx: &'a Context, id: &'a str, request: Box<dyn Any + Send>) -> BoxFuture<'a, Result<Vec<u8>>>;
 }
 
 struct JsonExecutor<Req, Res> {
@@ -234,9 +249,16 @@ where
     Req: DeserializeOwned + Send + 'static,
     Res: Serialize + Send + 'static,
 {
-    fn execute<'a>(&'a self, ctx: &'a Context, id: &'a str, payload: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
+    fn decode(&self, id: &str, payload: &[u8]) -> Result<Box<dyn Any + Send>> {
+        decode::<Req>(id, payload).map(|request| Box::new(request) as Box<dyn Any + Send>)
+    }
+
+    fn run<'a>(&'a self, ctx: &'a Context, id: &'a str, request: Box<dyn Any + Send>) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
-            let request = decode::<Req>(id, payload)?;
+            // 解码与执行来自同一个执行器，类型总是对的
+            let request = *request
+                .downcast::<Req>()
+                .map_err(|_| Error::literal(ERROR_CODE_UNEXPECTED, format!("The decoded request of '{id}' does not have the registered type.")))?;
             let response = self.handler.handle(ctx, request).await?;
             serde_json::to_vec(&response)
                 .map_err(|error| Error::literal(ERROR_CODE_UNEXPECTED, format!("The response of '{id}' could not be encoded: {error}")))
@@ -289,7 +311,10 @@ impl Descriptor {
 
     /// 不经管道直接执行：解码载荷、执行、编码响应；载荷不合法返回 `KERNEL_VALIDATION_001`。
     pub fn execute<'a>(&'a self, ctx: &'a Context, payload: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
-        self.executor.execute(ctx, &self.contract.id, payload)
+        Box::pin(async move {
+            let request = self.executor.decode(self.id(), payload)?;
+            self.executor.run(ctx, self.id(), request).await
+        })
     }
 }
 
@@ -429,6 +454,10 @@ struct CurrentRequest(Arc<Request>);
 #[derive(Clone)]
 struct ResponsePayload(Vec<u8>);
 
+/// 对象袋里 Validate 阶段解码好的请求，handle 阶段之后取走；只在原始调用里有。
+#[derive(Clone)]
+struct DecodedRequest(Arc<Mutex<Option<Box<dyn Any + Send>>>>);
+
 /// 返回当前调用的操作描述：管道里的中间件用；不在调用里为 `None`。
 pub fn current(ctx: &Context) -> Option<Arc<Descriptor>> {
     ctx.item::<CurrentOperation>().map(|current| Arc::clone(&current.0))
@@ -452,17 +481,18 @@ struct Scope<'c> {
     operation: Option<Arc<CurrentOperation>>,
     request: Option<Arc<CurrentRequest>>,
     response: Option<Arc<ResponsePayload>>,
+    decoded: Option<Arc<DecodedRequest>>,
 }
 
 impl<'c> Scope<'c> {
     fn enter(ctx: &'c Context, descriptor: Arc<Descriptor>, request: Option<Arc<Request>>) -> Self {
         let operation = ctx.insert_item(CurrentOperation(descriptor));
-        let request = match request {
-            Some(request) => ctx.insert_item(CurrentRequest(request)),
-            None => ctx.remove_item::<CurrentRequest>(),
+        let (request, decoded) = match request {
+            Some(request) => (ctx.insert_item(CurrentRequest(request)), ctx.insert_item(DecodedRequest(Arc::new(Mutex::new(None))))),
+            None => (ctx.remove_item::<CurrentRequest>(), ctx.remove_item::<DecodedRequest>()),
         };
         let response = ctx.remove_item::<ResponsePayload>();
-        Self { ctx, operation, request, response }
+        Self { ctx, operation, request, response, decoded }
     }
 
     /// 取走这次调用写回的响应载荷。
@@ -476,6 +506,7 @@ impl Drop for Scope<'_> {
         restore(self.ctx, self.operation.take());
         restore(self.ctx, self.request.take());
         restore(self.ctx, self.response.take());
+        restore(self.ctx, self.decoded.take());
     }
 }
 
@@ -500,7 +531,14 @@ struct Dispatch<'d> {
 impl Step for Dispatch<'_> {
     fn run<'a>(&'a self, ctx: &'a Context) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
-            let payload = self.descriptor.execute(ctx, self.payload).await?;
+            let (id, executor) = (self.descriptor.id(), &self.descriptor.executor);
+            // Validate 阶段解码好的请求；中间件再次进入下游（如重试）时它已被取走，按同一份载荷重新解码
+            let decoded = ctx.item::<DecodedRequest>().and_then(|slot| slot.0.lock().unwrap_or_else(PoisonError::into_inner).take());
+            let request = match decoded {
+                Some(request) => request,
+                None => executor.decode(id, self.payload)?,
+            };
+            let payload = executor.run(ctx, id, request).await?;
             ctx.insert_item(ResponsePayload(payload));
             Ok(())
         })
@@ -526,6 +564,59 @@ where
             // 槽只在这里整体赋值，中毒时照常使用
             *self.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
             outcome
+        })
+    }
+}
+
+/// Observe 阶段的内置步骤：只接住排在它之后的中间件与处理器的 panic（RFC-0011 规则 5、10）。
+///
+/// 排在它之前的（Ingress 阶段，或 Observe 阶段 `Beginning` 上归属的序数排在 [`KERNEL_OWNER`] 之前的）panic 原样交给调用方，与 .NET 一致。
+struct ObserveStep;
+
+impl Middleware for ObserveStep {
+    fn name(&self) -> &str {
+        OBSERVE_MIDDLEWARE
+    }
+
+    fn invoke<'a>(&'a self, ctx: &'a Context, next: Next<'a>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(CatchPanic(next.run(ctx)))
+    }
+}
+
+/// Resilience 阶段的内置步骤：进入时按时钟核对截止时间，已到即以 `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_before_start`
+/// 结束，后面的中间件与处理器不执行；进入时不核对取消，途中的超时与取消按上下文的截止令牌归因（RFC-0003 第 1 条）。
+struct DeadlineStep;
+
+impl Middleware for DeadlineStep {
+    fn name(&self) -> &str {
+        DEADLINE_MIDDLEWARE
+    }
+
+    fn invoke<'a>(&'a self, ctx: &'a Context, next: Next<'a>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if ctx.is_expired(SystemTime::now()) {
+                return Err(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START));
+            }
+            next.run(ctx).await
+        })
+    }
+}
+
+/// Validate 阶段的内置步骤：原始调用在这里解码载荷，失败即以 `KERNEL_VALIDATION_001` 结束；类型化调用没有载荷，跳过。
+struct ValidationStep;
+
+impl Middleware for ValidationStep {
+    fn name(&self) -> &str {
+        VALIDATION_MIDDLEWARE
+    }
+
+    fn invoke<'a>(&'a self, ctx: &'a Context, next: Next<'a>) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if let (Some(slot), Some(descriptor), Some(request)) = (ctx.item::<DecodedRequest>(), current(ctx), request_of(ctx)) {
+                let decoded = descriptor.executor.decode(descriptor.id(), &request.payload)?;
+                *slot.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(decoded);
+            }
+            next.run(ctx).await
         })
     }
 }
@@ -568,8 +659,18 @@ pub struct Invoker {
 
 impl Invoker {
     /// 用登记表与管道构建调用器；管道排序失败时返回 `KERNEL_PIPELINE_00x`。
+    ///
+    /// 管道里先放三个内置步骤，归属 [`KERNEL_OWNER`]、都在所在阶段的 `Beginning`，与 .NET 内置中间件的位置相同（RFC-0011 规则 10）：
+    /// Observe 阶段的 [`OBSERVE_MIDDLEWARE`] 翻译 panic，Resilience 阶段的 [`DEADLINE_MIDDLEWARE`] 核对截止时间，Validate 阶段的
+    /// [`VALIDATION_MIDDLEWARE`] 解码载荷。它们与 `builder` 里同位置的中间件按 RFC-0004 的规则排序（归属的序数序，同归属按登记顺序，
+    /// 内置步骤先登记），顺序约束可以按这几个名字引用它们；`builder` 里登记了同名的中间件时返回 `KERNEL_PIPELINE_003`。
     pub fn new(registry: Arc<Registry>, builder: &pipeline::Builder) -> std::result::Result<Self, FrameworkError> {
-        Ok(Self { registry, pipeline: builder.build()? })
+        let mut pipeline = pipeline::Builder::new();
+        pipeline.use_at(ObserveStep, PipelineStage::Observe, Placement::Beginning, KERNEL_OWNER)?;
+        pipeline.use_at(DeadlineStep, PipelineStage::Resilience, Placement::Beginning, KERNEL_OWNER)?;
+        pipeline.use_at(ValidationStep, PipelineStage::Validate, Placement::Beginning, KERNEL_OWNER)?;
+        pipeline.extend_from(builder)?;
+        Ok(Self { registry, pipeline: pipeline.build()? })
     }
 
     /// 登记表。
@@ -577,16 +678,16 @@ impl Invoker {
         &self.registry
     }
 
-    /// 管道。
+    /// 管道，含三个内置步骤。
     pub fn pipeline(&self) -> &Pipeline {
         &self.pipeline
     }
 
     /// 执行一个 XGI 请求，成功时返回响应载荷。
     ///
-    /// 未登记返回 `KERNEL_NOTFOUND_001`（不进管道）；调用开始时截止时间已过返回 `KERNEL_TIMEOUT_001` +
-    /// `kernel.invocation.deadline_before_start`（按时钟判断，不进管道）；否则把操作与请求放进上下文，经完整管道执行，handle 阶段之后解码、
-    /// 执行、编码。中间件以成功短路、没有执行操作时返回 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response`（规则 9）；载荷不合法时 `reason` 是出错位置的 JSON 路径（如 `$.quantity`）。
+    /// 未登记返回 `KERNEL_NOTFOUND_001`，不进管道；否则把操作与请求放进上下文，经完整管道执行：Resilience 阶段进入时截止时间已到返回
+    /// `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_before_start`，Validate 阶段解码载荷，handle 阶段之后执行、编码；
+    /// 排在 Observe 阶段内置步骤之后的 panic 成为 `KERNEL_UNEXPECTED_001`，之前的原样交给调用方。中间件以成功短路、没有执行操作时返回 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response`（规则 9）；载荷不合法时 `reason` 是出错位置的 JSON 路径（如 `$.quantity`）。
     ///
     /// 载荷先过共同的 JSON 读取检查，再按请求类型的 `Deserialize` 解码；必填、可选与接受 `null` 的成员怎么声明见 [`nullable`]。
     // 返回类型写明 Send：签名即承诺 future 可以跨线程（gRPC 服务端要求），实现改动不会悄悄破坏这一点
@@ -594,11 +695,10 @@ impl Invoker {
     pub fn invoke<'a>(&'a self, ctx: &'a Context, request: Request) -> impl Future<Output = Result<Vec<u8>>> + Send + 'a {
         async move {
             let descriptor = self.registry.get(&request.id).ok_or_else(|| not_found(&request.id))?;
-            started_in_time(ctx)?;
             let request = Arc::new(request);
             let scope = Scope::enter(ctx, Arc::clone(&descriptor), Some(Arc::clone(&request)));
             let terminal = Dispatch { descriptor: &descriptor, payload: &request.payload };
-            let outcome = CatchPanic(self.pipeline.run(ctx, &terminal)).await;
+            let outcome = self.pipeline.run(ctx, &terminal).await;
             let response = scope.take_response();
             drop(scope);
             outcome?;
@@ -614,7 +714,8 @@ impl Invoker {
 
     /// 类型化入口：不经 JSON，直接以请求对象执行。
     ///
-    /// 未登记返回 `KERNEL_NOTFOUND_001`，请求或响应类型与登记不符返回 `KERNEL_VALIDATION_002`；其余同 [`Invoker::invoke`]。
+    /// 进管道前只核对两项，按这个顺序：未登记返回 `KERNEL_NOTFOUND_001`，请求或响应类型与登记不符返回 `KERNEL_VALIDATION_002`；
+    /// 其余同 [`Invoker::invoke`]，Validate 阶段的内置步骤跳过解码。
     /// 请求要可克隆：管道里的中间件可以多次进入下游（如重试），每次交给处理器一份克隆。
     // 返回类型写明 Send：签名即承诺 future 可以跨线程（gRPC 服务端要求），实现改动不会悄悄破坏这一点
     #[allow(clippy::manual_async_fn)]
@@ -626,10 +727,9 @@ impl Invoker {
         async move {
             let descriptor = self.registry.get(id).ok_or_else(|| not_found(id))?;
             let handler = descriptor.typed.downcast_ref::<Arc<dyn Handler<Req, Res>>>().ok_or_else(|| type_mismatch(id))?;
-            started_in_time(ctx)?;
             let terminal = Typed { handler: Arc::clone(handler), request, outcome: Mutex::new(None) };
             let scope = Scope::enter(ctx, Arc::clone(&descriptor), None);
-            let outcome = CatchPanic(self.pipeline.run(ctx, &terminal)).await;
+            let outcome = self.pipeline.run(ctx, &terminal).await;
             drop(scope);
             outcome?;
             terminal.outcome.into_inner().unwrap_or_else(PoisonError::into_inner).unwrap_or_else(|| Err(no_response(id)))
@@ -704,15 +804,6 @@ fn not_found(id: &str) -> Error {
 /// 类型化调用的类型与登记不符：只带 `id`（ADR-0236），实现语言的类型名各语言写不出同样的参数。
 fn type_mismatch(id: &str) -> Error {
     Error::validation(ERROR_CODE_TYPE_MISMATCH, MESSAGE_TYPE_MISMATCH).with_detail("id", id)
-}
-
-/// 调用开始时按时钟核对截止时间（RFC-0011 规则 10）：SDK 没有截止时间中间件，已到即以 `KERNEL_TIMEOUT_001` +
-/// `kernel.invocation.deadline_before_start` 结束，管道与操作都不执行。调用途中到达的截止时间按上下文的截止令牌归因。
-fn started_in_time(ctx: &Context) -> Result<()> {
-    if ctx.is_expired(SystemTime::now()) {
-        return Err(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START));
-    }
-    Ok(())
 }
 
 /// 管道以成功结束而没有响应：某个中间件以成功短路、操作没有执行（规则 9）。

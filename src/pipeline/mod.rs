@@ -294,6 +294,18 @@ impl Builder {
         Ok(self)
     }
 
+    /// 接上另一个构建器的全部登记与约束，排在已有的登记之后；重复登记同样报 `KERNEL_PIPELINE_003`。
+    pub(crate) fn extend_from(&mut self, other: &Builder) -> std::result::Result<(), FrameworkError> {
+        let offset = self.registrations.len();
+        for registration in &other.registrations {
+            let descriptor = &registration.descriptor;
+            self.add(Arc::clone(&registration.middleware), descriptor.instance.clone(), descriptor.stage, descriptor.placement, &descriptor.owner)?;
+        }
+        // 约束的主体在声明时解析成下标，接上之后整体后移
+        self.constraints.extend(other.constraints.iter().map(|constraint| Constraint { subject: constraint.subject + offset, ..constraint.clone() }));
+        Ok(())
+    }
+
     /// 约束 `middleware` 在 `other` 之前。
     ///
     /// 两端都是名字：按名字登记的实例用实例名，没有名字的登记用中间件名（RFC-0004 排序规则第 7 条）。主体 `middleware`

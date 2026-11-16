@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use xihan_framework::invocation::Context;
 use xihan_framework::operation::{
-    self, CAPACITY, Contract, ERROR_CODE_DUPLICATE, ERROR_CODE_INVALID_PAYLOAD, ERROR_CODE_NOT_FOUND, ERROR_CODE_REGISTRY_FULL, ERROR_CODE_TYPE_MISMATCH,
-    EXPOSE_AI, EXPOSE_HTTP, Invoker, MESSAGE_DUPLICATE, MESSAGE_INVALID_PAYLOAD, MESSAGE_NO_RESPONSE, MESSAGE_NOT_FOUND, MESSAGE_REGISTRY_FULL,
-    MESSAGE_TYPE_MISMATCH, Registry, Request, Schema,
+    self, CAPACITY, Contract, DEADLINE_MIDDLEWARE, ERROR_CODE_DUPLICATE, ERROR_CODE_INVALID_PAYLOAD, ERROR_CODE_NOT_FOUND, ERROR_CODE_REGISTRY_FULL,
+    ERROR_CODE_TYPE_MISMATCH, EXPOSE_AI, EXPOSE_HTTP, Invoker, MESSAGE_DUPLICATE, MESSAGE_INVALID_PAYLOAD, MESSAGE_NO_RESPONSE, MESSAGE_NOT_FOUND,
+    MESSAGE_REGISTRY_FULL, MESSAGE_TYPE_MISMATCH, Registry, Request, Schema, VALIDATION_MIDDLEWARE,
 };
 use xihan_framework::pipeline::{self, APP_OWNER, Builder, Placement};
 use xihan_framework::primitives::{BAGGAGE_CORRELATION, ERROR_CODE_INVALID_ARGUMENT, Error, PipelineStage, Stability};
@@ -333,35 +333,123 @@ fn framework_panics_become_inner_errors() {
     assert!(inner.message().contains("'not-a-code'"), "{}", inner.message());
 }
 
-/// 截止时间在调用开始时已过：调用器在第一个中间件之前按时钟判断，报 deadline_before_start，管道与操作都不执行（RFC-0011 规则 10）。
-#[test]
-fn expired_deadlines_stop_before_the_pipeline() {
-    let entered = Arc::new(Mutex::new(0));
-    let count = {
-        let entered = Arc::clone(&entered);
-        pipeline::from_fn("Count", move |ctx, next| {
-            let entered = Arc::clone(&entered);
-            Box::pin(async move {
-                *entered.lock().unwrap() += 1;
-                next.run(ctx).await
-            })
+/// 记下进入过的中间件名。
+fn recorder(name: &'static str, log: &Arc<Mutex<Vec<&'static str>>>) -> impl pipeline::Middleware + 'static {
+    let log = Arc::clone(log);
+    pipeline::from_fn(name, move |ctx, next| {
+        let log = Arc::clone(&log);
+        Box::pin(async move {
+            log.lock().unwrap().push(name);
+            next.run(ctx).await
         })
-    };
-    let invoker = Invoker::new(registry(), Builder::new().use_at(count, PipelineStage::Observe, Placement::Beginning, APP_OWNER).unwrap()).unwrap();
+    })
+}
+
+/// 截止时间在调用开始时已过：Resilience 阶段的内置步骤在进入时按时钟判断，报 deadline_before_start（RFC-0011 规则 10，ADR-0236）。
+/// 排在它之前的 Ingress 与 Observe 阶段照常执行，之后的中间件与操作不执行；构造上下文时不判断。
+#[test]
+fn expired_deadlines_stop_at_the_resilience_stage() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let mut builder = Builder::new();
+    builder
+        .use_at(recorder("Ingress", &log), PipelineStage::Ingress, Placement::End, APP_OWNER)
+        .unwrap()
+        .use_at(recorder("Observe", &log), PipelineStage::Observe, Placement::End, APP_OWNER)
+        .unwrap()
+        .use_at(recorder("BeforeDeadline", &log), PipelineStage::Resilience, Placement::Beginning, APP_OWNER)
+        .unwrap()
+        .use_at(recorder("Retry", &log), PipelineStage::Resilience, Placement::End, APP_OWNER)
+        .unwrap();
+    let invoker = Invoker::new(registry(), &builder).unwrap();
     let late = Context::builder().deadline(std::time::SystemTime::now() - std::time::Duration::from_millis(1)).build();
-    let error = common::block_on(invoker.invoke(&late, Request::new("orders.create", r#"{"quantity":1}"#))).unwrap_err();
+    // 截止时间先于载荷：Resilience 在 Validate 之前，载荷不合法也报截止时间
+    let error = common::block_on(invoker.invoke(&late, Request::new("orders.create", "not json"))).unwrap_err();
     common::assert_kernel_error(&error, xihan_framework::invocation::MESSAGE_DEADLINE_BEFORE_START);
     let typed = common::block_on(invoker.invoke_typed::<CreateOrder, OrderCreated>(&late, "orders.create", CreateOrder { quantity: 1 })).unwrap_err();
     common::assert_kernel_error(&typed, xihan_framework::invocation::MESSAGE_DEADLINE_BEFORE_START);
-    assert_eq!(*entered.lock().unwrap(), 0, "the pipeline does not run");
+    // 归属 app 排在 xihan.kernel.core 之前，所以 BeforeDeadline 也执行了
+    assert_eq!(*log.lock().unwrap(), ["Ingress", "Observe", "BeforeDeadline", "Ingress", "Observe", "BeforeDeadline"]);
     assert!(operation::current(&late).is_none());
 
-    let missing = common::block_on(invoker.invoke(&late, Request::new("orders.missing", "{}"))).unwrap_err();
+    // 进管道前只核对未登记与类型不符，按这个顺序
+    let missing = common::block_on(invoker.invoke_typed::<String, String>(&late, "orders.missing", String::new())).unwrap_err();
     assert_eq!(missing.code(), ERROR_CODE_NOT_FOUND, "an unknown operation is reported first");
+    let mismatch = common::block_on(invoker.invoke_typed::<String, String>(&late, "orders.create", String::new())).unwrap_err();
+    assert_eq!(mismatch.code(), ERROR_CODE_TYPE_MISMATCH, "a type mismatch is reported before the pipeline");
 
+    log.lock().unwrap().clear();
     let in_time = Context::builder().timeout(std::time::Duration::from_secs(60)).build();
     assert!(common::block_on(invoker.invoke(&in_time, Request::new("orders.create", r#"{"quantity":1}"#))).is_ok());
-    assert_eq!(*entered.lock().unwrap(), 1);
+    assert_eq!(*log.lock().unwrap(), ["Ingress", "Observe", "BeforeDeadline", "Retry"]);
+}
+
+/// 三个内置步骤都按归属 xihan.kernel.core 放在所在阶段的 Beginning，与同位置的中间件按 RFC-0004 排序（RFC-0011 规则 10）：
+/// Observe 只接住排在它之后的 panic，Validate 在这里解码，排在它前面的中间件看得到不合法的载荷。
+#[test]
+fn built_in_steps_sit_where_the_reference_puts_them() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let explode = |name: &'static str| pipeline::from_fn(name, |_ctx, _next| Box::pin(async { panic!("the middleware crashed") }));
+    let mut builder = Builder::new();
+    builder
+        .use_at(recorder("Early", &log), PipelineStage::Validate, Placement::Beginning, APP_OWNER)
+        .unwrap()
+        .use_at(recorder("Late", &log), PipelineStage::Validate, Placement::Beginning, "zeta.late.validator")
+        .unwrap()
+        .use_at(recorder("Audit", &log), PipelineStage::Observe, Placement::Beginning, "zeta.audit.core")
+        .unwrap();
+    let invoker = Invoker::new(registry(), &builder).unwrap();
+    assert_eq!(
+        invoker.pipeline().dump(),
+        "observe      ObserveMiddleware\nobserve      Audit\nresilience   DeadlineMiddleware\nvalidate     Early\nvalidate     ValidationMiddleware\nvalidate     Late\n"
+    );
+    let invalid = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", r#"{"quantity":"x"}"#))).unwrap_err();
+    common::assert_kernel_error(&invalid, MESSAGE_INVALID_PAYLOAD);
+    assert_eq!(*log.lock().unwrap(), ["Audit", "Early"], "decoding fails at the built-in step, after Early and before Late");
+
+    // 顺序约束可以按名字引用内置步骤；同名的中间件与内置步骤冲突
+    let mut constrained = Builder::new();
+    constrained.use_at(recorder("Guard", &log), PipelineStage::Validate, Placement::End, APP_OWNER).unwrap().before("Guard", VALIDATION_MIDDLEWARE).unwrap();
+    let dump = Invoker::new(registry(), &constrained).unwrap().pipeline().dump();
+    assert!(dump.ends_with("validate     Guard\nvalidate     ValidationMiddleware\n"), "{dump}");
+    let mut clash = Builder::new();
+    clash.use_at(recorder(DEADLINE_MIDDLEWARE, &log), PipelineStage::Handle, Placement::End, APP_OWNER).unwrap();
+    assert_eq!(Invoker::new(registry(), &clash).unwrap_err().code(), "KERNEL_PIPELINE_003");
+
+    // Ingress 阶段与 Observe 阶段 Beginning 上归属排在 xihan.kernel.core 之前的 panic 原样交给调用方，排在之后的被翻译
+    for (stage, placement, owner, caught) in [
+        (PipelineStage::Ingress, Placement::End, APP_OWNER, false),
+        (PipelineStage::Observe, Placement::Beginning, APP_OWNER, false),
+        (PipelineStage::Observe, Placement::Beginning, "zeta.audit.core", true),
+        (PipelineStage::Observe, Placement::End, APP_OWNER, true),
+        (PipelineStage::Transaction, Placement::End, APP_OWNER, true),
+    ] {
+        let mut builder = Builder::new();
+        builder.use_at(explode("Explode"), stage, placement, owner).unwrap();
+        let invoker = Invoker::new(registry(), &builder).unwrap();
+        let ctx = Context::background();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            common::block_on(invoker.invoke(&ctx, Request::new("orders.create", r#"{"quantity":1}"#)))
+        }));
+        match (outcome, caught) {
+            (Ok(Err(error)), true) => assert_eq!(error.message_key(), Some(operation::MESSAGE_UNHANDLED_PANIC)),
+            (Err(_), false) => {}
+            (outcome, _) => panic!("{stage} {placement} {owner}: caught must be {caught}, got {:?}", outcome.map(|result| result.map(|_| ()))),
+        }
+        assert!(operation::current(&ctx).is_none(), "the scope is restored after a panic");
+    }
+
+    // 排在 Validate 之后的中间件再次进入下游时，处理器拿到重新解码的请求
+    let retry = pipeline::from_fn("Retry", |ctx, next| {
+        Box::pin(async move {
+            let _ = next.run(ctx).await;
+            next.run(ctx).await
+        })
+    });
+    let mut builder = Builder::new();
+    builder.use_middleware(retry).unwrap();
+    let invoker = Invoker::new(registry(), &builder).unwrap();
+    let response = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", r#"{"quantity":4}"#))).unwrap();
+    assert_eq!(String::from_utf8(response).unwrap(), r#"{"id":"o-","quantity":4}"#);
 }
 
 /// payload-reasons.json 的订单：lines 是可选的数组，每项是对象，quantity 是可选的 32 位整数。
