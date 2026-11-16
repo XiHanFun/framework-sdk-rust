@@ -58,7 +58,8 @@ fn invoke_runs_the_pipeline_and_encodes_the_response() {
                 let id = operation::current(ctx).map(|descriptor| descriptor.id().to_owned());
                 let payload = operation::request_of(ctx).map(|request| request.payload.clone());
                 let outcome = next.run(ctx).await;
-                let response = operation::response_payload_of(ctx).map(|payload| String::from_utf8(payload).unwrap());
+                // 中间件看到的是编码之前的响应对象（RFC-0011 规则 10「编码」）
+                let response = operation::with_response(ctx, |created: &OrderCreated| format!("{}:{}", created.id, created.quantity));
                 seen.lock().unwrap().push((id, payload, response));
                 outcome
             })
@@ -69,11 +70,11 @@ fn invoke_runs_the_pipeline_and_encodes_the_response() {
     let ctx = correlated("c1");
     let response = common::block_on(invoker.invoke(&ctx, Request::new("orders.create", r#"{"quantity":2}"#))).unwrap();
     assert_eq!(String::from_utf8(response).unwrap(), r#"{"id":"o-c1","quantity":2}"#);
-    assert_eq!(
-        seen.lock().unwrap().as_slice(),
-        [(Some("orders.create".to_owned()), Some(br#"{"quantity":2}"#.to_vec()), Some(r#"{"id":"o-c1","quantity":2}"#.to_owned()))]
+    assert_eq!(seen.lock().unwrap().as_slice(), [(Some("orders.create".to_owned()), Some(br#"{"quantity":2}"#.to_vec()), Some("o-c1:2".to_owned()))]);
+    assert!(
+        operation::current(&ctx).is_none() && operation::with_response(&ctx, |_: &OrderCreated| ()).is_none(),
+        "the scope is restored after the invocation"
     );
-    assert!(operation::current(&ctx).is_none() && operation::response_payload_of(&ctx).is_none(), "the scope is restored after the invocation");
 
     let failed = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", r#"{"quantity":0}"#))).unwrap_err();
     assert_eq!(failed.code(), "ORDERS_VALIDATION_001");
@@ -236,8 +237,8 @@ fn execute_skips_the_pipeline_and_reports_encoding_failures() {
     .unwrap();
     let descriptor = maps.get("maps.get").unwrap();
     let error = common::block_on(descriptor.execute(&Context::background(), b"{}")).unwrap_err();
-    assert_eq!((error.code(), error.message_key()), ("KERNEL_UNEXPECTED_001", None));
-    assert!(error.message().starts_with("The response of 'maps.get' could not be encoded"), "{}", error.message());
+    common::assert_kernel_error(&error, operation::MESSAGE_UNHANDLED_PANIC);
+    assert!(error.inner().is_none());
 
     let ok = registry();
     let created = common::block_on(ok.get("orders.create").unwrap().execute(&correlated("c5"), br#"{"quantity":1}"#)).unwrap();
@@ -484,6 +485,56 @@ fn built_in_steps_sit_where_the_reference_puts_them() {
     let invoker = Invoker::new(registry(), &builder).unwrap();
     let response = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", r#"{"quantity":4}"#))).unwrap();
     assert_eq!(String::from_utf8(response).unwrap(), r#"{"id":"o-","quantity":4}"#);
+}
+
+/// 响应写不出（RFC-0011 规则 10「编码」，ADR-0236）：管道结束之后编码，类型化的浮点成员是 NaN 或无穷、序列化不支持的值或序列化时
+/// panic，都以 KERNEL_UNEXPECTED_001 + kernel.invocation.unhandled_exception 结束，框架错误进 inner，不抛给调用方，没有载荷。
+#[test]
+fn unwritable_responses_become_unhandled_failures() {
+    #[derive(Serialize)]
+    struct Measured {
+        ratio: f64,
+    }
+    struct Exploding;
+    impl Serialize for Exploding {
+        fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+            std::panic::panic_any(xihan_framework::primitives::FrameworkError::new("ORDERS_UNEXPECTED_001", "the response cannot be written."))
+        }
+    }
+    let registry = Registry::new();
+    registry
+        .add(Contract::new("ratios.get"), operation::handler_fn(|_ctx, _request: CreateOrder| Box::pin(async { Ok(Measured { ratio: f64::NAN }) })))
+        .unwrap();
+    registry.add(Contract::new("limits.get"), operation::handler_fn(|_ctx, _request: CreateOrder| Box::pin(async { Ok(vec![f32::INFINITY]) }))).unwrap();
+    registry.add(Contract::new("bombs.get"), operation::handler_fn(|_ctx, _request: CreateOrder| Box::pin(async { Ok(Exploding) }))).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observe = {
+        let seen = Arc::clone(&seen);
+        pipeline::from_fn("Seen", move |ctx, next| {
+            let seen = Arc::clone(&seen);
+            Box::pin(async move {
+                let outcome = next.run(ctx).await;
+                // 中间件看到的是编码之前的对象：NaN 还在，调用在这里还是成功的
+                seen.lock().unwrap().push((outcome.is_ok(), operation::with_response(ctx, |measured: &Measured| measured.ratio.is_nan())));
+                outcome
+            })
+        })
+    };
+    let mut builder = Builder::new();
+    builder.use_middleware(observe).unwrap();
+    let invoker = Invoker::new(Arc::new(registry), &builder).unwrap();
+    for id in ["ratios.get", "limits.get"] {
+        let error = common::block_on(invoker.invoke(&Context::background(), Request::new(id, "{}"))).unwrap_err();
+        common::assert_kernel_error(&error, operation::MESSAGE_UNHANDLED_PANIC);
+        assert!(error.inner().is_none(), "{id}: a serialization error is not a framework error");
+    }
+    assert_eq!(*seen.lock().unwrap(), [(true, Some(true)), (true, None)]);
+    let error = common::block_on(invoker.invoke(&Context::background(), Request::new("bombs.get", "{}"))).unwrap_err();
+    common::assert_kernel_error(&error, operation::MESSAGE_UNHANDLED_PANIC);
+    assert_eq!(error.inner().map(|inner| inner.code()), Some("ORDERS_UNEXPECTED_001"), "a framework error raised while encoding is the inner error");
+    // 类型化调用不编码，NaN 原样交回
+    let typed = common::block_on(invoker.invoke_typed::<CreateOrder, Measured>(&Context::background(), "ratios.get", CreateOrder::default())).unwrap();
+    assert!(typed.ratio.is_nan());
 }
 
 /// 任意 JSON 的成员原样保留读到的值（RFC-0011 规则 2，ADR-0236）：处理器原样返回，响应载荷与原文的 JSON 值相等，

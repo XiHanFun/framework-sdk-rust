@@ -1,6 +1,7 @@
 //! 按值模型写出（RFC-0001「Result」、RFC-0010「模板」的值模型）。
 
 use serde::Serialize;
+use serde::ser::Error as _;
 use serde::ser::{
     SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple, SerializeTupleStruct, SerializeTupleVariant, Serializer,
 };
@@ -24,8 +25,23 @@ pub struct Model<'a, T: ?Sized>(pub &'a T);
 
 impl<T: Serialize + ?Sized> Serialize for Model<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(ModelSerializer(serializer))
+        self.0.serialize(ModelSerializer::<S, false>(serializer))
     }
+}
+
+/// 值与它的写法：`STRICT` 为假时按值模型（同 [`Model`]），为真时是类型化的响应——非有限的浮点写不出、报错，
+/// 不写成 `null` 或字符串（RFC-0011 规则 2 与规则 10「编码」），单精度与 128 位整数照原样交给内层。
+pub(crate) struct Wrap<'a, T: ?Sized, const STRICT: bool>(pub(crate) &'a T);
+
+impl<T: Serialize + ?Sized, const STRICT: bool> Serialize for Wrap<'_, T, STRICT> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(ModelSerializer::<S, STRICT>(serializer))
+    }
+}
+
+/// 把类型化的响应写成 JSON：非有限的浮点（及序列化不支持的值）报错。
+pub(crate) fn to_vec_strict<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec(&Wrap::<T, true>(value))
 }
 
 /// 按值模型把值转成 `serde_json::Value`：给错误细节与模板参数用，非有限的浮点成为字符串，而不是 `Value::from` 给出的 `null`。
@@ -46,21 +62,21 @@ fn non_finite(number: f64) -> &'static str {
     }
 }
 
-struct ModelSerializer<S>(S);
+struct ModelSerializer<S, const STRICT: bool>(S);
 
 /// 容器的包装：每个元素与成员同样按值模型写出。
-struct Compound<C>(C);
+struct Compound<C, const STRICT: bool>(C);
 
-impl<S: Serializer> Serializer for ModelSerializer<S> {
+impl<S: Serializer, const STRICT: bool> Serializer for ModelSerializer<S, STRICT> {
     type Ok = S::Ok;
     type Error = S::Error;
-    type SerializeSeq = Compound<S::SerializeSeq>;
-    type SerializeTuple = Compound<S::SerializeTuple>;
-    type SerializeTupleStruct = Compound<S::SerializeTupleStruct>;
-    type SerializeTupleVariant = Compound<S::SerializeTupleVariant>;
-    type SerializeMap = Compound<S::SerializeMap>;
-    type SerializeStruct = Compound<S::SerializeStruct>;
-    type SerializeStructVariant = Compound<S::SerializeStructVariant>;
+    type SerializeSeq = Compound<S::SerializeSeq, STRICT>;
+    type SerializeTuple = Compound<S::SerializeTuple, STRICT>;
+    type SerializeTupleStruct = Compound<S::SerializeTupleStruct, STRICT>;
+    type SerializeTupleVariant = Compound<S::SerializeTupleVariant, STRICT>;
+    type SerializeMap = Compound<S::SerializeMap, STRICT>;
+    type SerializeStruct = Compound<S::SerializeStruct, STRICT>;
+    type SerializeStructVariant = Compound<S::SerializeStructVariant, STRICT>;
 
     fn serialize_bool(self, value: bool) -> Result<S::Ok, S::Error> {
         self.0.serialize_bool(value)
@@ -83,6 +99,9 @@ impl<S: Serializer> Serializer for ModelSerializer<S> {
     }
 
     fn serialize_i128(self, value: i128) -> Result<S::Ok, S::Error> {
+        if STRICT {
+            return self.0.serialize_i128(value);
+        }
         // 64 位之外的整数按值模型是双精度浮点（serde_json 本来也写不出）
         match (i64::try_from(value), u64::try_from(value)) {
             (Ok(small), _) => self.0.serialize_i64(small),
@@ -108,6 +127,9 @@ impl<S: Serializer> Serializer for ModelSerializer<S> {
     }
 
     fn serialize_u128(self, value: u128) -> Result<S::Ok, S::Error> {
+        if STRICT {
+            return self.0.serialize_u128(value);
+        }
         match u64::try_from(value) {
             Ok(small) => self.0.serialize_u64(small),
             Err(_) => self.serialize_f64(value as f64),
@@ -115,11 +137,19 @@ impl<S: Serializer> Serializer for ModelSerializer<S> {
     }
 
     fn serialize_f32(self, value: f32) -> Result<S::Ok, S::Error> {
-        self.serialize_f64(f64::from(value))
+        match STRICT {
+            true if value.is_finite() => self.0.serialize_f32(value),
+            _ => self.serialize_f64(f64::from(value)),
+        }
     }
 
     fn serialize_f64(self, value: f64) -> Result<S::Ok, S::Error> {
-        if value.is_finite() { self.0.serialize_f64(value) } else { self.0.serialize_str(non_finite(value)) }
+        match (value.is_finite(), STRICT) {
+            (true, _) => self.0.serialize_f64(value),
+            // 类型化的响应写不出非有限的浮点，不悄悄换成 null 或字符串
+            (false, true) => Err(S::Error::custom(format!("the floating-point value {} cannot be written as JSON", non_finite(value)))),
+            (false, false) => self.0.serialize_str(non_finite(value)),
+        }
     }
 
     fn serialize_char(self, value: char) -> Result<S::Ok, S::Error> {
@@ -139,7 +169,7 @@ impl<S: Serializer> Serializer for ModelSerializer<S> {
     }
 
     fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<S::Ok, S::Error> {
-        self.0.serialize_some(&Model(value))
+        self.0.serialize_some(&Wrap::<_, STRICT>(value))
     }
 
     fn serialize_unit(self) -> Result<S::Ok, S::Error> {
@@ -155,11 +185,11 @@ impl<S: Serializer> Serializer for ModelSerializer<S> {
     }
 
     fn serialize_newtype_struct<T: Serialize + ?Sized>(self, name: &'static str, value: &T) -> Result<S::Ok, S::Error> {
-        self.0.serialize_newtype_struct(name, &Model(value))
+        self.0.serialize_newtype_struct(name, &Wrap::<_, STRICT>(value))
     }
 
     fn serialize_newtype_variant<T: Serialize + ?Sized>(self, name: &'static str, index: u32, variant: &'static str, value: &T) -> Result<S::Ok, S::Error> {
-        self.0.serialize_newtype_variant(name, index, variant, &Model(value))
+        self.0.serialize_newtype_variant(name, index, variant, &Wrap::<_, STRICT>(value))
     }
 
     fn serialize_seq(self, len: Option<usize>) -> Result<Self::SerializeSeq, S::Error> {
@@ -195,12 +225,12 @@ impl<S: Serializer> Serializer for ModelSerializer<S> {
     }
 }
 
-impl<C: SerializeSeq> SerializeSeq for Compound<C> {
+impl<C: SerializeSeq, const STRICT: bool> SerializeSeq for Compound<C, STRICT> {
     type Ok = C::Ok;
     type Error = C::Error;
 
     fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), C::Error> {
-        self.0.serialize_element(&Model(value))
+        self.0.serialize_element(&Wrap::<_, STRICT>(value))
     }
 
     fn end(self) -> Result<C::Ok, C::Error> {
@@ -208,12 +238,12 @@ impl<C: SerializeSeq> SerializeSeq for Compound<C> {
     }
 }
 
-impl<C: SerializeTuple> SerializeTuple for Compound<C> {
+impl<C: SerializeTuple, const STRICT: bool> SerializeTuple for Compound<C, STRICT> {
     type Ok = C::Ok;
     type Error = C::Error;
 
     fn serialize_element<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), C::Error> {
-        self.0.serialize_element(&Model(value))
+        self.0.serialize_element(&Wrap::<_, STRICT>(value))
     }
 
     fn end(self) -> Result<C::Ok, C::Error> {
@@ -221,12 +251,12 @@ impl<C: SerializeTuple> SerializeTuple for Compound<C> {
     }
 }
 
-impl<C: SerializeTupleStruct> SerializeTupleStruct for Compound<C> {
+impl<C: SerializeTupleStruct, const STRICT: bool> SerializeTupleStruct for Compound<C, STRICT> {
     type Ok = C::Ok;
     type Error = C::Error;
 
     fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), C::Error> {
-        self.0.serialize_field(&Model(value))
+        self.0.serialize_field(&Wrap::<_, STRICT>(value))
     }
 
     fn end(self) -> Result<C::Ok, C::Error> {
@@ -234,12 +264,12 @@ impl<C: SerializeTupleStruct> SerializeTupleStruct for Compound<C> {
     }
 }
 
-impl<C: SerializeTupleVariant> SerializeTupleVariant for Compound<C> {
+impl<C: SerializeTupleVariant, const STRICT: bool> SerializeTupleVariant for Compound<C, STRICT> {
     type Ok = C::Ok;
     type Error = C::Error;
 
     fn serialize_field<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), C::Error> {
-        self.0.serialize_field(&Model(value))
+        self.0.serialize_field(&Wrap::<_, STRICT>(value))
     }
 
     fn end(self) -> Result<C::Ok, C::Error> {
@@ -247,20 +277,20 @@ impl<C: SerializeTupleVariant> SerializeTupleVariant for Compound<C> {
     }
 }
 
-impl<C: SerializeMap> SerializeMap for Compound<C> {
+impl<C: SerializeMap, const STRICT: bool> SerializeMap for Compound<C, STRICT> {
     type Ok = C::Ok;
     type Error = C::Error;
 
     fn serialize_key<T: Serialize + ?Sized>(&mut self, key: &T) -> Result<(), C::Error> {
-        self.0.serialize_key(&Model(key))
+        self.0.serialize_key(&Wrap::<_, STRICT>(key))
     }
 
     fn serialize_value<T: Serialize + ?Sized>(&mut self, value: &T) -> Result<(), C::Error> {
-        self.0.serialize_value(&Model(value))
+        self.0.serialize_value(&Wrap::<_, STRICT>(value))
     }
 
     fn serialize_entry<K: Serialize + ?Sized, V: Serialize + ?Sized>(&mut self, key: &K, value: &V) -> Result<(), C::Error> {
-        self.0.serialize_entry(&Model(key), &Model(value))
+        self.0.serialize_entry(&Wrap::<_, STRICT>(key), &Wrap::<_, STRICT>(value))
     }
 
     fn end(self) -> Result<C::Ok, C::Error> {
@@ -268,12 +298,12 @@ impl<C: SerializeMap> SerializeMap for Compound<C> {
     }
 }
 
-impl<C: SerializeStruct> SerializeStruct for Compound<C> {
+impl<C: SerializeStruct, const STRICT: bool> SerializeStruct for Compound<C, STRICT> {
     type Ok = C::Ok;
     type Error = C::Error;
 
     fn serialize_field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> Result<(), C::Error> {
-        self.0.serialize_field(key, &Model(value))
+        self.0.serialize_field(key, &Wrap::<_, STRICT>(value))
     }
 
     fn skip_field(&mut self, key: &'static str) -> Result<(), C::Error> {
@@ -285,12 +315,12 @@ impl<C: SerializeStruct> SerializeStruct for Compound<C> {
     }
 }
 
-impl<C: SerializeStructVariant> SerializeStructVariant for Compound<C> {
+impl<C: SerializeStructVariant, const STRICT: bool> SerializeStructVariant for Compound<C, STRICT> {
     type Ok = C::Ok;
     type Error = C::Error;
 
     fn serialize_field<T: Serialize + ?Sized>(&mut self, key: &'static str, value: &T) -> Result<(), C::Error> {
-        self.0.serialize_field(key, &Model(value))
+        self.0.serialize_field(key, &Wrap::<_, STRICT>(value))
     }
 
     fn skip_field(&mut self, key: &'static str) -> Result<(), C::Error> {

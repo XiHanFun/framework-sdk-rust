@@ -232,12 +232,39 @@ impl<Req, Res, F> fmt::Debug for HandlerFn<Req, Res, F> {
     }
 }
 
-/// 解码载荷、执行、编码响应：登记时按请求与响应类型生成，不经反射。
+/// 解码载荷、执行：登记时按请求与响应类型生成，不经反射。
 ///
-/// 解码与执行分开：原始调用在 Validate 阶段的内置步骤里解码，handle 阶段之后执行（RFC-0011 规则 10）。
+/// 解码、执行与编码分开（RFC-0011 规则 10）：原始调用在 Validate 阶段的内置步骤里解码，handle 阶段之后执行，管道结束之后才编码响应。
 trait Execute: Send + Sync {
     fn decode(&self, id: &str, payload: &[u8]) -> Result<Box<dyn Any + Send>>;
-    fn run<'a>(&'a self, ctx: &'a Context, id: &'a str, request: Box<dyn Any + Send>) -> BoxFuture<'a, Result<Vec<u8>>>;
+    fn run<'a>(&'a self, ctx: &'a Context, id: &'a str, request: Box<dyn Any + Send>) -> BoxFuture<'a, Result<Box<dyn Response>>>;
+}
+
+/// 编码之前的响应对象：中间件看得到它（[`with_response`]），管道结束之后才写成载荷。
+trait Response: Send {
+    fn encode(&self) -> std::result::Result<Vec<u8>, serde_json::Error>;
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Serialize + Send + 'static> Response for T {
+    /// 按类型写出：非有限的浮点写不出、报错，不写成 `null` 或字符串（RFC-0011 规则 2）。
+    fn encode(&self) -> std::result::Result<Vec<u8>, serde_json::Error> {
+        json::to_vec_strict(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// 把响应写成载荷（RFC-0011 规则 10「编码」）：写不出（非有限的浮点、序列化不支持的值）或序列化时 panic，都以
+/// `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception` 结束，panic 的内容是框架错误时它进 `inner`，不抛给调用方。
+fn encode(response: &dyn Response) -> Result<Vec<u8>> {
+    match panic::catch_unwind(AssertUnwindSafe(|| response.encode())) {
+        Ok(Ok(payload)) => Ok(payload),
+        Ok(Err(_)) => Err(Error::unexpected(ERROR_CODE_UNEXPECTED, MESSAGE_UNHANDLED_PANIC)),
+        Err(payload) => Err(unhandled(payload.as_ref())),
+    }
 }
 
 struct JsonExecutor<Req, Res> {
@@ -253,15 +280,14 @@ where
         decode::<Req>(id, payload).map(|request| Box::new(request) as Box<dyn Any + Send>)
     }
 
-    fn run<'a>(&'a self, ctx: &'a Context, id: &'a str, request: Box<dyn Any + Send>) -> BoxFuture<'a, Result<Vec<u8>>> {
+    fn run<'a>(&'a self, ctx: &'a Context, id: &'a str, request: Box<dyn Any + Send>) -> BoxFuture<'a, Result<Box<dyn Response>>> {
         Box::pin(async move {
             // 解码与执行来自同一个执行器，类型总是对的
             let request = *request
                 .downcast::<Req>()
                 .map_err(|_| Error::literal(ERROR_CODE_UNEXPECTED, format!("The decoded request of '{id}' does not have the registered type.")))?;
             let response = self.handler.handle(ctx, request).await?;
-            serde_json::to_vec(&response)
-                .map_err(|error| Error::literal(ERROR_CODE_UNEXPECTED, format!("The response of '{id}' could not be encoded: {error}")))
+            Ok(Box::new(response) as Box<dyn Response>)
         })
     }
 }
@@ -309,11 +335,13 @@ impl Descriptor {
         &self.response_type
     }
 
-    /// 不经管道直接执行：解码载荷、执行、编码响应；载荷不合法返回 `KERNEL_VALIDATION_001`。
+    /// 不经管道直接执行：解码载荷、执行、编码响应；载荷不合法返回 `KERNEL_VALIDATION_001`，响应写不出返回
+    /// `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception`，同 [`Invoker::invoke`]。
     pub fn execute<'a>(&'a self, ctx: &'a Context, payload: &'a [u8]) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
             let request = self.executor.decode(self.id(), payload)?;
-            self.executor.run(ctx, self.id(), request).await
+            let response = self.executor.run(ctx, self.id(), request).await?;
+            encode(response.as_ref())
         })
     }
 }
@@ -450,9 +478,9 @@ struct CurrentOperation(Arc<Descriptor>);
 #[derive(Clone)]
 struct CurrentRequest(Arc<Request>);
 
-/// 对象袋里 handle 阶段写回的响应载荷。
+/// 对象袋里 handle 阶段之后写回的响应对象，管道结束之后才编码；只在原始调用里有。
 #[derive(Clone)]
-struct ResponsePayload(Vec<u8>);
+struct ResponseObject(Arc<Mutex<Option<Box<dyn Response>>>>);
 
 /// 对象袋里 Validate 阶段解码好的请求，handle 阶段之后取走；只在原始调用里有。
 #[derive(Clone)]
@@ -468,9 +496,13 @@ pub fn request_of(ctx: &Context) -> Option<Arc<Request>> {
     ctx.item::<CurrentRequest>().map(|current| Arc::clone(&current.0))
 }
 
-/// 返回 handle 阶段写回的响应载荷：操作成功后在中间件的下游返回之后可读。
-pub fn response_payload_of(ctx: &Context) -> Option<Vec<u8>> {
-    ctx.item::<ResponsePayload>().map(|payload| payload.0.clone())
+/// 读 handle 阶段之后写回的响应对象（编码之前，RFC-0011 规则 10「编码」）：原始调用里操作成功后，中间件在下游返回之后可读。
+///
+/// `T` 是登记的响应类型；还没有响应、类型不对或是类型化调用时为 `None`。响应在管道结束之后才写成载荷，中间件看不到载荷。
+pub fn with_response<T: 'static, R>(ctx: &Context, read: impl FnOnce(&T) -> R) -> Option<R> {
+    let slot = ctx.item::<ResponseObject>()?;
+    let response = slot.0.lock().unwrap_or_else(PoisonError::into_inner);
+    response.as_ref()?.as_any().downcast_ref::<T>().map(read)
 }
 
 /// 一次调用在对象袋里的作用域：进入时放入当前操作与请求，离开时（含 future 被丢弃）恢复上一层。
@@ -480,24 +512,27 @@ struct Scope<'c> {
     ctx: &'c Context,
     operation: Option<Arc<CurrentOperation>>,
     request: Option<Arc<CurrentRequest>>,
-    response: Option<Arc<ResponsePayload>>,
+    response: Option<Arc<ResponseObject>>,
     decoded: Option<Arc<DecodedRequest>>,
 }
 
 impl<'c> Scope<'c> {
     fn enter(ctx: &'c Context, descriptor: Arc<Descriptor>, request: Option<Arc<Request>>) -> Self {
         let operation = ctx.insert_item(CurrentOperation(descriptor));
-        let (request, decoded) = match request {
-            Some(request) => (ctx.insert_item(CurrentRequest(request)), ctx.insert_item(DecodedRequest(Arc::new(Mutex::new(None))))),
-            None => (ctx.remove_item::<CurrentRequest>(), ctx.remove_item::<DecodedRequest>()),
+        let (request, decoded, response) = match request {
+            Some(request) => (
+                ctx.insert_item(CurrentRequest(request)),
+                ctx.insert_item(DecodedRequest(Arc::new(Mutex::new(None)))),
+                ctx.insert_item(ResponseObject(Arc::new(Mutex::new(None)))),
+            ),
+            None => (ctx.remove_item::<CurrentRequest>(), ctx.remove_item::<DecodedRequest>(), ctx.remove_item::<ResponseObject>()),
         };
-        let response = ctx.remove_item::<ResponsePayload>();
         Self { ctx, operation, request, response, decoded }
     }
 
-    /// 取走这次调用写回的响应载荷。
-    fn take_response(&self) -> Option<Vec<u8>> {
-        self.ctx.remove_item::<ResponsePayload>().map(|payload| Arc::unwrap_or_clone(payload).0)
+    /// 取走这次调用写回的响应对象。
+    fn take_response(&self) -> Option<Box<dyn Response>> {
+        self.ctx.item::<ResponseObject>().and_then(|slot| slot.0.lock().unwrap_or_else(PoisonError::into_inner).take())
     }
 }
 
@@ -522,7 +557,7 @@ fn restore<T: Clone + Send + Sync + 'static>(ctx: &Context, previous: Option<Arc
     }
 }
 
-/// XGI 调用的终点：在 handle 阶段之后执行当前操作，成功时把响应载荷写回上下文。
+/// XGI 调用的终点：在 handle 阶段之后执行当前操作，成功时把响应对象写回上下文（编码在管道结束之后）。
 struct Dispatch<'d> {
     descriptor: &'d Descriptor,
     payload: &'d [u8],
@@ -538,8 +573,10 @@ impl Step for Dispatch<'_> {
                 Some(request) => request,
                 None => executor.decode(id, self.payload)?,
             };
-            let payload = executor.run(ctx, id, request).await?;
-            ctx.insert_item(ResponsePayload(payload));
+            let response = executor.run(ctx, id, request).await?;
+            if let Some(slot) = ctx.item::<ResponseObject>() {
+                *slot.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(response);
+            }
             Ok(())
         })
     }
@@ -685,7 +722,8 @@ impl Invoker {
     /// 执行一个 XGI 请求，成功时返回响应载荷。
     ///
     /// 未登记返回 `KERNEL_NOTFOUND_001`，不进管道；否则把操作与请求放进上下文，经完整管道执行：Resilience 阶段进入时截止时间已到返回
-    /// `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_before_start`，Validate 阶段解码载荷，handle 阶段之后执行、编码；
+    /// `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_before_start`，Validate 阶段解码载荷，handle 阶段之后执行，管道结束之后编码响应
+    /// （中间件看到的是编码之前的对象，见 [`with_response`]；写不出时返回 `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception`）；
     /// 排在 Observe 阶段内置步骤之后的 panic 成为 `KERNEL_UNEXPECTED_001`，之前的原样交给调用方。中间件以成功短路、没有执行操作时返回 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response`（规则 9）；载荷不合法时 `reason` 是出错位置的 JSON 路径（如 `$.quantity`）。
     ///
     /// 载荷先过共同的 JSON 读取检查，再按请求类型的 `Deserialize` 解码；必填、可选与接受 `null` 的成员怎么声明见 [`nullable`]。
@@ -701,7 +739,8 @@ impl Invoker {
             let response = scope.take_response();
             drop(scope);
             outcome?;
-            response.ok_or_else(|| no_response(descriptor.id()))
+            // 管道结束之后才编码（规则 10「编码」）：写不出时以未处理失败结束，不抛给调用方
+            encode(response.ok_or_else(|| no_response(descriptor.id()))?.as_ref())
         }
     }
 

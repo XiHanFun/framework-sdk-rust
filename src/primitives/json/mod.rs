@@ -35,6 +35,7 @@ use serde::de::DeserializeOwned;
 use serde_path_to_error::Segment;
 
 pub(crate) use reader::{Node, parse};
+pub(crate) use ser::to_vec_strict;
 pub use ser::{Model, to_value};
 pub use value::Json;
 
