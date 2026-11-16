@@ -61,7 +61,7 @@ pub const ERROR_CODE_UNEXPECTED: &str = "KERNEL_UNEXPECTED_001";
 pub const MESSAGE_NOT_FOUND: &str = "kernel.operation.unknown";
 /// 载荷不合法的消息键；参数 `id`、`reason`（出错位置的 JSON 路径，如 `$.quantity`）。
 pub const MESSAGE_INVALID_PAYLOAD: &str = "kernel.operation.invalid_payload";
-/// 类型不符的消息键；参数 `id`、`expected`、`actual`（Rust 类型的短名）。
+/// 类型不符的消息键；参数只有 `id`（ADR-0236）。
 pub const MESSAGE_TYPE_MISMATCH: &str = "kernel.operation.type_mismatch";
 /// 管道以成功结束而没有响应的消息键；参数 `id`。
 pub const MESSAGE_NO_RESPONSE: &str = "kernel.operation.no_response";
@@ -625,7 +625,7 @@ impl Invoker {
     {
         async move {
             let descriptor = self.registry.get(id).ok_or_else(|| not_found(id))?;
-            let handler = descriptor.typed.downcast_ref::<Arc<dyn Handler<Req, Res>>>().ok_or_else(|| type_mismatch::<Req, Res>(&descriptor))?;
+            let handler = descriptor.typed.downcast_ref::<Arc<dyn Handler<Req, Res>>>().ok_or_else(|| type_mismatch(id))?;
             started_in_time(ctx)?;
             let terminal = Typed { handler: Arc::clone(handler), request, outcome: Mutex::new(None) };
             let scope = Scope::enter(ctx, Arc::clone(&descriptor), None);
@@ -701,11 +701,9 @@ fn not_found(id: &str) -> Error {
     Error::not_found(ERROR_CODE_NOT_FOUND, MESSAGE_NOT_FOUND).with_detail("id", id)
 }
 
-fn type_mismatch<Req, Res>(descriptor: &Descriptor) -> Error {
-    Error::validation(ERROR_CODE_TYPE_MISMATCH, MESSAGE_TYPE_MISMATCH)
-        .with_detail("id", descriptor.id())
-        .with_detail("expected", format!("{} -> {}", descriptor.request_type, descriptor.response_type))
-        .with_detail("actual", format!("{} -> {}", short_type_name::<Req>(), short_type_name::<Res>()))
+/// 类型化调用的类型与登记不符：只带 `id`（ADR-0236），实现语言的类型名各语言写不出同样的参数。
+fn type_mismatch(id: &str) -> Error {
+    Error::validation(ERROR_CODE_TYPE_MISMATCH, MESSAGE_TYPE_MISMATCH).with_detail("id", id)
 }
 
 /// 调用开始时按时钟核对截止时间（RFC-0011 规则 10）：SDK 没有截止时间中间件，已到即以 `KERNEL_TIMEOUT_001` +

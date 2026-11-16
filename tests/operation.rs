@@ -116,8 +116,11 @@ fn typed_invoke_checks_types() {
     let mismatch =
         common::block_on(invoker.invoke_typed::<CreateOrder, String>(&Context::background(), "orders.create", CreateOrder { quantity: 3 })).unwrap_err();
     assert_eq!((mismatch.code(), mismatch.message_key()), (ERROR_CODE_TYPE_MISMATCH, Some(MESSAGE_TYPE_MISMATCH)));
-    let details = mismatch.details().unwrap();
-    assert_eq!((details["expected"].as_str(), details["actual"].as_str()), (Some("CreateOrder -> OrderCreated"), Some("CreateOrder -> String")));
+    // 只带 id（ADR-0236）：类型名是实现语言的，登记的类型仍可从描述里读
+    assert_eq!(mismatch.details().unwrap().keys().collect::<Vec<_>>(), ["id"]);
+    assert_eq!(mismatch.message(), "Operation 'orders.create' was invoked with request or response types that do not match its registration.");
+    let descriptor = invoker.registry().get("orders.create").unwrap();
+    assert_eq!((descriptor.request_type(), descriptor.response_type()), ("CreateOrder", "OrderCreated"));
     common::assert_kernel_error(&mismatch, MESSAGE_TYPE_MISMATCH);
 
     let missing = common::block_on(invoker.invoke_typed::<CreateOrder, OrderCreated>(&ctx, "orders.missing", CreateOrder::default())).unwrap_err();
