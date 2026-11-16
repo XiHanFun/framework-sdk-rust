@@ -64,7 +64,7 @@ fn invoke_runs_the_pipeline_and_encodes_the_response() {
             })
         })
     };
-    let invoker = Invoker::new(registry(), &Builder::new().use_at(observe, PipelineStage::Observe, Placement::End, APP_OWNER)).unwrap();
+    let invoker = Invoker::new(registry(), Builder::new().use_at(observe, PipelineStage::Observe, Placement::End, APP_OWNER).unwrap()).unwrap();
 
     let ctx = correlated("c1");
     let response = common::block_on(invoker.invoke(&ctx, Request::new("orders.create", r#"{"quantity":2}"#))).unwrap();
@@ -174,7 +174,7 @@ fn registry_capacity_is_bounded() {
 fn short_circuits_and_nested_invocations() {
     // 以成功短路、没有执行操作：没有响应可交出
     let skip = pipeline::from_fn("Skip", |_ctx, _next| Box::pin(async { Ok(()) }));
-    let invoker = Invoker::new(registry(), &Builder::new().use_at(skip, PipelineStage::Idempotency, Placement::End, APP_OWNER)).unwrap();
+    let invoker = Invoker::new(registry(), Builder::new().use_at(skip, PipelineStage::Idempotency, Placement::End, APP_OWNER).unwrap()).unwrap();
     let skipped = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.create", r#"{"quantity":1}"#))).unwrap_err();
     common::assert_kernel_error(&skipped, MESSAGE_NO_RESPONSE);
     assert_eq!(skipped.message(), "Operation 'orders.create' completed without producing a response.");
@@ -195,7 +195,8 @@ fn short_circuits_and_nested_invocations() {
             })
         })
     };
-    let invoker = Arc::new(Invoker::new(Arc::clone(&registry), &Builder::new().use_at(observe, PipelineStage::Observe, Placement::End, APP_OWNER)).unwrap());
+    let invoker =
+        Arc::new(Invoker::new(Arc::clone(&registry), Builder::new().use_at(observe, PipelineStage::Observe, Placement::End, APP_OWNER).unwrap()).unwrap());
     let inner = Arc::clone(&invoker);
     registry
         .add(
@@ -298,7 +299,7 @@ fn panics_become_unexpected_errors() {
     assert!(common::block_on(invoker.invoke(&ctx, Request::new("orders.crash", r#"{"quantity":1}"#))).is_ok(), "the invoker keeps working");
 
     let explode = pipeline::from_fn("Explode", |_ctx, _next| Box::pin(async { panic!("the middleware crashed") }));
-    let invoker = Invoker::new(registry(), &Builder::new().use_at(explode, PipelineStage::Observe, Placement::End, APP_OWNER)).unwrap();
+    let invoker = Invoker::new(registry(), Builder::new().use_at(explode, PipelineStage::Observe, Placement::End, APP_OWNER).unwrap()).unwrap();
     let crashed = common::block_on(invoker.invoke(&ctx, Request::new("orders.create", r#"{"quantity":1}"#))).unwrap_err();
     assert_eq!(crashed.message_key(), Some(operation::MESSAGE_UNHANDLED_PANIC));
 }
@@ -340,7 +341,7 @@ fn expired_deadlines_stop_before_the_pipeline() {
             })
         })
     };
-    let invoker = Invoker::new(registry(), &Builder::new().use_at(count, PipelineStage::Observe, Placement::Beginning, APP_OWNER)).unwrap();
+    let invoker = Invoker::new(registry(), Builder::new().use_at(count, PipelineStage::Observe, Placement::Beginning, APP_OWNER).unwrap()).unwrap();
     let late = Context::builder().deadline(std::time::SystemTime::now() - std::time::Duration::from_millis(1)).build();
     let error = common::block_on(invoker.invoke(&late, Request::new("orders.create", r#"{"quantity":1}"#))).unwrap_err();
     common::assert_kernel_error(&error, xihan_framework::invocation::MESSAGE_DEADLINE_BEFORE_START);

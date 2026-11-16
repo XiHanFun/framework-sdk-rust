@@ -10,7 +10,8 @@
 //! use xihan_framework::primitives::PipelineStage;
 //!
 //! let observe = pipeline::from_fn("Observe", |ctx, next| Box::pin(async move { next.run(ctx).await }));
-//! let builder = Builder::new().use_at(observe, PipelineStage::Observe, Placement::End, APP_OWNER);
+//! let mut builder = Builder::new();
+//! builder.use_at(observe, PipelineStage::Observe, Placement::End, APP_OWNER).unwrap(); // 重复登记等错误在登记时即返回
 //! assert_eq!(builder.dump().unwrap(), "observe      Observe\n");
 //! let pipeline = builder.build().unwrap();
 //! let terminal = pipeline::step_fn(|_ctx| Box::pin(async { Ok(()) }));
@@ -206,18 +207,19 @@ struct Registration {
 #[derive(Clone)]
 struct Constraint {
     name: String,
-    // 主体在声明时解析：登记的下标，或留到构建时报出的错误
-    subject: std::result::Result<usize, String>,
+    // 主体在声明时解析成登记的下标
+    subject: usize,
     target: String,
     before: bool,
 }
 
 /// 收集中间件与顺序约束，按规范排序后构建管道。
 ///
-/// 登记与约束在构建或打印时才解析与核对，链式调用不必逐个处理错误；错误码见 [`ERROR_CODE_REGISTRATION`] 与 [`ERROR_CODE_CYCLE`]。
+/// 报错的时机照 RFC-0004 排序规则第 8 条：登记时立即报的是重复登记、空的名字或归属、约束主体未登记或按名字有歧义
+/// （登记方法返回 `Err`，这一项不生效，构建器照常可用）；排序时（[`Builder::describe`]、[`Builder::dump`]、[`Builder::build`]）
+/// 报的是约束目标未登记、有歧义或不在同一阶段，以及约束成环。登记方法返回 `&mut Self`，可以接着 `?` 链式调用。
 /// 克隆共享已登记的中间件实例（`Arc`），可以从同一份基础登记派生几条管道。
 #[derive(Clone, Default)]
-#[must_use = "a builder does nothing until it is built"]
 pub struct Builder {
     // 下标即登记顺序（排序规则第 4 条）
     registrations: Vec<Registration>,
@@ -230,45 +232,85 @@ impl Builder {
         Self::default()
     }
 
-    /// 登记中间件到 transaction 阶段末尾，归属 [`APP_OWNER`]（排序规则第 1 条）。
-    pub fn use_middleware(self, middleware: impl Middleware + 'static) -> Self {
+    /// 登记中间件到 transaction 阶段末尾，归属 [`APP_OWNER`]（排序规则第 1 条）；错误同 [`Builder::use_at`]。
+    pub fn use_middleware(&mut self, middleware: impl Middleware + 'static) -> std::result::Result<&mut Self, FrameworkError> {
         self.use_at(middleware, PipelineStage::Transaction, Placement::End, APP_OWNER)
     }
 
-    /// 登记中间件到指定阶段与位置；`owner` 是清单 ID 或 [`APP_OWNER`]，不能为空。
-    pub fn use_at(self, middleware: impl Middleware + 'static, stage: PipelineStage, placement: Placement, owner: &str) -> Self {
+    /// 登记中间件到指定阶段与位置；`owner` 是清单 ID 或 [`APP_OWNER`]。
+    ///
+    /// 中间件名或归属为空、同一中间件的默认实例已登记过，立即返回 `KERNEL_PIPELINE_003`。
+    pub fn use_at(
+        &mut self,
+        middleware: impl Middleware + 'static,
+        stage: PipelineStage,
+        placement: Placement,
+        owner: &str,
+    ) -> std::result::Result<&mut Self, FrameworkError> {
         self.add(Arc::new(middleware), None, stage, placement, owner)
     }
 
-    /// 按名字登记同一中间件的另一个实例（排序规则第 7 条）；名字在中间件名内唯一，打印为 `中间件名[实例名]`。
-    pub fn use_named_instance(self, instance: &str, middleware: impl Middleware + 'static, stage: PipelineStage, placement: Placement, owner: &str) -> Self {
+    /// 按名字登记同一中间件的另一个实例（排序规则第 7 条），打印为 `中间件名[实例名]`。
+    ///
+    /// 名字在中间件名内唯一；实例名、中间件名或归属为空、同名实例已登记过，立即返回 `KERNEL_PIPELINE_003`。
+    pub fn use_named_instance(
+        &mut self,
+        instance: &str,
+        middleware: impl Middleware + 'static,
+        stage: PipelineStage,
+        placement: Placement,
+        owner: &str,
+    ) -> std::result::Result<&mut Self, FrameworkError> {
         self.add(Arc::new(middleware), Some(instance.to_owned()), stage, placement, owner)
     }
 
-    fn add(mut self, middleware: Arc<dyn Middleware>, instance: Option<String>, stage: PipelineStage, placement: Placement, owner: &str) -> Self {
+    fn add(
+        &mut self,
+        middleware: Arc<dyn Middleware>,
+        instance: Option<String>,
+        stage: PipelineStage,
+        placement: Placement,
+        owner: &str,
+    ) -> std::result::Result<&mut Self, FrameworkError> {
         let descriptor = Descriptor { stage, middleware: middleware.name().to_owned(), instance, owner: owner.to_owned(), placement };
+        if descriptor.middleware.is_empty() {
+            return Err(registration_error("a middleware has an empty name".to_owned()));
+        }
+        if descriptor.instance.as_deref() == Some("") {
+            return Err(registration_error(format!("a named instance of the middleware '{}' has an empty name", descriptor.middleware)));
+        }
+        if descriptor.owner.is_empty() {
+            return Err(registration_error(format!("the middleware '{}' has an empty owner", descriptor.display_name())));
+        }
+        // 同一中间件的默认实例只登记一次，命名实例的名字在中间件内唯一；登记数有限，逐个比较即可
+        let duplicate = self
+            .registrations
+            .iter()
+            .any(|registration| registration.descriptor.middleware == descriptor.middleware && registration.descriptor.instance == descriptor.instance);
+        if duplicate {
+            return Err(registration_error(format!("the middleware '{}' is registered more than once", descriptor.display_name())));
+        }
         self.registrations.push(Registration { middleware, descriptor });
-        self
+        Ok(self)
     }
 
     /// 约束 `middleware` 在 `other` 之前。
     ///
     /// 两端都是名字：按名字登记的实例用实例名，没有名字的登记用中间件名（RFC-0004 排序规则第 7 条）。主体 `middleware`
-    /// 在声明时就必须已登记，目标 `other` 在构建时解析；解析不到恰好一个登记、或两端不在同一阶段，在构建或打印时报
-    /// `KERNEL_PIPELINE_003`。
-    pub fn before(self, middleware: &str, other: &str) -> Self {
+    /// 在声明时就必须已登记，没有或有歧义立即返回 `KERNEL_PIPELINE_003`；目标 `other` 在排序时解析。
+    pub fn before(&mut self, middleware: &str, other: &str) -> std::result::Result<&mut Self, FrameworkError> {
         self.constrain(middleware, other, true)
     }
 
-    /// 约束 `middleware` 在 `other` 之后；名字的解析与时机同 [`Builder::before`]。
-    pub fn after(self, middleware: &str, other: &str) -> Self {
+    /// 约束 `middleware` 在 `other` 之后；名字的解析与报错的时机同 [`Builder::before`]。
+    pub fn after(&mut self, middleware: &str, other: &str) -> std::result::Result<&mut Self, FrameworkError> {
         self.constrain(middleware, other, false)
     }
 
-    fn constrain(mut self, middleware: &str, other: &str, before: bool) -> Self {
-        let subject = self.subject(middleware);
+    fn constrain(&mut self, middleware: &str, other: &str, before: bool) -> std::result::Result<&mut Self, FrameworkError> {
+        let subject = self.subject(middleware)?;
         self.constraints.push(Constraint { name: middleware.to_owned(), subject, target: other.to_owned(), before });
-        self
+        Ok(self)
     }
 
     /// 按执行顺序返回中间件描述。
@@ -292,11 +334,9 @@ impl Builder {
 
     /// 按规则排序，返回登记的下标：先阶段；阶段内先位置，再归属的序数字典序，再登记顺序；最后按约束做稳定拓扑排序。
     fn sorted(&self) -> std::result::Result<Vec<usize>, FrameworkError> {
-        self.check_registrations()?;
         let mut edges = Vec::with_capacity(self.constraints.len());
         for constraint in &self.constraints {
-            let subject = constraint.subject.clone().map_err(registration_error)?;
-            let target = self.target(&constraint.target)?;
+            let (subject, target) = (constraint.subject, self.target(&constraint.target)?);
             if self.registrations[subject].descriptor.stage != self.registrations[target].descriptor.stage {
                 let (first, second) = if constraint.before { (&constraint.name, &constraint.target) } else { (&constraint.target, &constraint.name) };
                 return Err(registration_error(format!("the ordering constraint between '{first}' and '{second}' crosses stages")));
@@ -307,40 +347,20 @@ impl Builder {
         let mut result = Vec::with_capacity(self.registrations.len());
         for &stage in PipelineStage::ALL {
             let mut members: Vec<usize> = (0..self.registrations.len()).filter(|&index| self.registrations[index].descriptor.stage == stage).collect();
-            // 基准次序（排序规则第 2–4 条）；下标唯一，所以是全序
+            // 基准次序（排序规则第 2–4 条）：归属按序数字典序，逐个 UTF-16 码元比较，与 .NET 的 Ordinal 一致；下标唯一，所以是全序
             members.sort_by(|&left, &right| {
                 let (a, b) = (&self.registrations[left].descriptor, &self.registrations[right].descriptor);
-                a.placement.cmp(&b.placement).then_with(|| a.owner.cmp(&b.owner)).then(left.cmp(&right))
+                a.placement.cmp(&b.placement).then_with(|| a.owner.encode_utf16().cmp(b.owner.encode_utf16())).then(left.cmp(&right))
             });
             result.extend(topological_sort(stage, members, &edges)?);
         }
         Ok(result)
     }
 
-    /// 核对登记：名字与归属非空，同一中间件的默认实例只登记一次，命名实例的名字在中间件内唯一。
-    fn check_registrations(&self) -> std::result::Result<(), FrameworkError> {
-        let mut seen = HashSet::new();
-        for Registration { descriptor, .. } in &self.registrations {
-            if descriptor.middleware.is_empty() {
-                return Err(registration_error("a middleware has an empty name".to_owned()));
-            }
-            if descriptor.instance.as_deref() == Some("") {
-                return Err(registration_error(format!("a named instance of the middleware '{}' has an empty name", descriptor.middleware)));
-            }
-            if descriptor.owner.is_empty() {
-                return Err(registration_error(format!("the middleware '{}' has an empty owner", descriptor.display_name())));
-            }
-            if !seen.insert((descriptor.middleware.as_str(), descriptor.instance.as_deref())) {
-                return Err(registration_error(format!("the middleware '{}' is registered more than once", descriptor.display_name())));
-            }
-        }
-        Ok(())
-    }
-
     /// 在登记里按名字找唯一的一个：按名字登记的实例只认实例名，没有名字的登记认中间件名（RFC-0004 排序规则第 7 条）。
     ///
     /// 没有为 `Ok(None)`；对应多个（不同中间件的实例同名，或实例名与某个中间件名相同）为歧义的登记错误。
-    fn find(&self, name: &str) -> std::result::Result<Option<usize>, String> {
+    fn find(&self, name: &str) -> std::result::Result<Option<usize>, FrameworkError> {
         let mut matches = (0..self.registrations.len()).filter(|&index| {
             let descriptor = &self.registrations[index].descriptor;
             descriptor.instance.as_deref().map_or(descriptor.middleware == name, |instance| instance == name)
@@ -348,22 +368,21 @@ impl Builder {
         match (matches.next(), matches.next()) {
             (None, _) => Ok(None),
             (Some(index), None) => Ok(Some(index)),
-            _ => Err(format!("the middleware name '{name}' matches several registrations, so ordering constraints by name are ambiguous for it")),
+            _ => Err(registration_error(format!(
+                "the middleware name '{name}' matches several registrations, so ordering constraints by name are ambiguous for it"
+            ))),
         }
     }
 
-    /// 解析约束的主体：声明时就必须已登记（排序规则第 7 条），解析不出的错误留到构建或打印时报出，链式调用不中断。
-    fn subject(&self, name: &str) -> std::result::Result<usize, String> {
-        self.find(name)?.ok_or_else(|| format!("the middleware '{name}' is not registered, so no ordering constraint can be declared for it"))
+    /// 解析约束的主体：声明时就必须已登记（排序规则第 7、8 条）。
+    fn subject(&self, name: &str) -> std::result::Result<usize, FrameworkError> {
+        self.find(name)?
+            .ok_or_else(|| registration_error(format!("the middleware '{name}' is not registered, so no ordering constraint can be declared for it")))
     }
 
     /// 解析约束的目标：在排序时按当时的登记解析。
     fn target(&self, name: &str) -> std::result::Result<usize, FrameworkError> {
-        match self.find(name) {
-            Ok(Some(index)) => Ok(index),
-            Ok(None) => Err(registration_error(format!("the ordering constraint references the unregistered middleware '{name}'"))),
-            Err(message) => Err(registration_error(message)),
-        }
+        self.find(name)?.ok_or_else(|| registration_error(format!("the ordering constraint references the unregistered middleware '{name}'")))
     }
 }
 
