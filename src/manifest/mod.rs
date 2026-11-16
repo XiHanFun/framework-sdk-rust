@@ -106,6 +106,13 @@ pub enum Isolation {
     OutOfProcess,
 }
 
+impl Default for Role {
+    /// 缺省的 `provider`。
+    fn default() -> Self {
+        Self::Provider
+    }
+}
+
 impl Kind {
     /// 清单里的名字。
     pub const fn name(self) -> &'static str {
@@ -280,21 +287,25 @@ pub struct Binding {
     /// 资源类型 `^[a-z]+(:[a-z]+)?$`，如 `connection:relational`、`cache:distributed`、`queue`。
     #[serde(rename = "type")]
     pub resource_type: String,
-    /// 是否必需；`None` 即缺省的必需。
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
-    pub required: Option<bool>,
+    /// 是否必需；没写时读成 `true`（与 .NET 的 `Binding.Required` 一样填上缺省值）。
+    #[serde(default = "required_by_default")]
+    pub required: bool,
 }
 
 impl Binding {
-    /// 用绑定名与资源类型创建。
+    /// 用绑定名与资源类型创建，缺省为必需。
     pub fn new(name: impl Into<String>, resource_type: impl Into<String>) -> Self {
-        Self { name: name.into(), resource_type: resource_type.into(), required: None }
+        Self { name: name.into(), resource_type: resource_type.into(), required: true }
     }
 
-    /// 判断绑定是否必需；缺省为必需。
+    /// 判断绑定是否必需。
     pub fn is_required(&self) -> bool {
-        self.required.unwrap_or(true)
+        self.required
     }
+}
+
+fn required_by_default() -> bool {
+    true
 }
 
 /// 贡献的一个中间件（RFC-0004）。
@@ -373,13 +384,13 @@ impl Contributions {
 /// 一份清单；字段顺序与 Schema 和 Go SDK 一致，也是 [`write()`] 的输出顺序。
 ///
 /// 构造只收必需字段（[`Manifest::new`]），可选字段直接赋值；`#[non_exhaustive]` 让以后只加可选字段而不破坏调用方。
+/// 与 .NET 的类型化模型一样，读出时填上缺省值：`role` 为 `provider`，`activation` 为 `["onStartup"]`，绑定的 `required` 为
+/// `true`，`contributes` 为空的贡献点；`$schema` 不保留，写出时总是 [`SCHEMA_URI`]。所以写出的清单再读回来与原来的相等。
+///
+/// 按 Schema 的严格读取是 [`read`]；这里的 `Deserialize` 是给嵌在别的配置里用的，根上的未知成员（含 `$schema`）忽略。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 #[non_exhaustive]
 pub struct Manifest {
-    /// `$schema`。
-    #[serde(rename = "$schema", default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
-    pub schema: Option<String>,
     /// 清单 ID `xihan.<领域>.<名称>`。
     pub id: String,
     /// 所属包 ID。
@@ -394,9 +405,9 @@ pub struct Manifest {
     pub stability: Stability,
     /// 种类。
     pub kind: Kind,
-    /// Provider 角色；`None` 即缺省的 `provider`。
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
-    pub role: Option<Role>,
+    /// Provider 角色；没写时为 [`Role::Provider`]。
+    #[serde(default)]
+    pub role: Role,
     /// 插件隔离级别；插件必须声明，非插件不得声明。
     #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
     pub isolation: Option<Isolation>,
@@ -409,11 +420,11 @@ pub struct Manifest {
     /// 需要宿主注入的资源。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<Binding>,
-    /// 贡献点。
-    #[serde(default, deserialize_with = "present", skip_serializing_if = "Option::is_none")]
-    pub contributes: Option<Contributions>,
-    /// 激活事件；空即没有声明，按缺省的 `onStartup`。读入时写了就至少一项，空数组不合法。
-    #[serde(default, deserialize_with = "non_empty", skip_serializing_if = "Vec::is_empty")]
+    /// 贡献点；没写时为空。
+    #[serde(default)]
+    pub contributes: Contributions,
+    /// 激活事件；没写时为 `["onStartup"]`，写了就至少一项，空数组不合法。
+    #[serde(default = "default_activation", deserialize_with = "non_empty")]
     pub activation: Vec<String>,
     /// 插件所需权限，宿主配置授予。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -427,31 +438,30 @@ impl Manifest {
     /// 用必需字段创建清单；格式由 [`Manifest::validate`] 校验。
     pub fn new(id: impl Into<String>, version: impl Into<String>, primitives: u32, stability: Stability, kind: Kind) -> Self {
         Self {
-            schema: None,
             id: id.into(),
             package: None,
             version: version.into(),
             primitives,
             stability,
             kind,
-            role: None,
+            role: Role::Provider,
             isolation: None,
             provides: Vec::new(),
             requires: Vec::new(),
             bindings: Vec::new(),
-            contributes: None,
-            activation: Vec::new(),
+            contributes: Contributions::default(),
+            activation: default_activation(),
             permissions: Vec::new(),
             entry: None,
         }
     }
 
-    /// 角色，缺省为 [`Role::Provider`]。
+    /// 角色，同 `role`。
     pub fn effective_role(&self) -> Role {
-        self.role.unwrap_or(Role::Provider)
+        self.role
     }
 
-    /// 激活事件，缺省为 `onStartup`。
+    /// 激活事件；程序里清空了的按缺省的 `onStartup`。
     pub fn effective_activation(&self) -> Vec<&str> {
         if self.activation.is_empty() { vec![ACTIVATION_ON_STARTUP] } else { self.activation.iter().map(String::as_str).collect() }
     }
@@ -461,19 +471,19 @@ impl Manifest {
         self.effective_activation().contains(&ACTIVATION_ON_STARTUP)
     }
 
-    /// 贡献的操作 ID；没有贡献时为空。
+    /// 贡献的操作 ID。
     pub fn operations(&self) -> &[String] {
-        self.contributes.as_ref().map_or(&[], |contributes| &contributes.operations)
+        &self.contributes.operations
     }
 
-    /// 贡献的健康项；没有贡献时为空。
+    /// 贡献的健康项。
     pub fn health(&self) -> &[String] {
-        self.contributes.as_ref().map_or(&[], |contributes| &contributes.health)
+        &self.contributes.health
     }
 
     /// 贡献的配置节；没有时为 `None`。
     pub fn config_section(&self) -> Option<&str> {
-        self.contributes.as_ref()?.config.as_ref().map(|config| config.section.as_str())
+        self.contributes.config.as_ref().map(|config| config.section.as_str())
     }
 
     /// 校验字段的格式与跨字段约束；失败为 `PRIMITIVES_VALIDATION_001`（与 .NET 的 `Manifest.Validate` 同码）。
@@ -597,8 +607,7 @@ fn texts(items: &[String]) -> Out<'_> {
 
 /// 按规范的排版写出，不校验。
 fn render(manifest: &Manifest) -> String {
-    let empty = Contributions::default();
-    let contributes = manifest.contributes.as_ref().unwrap_or(&empty);
+    let contributes = &manifest.contributes;
     let mut root = vec![("$schema", Out::Text(SCHEMA_URI)), ("id", Out::Text(&manifest.id))];
     if let Some(package) = &manifest.package {
         root.push(("package", Out::Text(package)));
@@ -608,7 +617,7 @@ fn render(manifest: &Manifest) -> String {
         ("primitives", Out::Number(manifest.primitives)),
         ("stability", Out::Text(manifest.stability.name())),
         ("kind", Out::Text(manifest.kind.name())),
-        ("role", Out::Text(manifest.effective_role().name())),
+        ("role", Out::Text(manifest.role.name())),
     ]);
     if let Some(isolation) = manifest.isolation {
         root.push(("isolation", Out::Text(isolation.name())));
@@ -707,6 +716,11 @@ fn is_false(value: &bool) -> bool {
 /// 可选成员写了就必须有值：缺失表示没有，写成 `null` 不合法（RFC-0002 解析规则 2）。
 fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D) -> Result<Option<T>, D::Error> {
     T::deserialize(deserializer).map(Some)
+}
+
+/// 缺省的激活事件 `["onStartup"]`。
+fn default_activation() -> Vec<String> {
+    vec![ACTIVATION_ON_STARTUP.to_owned()]
 }
 
 /// 写了就至少一项：`activation` 缺失才是缺省的 `onStartup`，空数组不合法（RFC-0002 解析规则 2，ADR-0235）。

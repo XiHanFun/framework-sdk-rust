@@ -11,7 +11,7 @@ use xihan_framework::manifest::{
     MESSAGE_DUPLICATE_PROVIDES, MESSAGE_DUPLICATE_REQUIRES, MESSAGE_EMPTY, MESSAGE_FILE_MISSING, MESSAGE_INVALID, MESSAGE_INVALID_JSON,
     MESSAGE_ISOLATION_NOT_ALLOWED, MESSAGE_ISOLATION_REQUIRED, Manifest, Role,
 };
-use xihan_framework::primitives::{ERROR_CODE_INVALID_ARGUMENT, FrameworkError, PipelineStage, Stability};
+use xihan_framework::primitives::{self, ERROR_CODE_INVALID_ARGUMENT, FrameworkError, PipelineStage, Stability};
 
 const ECHO_MANIFEST: &str = r#"{
   "$schema": "https://spec.xihanfun.com/manifest/v1.json",
@@ -107,9 +107,9 @@ fn read_parses_a_plugin_manifest() {
 
     let written = manifest::write(&m).unwrap();
     assert_eq!(written, ECHO_WRITTEN);
-    // 写出的缺省值再读回来是显式的值，含义相同，再写出逐字相同
+    // 读出时填上了缺省值，写出的清单再读回来与原来的相等
     let again = manifest::read(&written).unwrap();
-    assert_eq!((again.effective_role(), again.effective_activation()), (m.effective_role(), m.effective_activation()));
+    assert_eq!(again, m, "round trip");
     assert_eq!(manifest::write(&again).unwrap(), written);
 }
 
@@ -123,7 +123,14 @@ fn defaults_follow_the_schema() {
     assert_eq!(m.operations(), &[] as &[String]);
     assert_eq!(m.config_section(), None);
 
+    // 读出时与 .NET 的类型化模型一样填上缺省值；程序里创建的清单也是同样的缺省值
     let minimal = Manifest::new("xihan.a.b", "1.0.0", 1, Stability::Stable, Kind::Capability);
+    let read = manifest::read(
+        r#"{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"capability","bindings":[{"name":"db","type":"queue"}]}"#,
+    )
+    .unwrap();
+    assert_eq!((read.role, read.activation.as_slice(), read.bindings[0].required), (Role::Provider, ["onStartup".to_owned()].as_slice(), true));
+    assert_eq!((minimal.role, minimal.activation.as_slice(), &minimal.contributes), (Role::Provider, ["onStartup".to_owned()].as_slice(), &read.contributes));
     assert_eq!(minimal.effective_activation(), ["onStartup"]);
     assert_eq!(
         manifest::write(&minimal).unwrap(),
@@ -161,7 +168,7 @@ fn contributed_permission_codes_follow_the_host_grammar() {
     let template = |codes: &str| minimal(&format!(r#","contributes":{{"permissions":{codes}}}"#));
     for codes in [r#"[]"#, r#"["orders.read"]"#, r#"["sales.orders.read","sales.orders.write"]"#, r#"["echo2.items-v2.read"]"#] {
         let m = manifest::read(template(codes)).unwrap_or_else(|error| panic!("{codes} must be accepted: {error}"));
-        assert!(m.contributes.is_some(), "{codes} read without contributions");
+        assert_eq!(m.contributes.permissions.is_empty(), codes == "[]", "{codes}");
     }
     for (codes, path) in [
         (r#"["orders"]"#, "$.contributes.permissions[0]"),
@@ -299,7 +306,7 @@ fn pipeline_contributions_are_left_to_the_host() {
             r#"{{"id":"xihan.a.b","version":"1.0.0","primitives":"1","stability":"stable","kind":"plugin","isolation":"{isolation}","contributes":{{"pipeline":[{{"middleware":"audit","stage":"observe","before":["x"]}},{{"middleware":"tenant-guard","stage":"tenant"}}]}}}}"#
         );
         let m = manifest::read(&data).unwrap_or_else(|error| panic!("{isolation}: {error}"));
-        let pipeline = &m.contributes.as_ref().unwrap().pipeline;
+        let pipeline = &m.contributes.pipeline;
         assert_eq!((pipeline[0].before.as_slice(), pipeline[1].stage), (["x".to_owned()].as_slice(), PipelineStage::Tenant));
         let written = manifest::write(&m).unwrap();
         assert!(
@@ -458,11 +465,12 @@ impl ManifestCase {
 #[test]
 fn manifests_follow_the_vectors() {
     let vectors: ManifestVectors = common::vector("manifest/manifests.json");
+    let templates = common::kernel_messages();
     for case in &vectors.valid {
         let read = manifest::read(case.source()).unwrap_or_else(|error| panic!("{} must be read: {error}", case.name));
         let written = manifest::write(&read).unwrap();
         assert_eq!(Some(&written), case.written.as_ref(), "{}", case.name);
-        assert_eq!(manifest::write(&manifest::read(&written).unwrap()).unwrap(), written, "{} reads back", case.name);
+        assert_eq!(manifest::read(&written).unwrap(), read, "{} reads back", case.name);
     }
     for case in &vectors.invalid {
         let error = manifest::read(case.source()).expect_err(&case.name);
@@ -470,5 +478,13 @@ fn manifests_follow_the_vectors() {
         assert_eq!(error.code(), expected.code, "{}", case.name);
         let arguments: Vec<(&str, &str)> = expected.arguments.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
         assert_error(&error, &expected.message_key, &arguments, &case.name);
+        // 消息是 kernel-messages.json 的 en-US 模板填入参数，与 .NET 相同（ADR-0236）
+        let template = templates
+            .iter()
+            .find(|message| message.key == expected.message_key)
+            .unwrap_or_else(|| panic!("{} is not in kernel-messages.json", expected.message_key));
+        assert_eq!(template.code, expected.code, "{}", case.name);
+        assert_eq!(error.message(), primitives::format_message(&template.template, error.details().unwrap()), "{}", case.name);
+        assert_eq!(error.to_error().message(), error.message(), "{}", case.name);
     }
 }
