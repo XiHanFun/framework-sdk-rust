@@ -290,6 +290,8 @@ fn panics_become_unexpected_errors() {
     let crashed = common::block_on(invoker.invoke(&ctx, Request::new("orders.crash", r#"{"quantity":-1}"#))).unwrap_err();
     assert_eq!((crashed.code(), crashed.message_key(), crashed.details()), ("KERNEL_UNEXPECTED_001", Some(operation::MESSAGE_UNHANDLED_PANIC), None));
     assert_eq!(crashed.message(), "An unhandled exception occurred during the invocation.");
+    common::assert_kernel_error(&crashed, operation::MESSAGE_UNHANDLED_PANIC);
+    assert!(crashed.inner().is_none(), "an ordinary panic has no inner error");
     assert!(operation::current(&ctx).is_none(), "the scope is restored after a panic");
     let typed = common::block_on(invoker.invoke_typed::<CreateOrder, ()>(&ctx, "orders.crash", CreateOrder { quantity: -1 })).unwrap_err();
     assert_eq!(typed.message_key(), Some(operation::MESSAGE_UNHANDLED_PANIC));
@@ -299,4 +301,27 @@ fn panics_become_unexpected_errors() {
     let invoker = Invoker::new(registry(), &Builder::new().use_at(explode, PipelineStage::Observe, Placement::End, APP_OWNER)).unwrap();
     let crashed = common::block_on(invoker.invoke(&ctx, Request::new("orders.create", r#"{"quantity":1}"#))).unwrap_err();
     assert_eq!(crashed.message_key(), Some(operation::MESSAGE_UNHANDLED_PANIC));
+}
+
+/// panic 来自框架错误（原语的非法参数）时，那个错误放进 inner（RFC-0011 规则 10）。
+#[test]
+fn framework_panics_become_inner_errors() {
+    let registry = Registry::new();
+    registry
+        .add(
+            Contract::new("orders.misuse"),
+            operation::handler_fn(|_ctx, _request: CreateOrder| {
+                Box::pin(async move {
+                    let code = String::from("not-a-code");
+                    Err::<(), _>(Error::new(code, "orders.misuse"))
+                })
+            }),
+        )
+        .unwrap();
+    let invoker = Invoker::new(Arc::new(registry), &Builder::new()).unwrap();
+    let crashed = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.misuse", "{}"))).unwrap_err();
+    common::assert_kernel_error(&crashed, operation::MESSAGE_UNHANDLED_PANIC);
+    let inner = crashed.inner().expect("the framework error is the inner error");
+    assert_eq!((inner.code(), inner.message_key()), (ERROR_CODE_INVALID_ARGUMENT, None));
+    assert!(inner.message().contains("'not-a-code'"), "{}", inner.message());
 }
