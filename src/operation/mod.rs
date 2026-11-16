@@ -41,7 +41,7 @@ use crate::BoxFuture;
 use crate::invocation::{Context, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START};
 use crate::pipeline::{self, APP_OWNER, Middleware, Next, Pipeline, Placement, Step};
 use crate::primitives::json::{self, Node};
-use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, PipelineStage, Result, Stability, is_error_code};
+use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, PipelineStage, Result, Stability};
 
 /// 操作未登记。
 pub const ERROR_CODE_NOT_FOUND: &str = "KERNEL_NOTFOUND_001";
@@ -622,8 +622,8 @@ impl Middleware for ValidationStep {
 }
 
 /// 管道执行中的 panic 转成失败结果（RFC-0011 规则 5、10）：中间件或处理器 panic 时调用以 `KERNEL_UNEXPECTED_001` +
-/// `kernel.invocation.unhandled_exception` 结束、没有参数，不把 panic 抛给调用方；panic 来自框架错误（原语的非法参数等，
-/// 消息是 `<错误码>: <说明>`）时，那个错误放进 `inner`，与 .NET 的 Observe 阶段一致。取消不是 panic，按上下文归因。
+/// `kernel.invocation.unhandled_exception` 结束、没有参数，不把 panic 抛给调用方；panic 的内容是 [`FrameworkError`]（原语的非法参数等）
+/// 时，那个错误放进 `inner`，与 .NET 的 Observe 阶段一致。取消不是 panic，按上下文归因。
 ///
 /// 只在 `panic = "unwind"` 下有效；panic 之后不再轮询内层 future，对象袋的作用域照常由 `Scope` 恢复。
 struct CatchPanic<'a>(BoxFuture<'a, Result<()>>);
@@ -640,13 +640,12 @@ impl Future for CatchPanic<'_> {
     }
 }
 
-/// 把 panic 的内容翻译成未处理失败；内容是框架错误的文本 `<错误码>: <说明>` 时，它成为内部错误。
+/// 把 panic 的内容翻译成未处理失败；内容是 [`FrameworkError`]（`std::panic::panic_any` 抛出，原语的非法参数就是这样）时，
+/// 它转成的错误成为内部错误。按类型认出，不看文本：内容是字符串的 panic 一律没有内部错误。
 fn unhandled(payload: &(dyn Any + Send)) -> Error {
     let error = Error::unexpected(ERROR_CODE_UNEXPECTED, MESSAGE_UNHANDLED_PANIC);
-    let text = payload.downcast_ref::<String>().map(String::as_str).or_else(|| payload.downcast_ref::<&str>().copied());
-    let framework = text.and_then(|text| text.split_once(": ")).filter(|(code, message)| is_error_code(code) && !message.is_empty());
-    match framework {
-        Some((code, message)) => error.with_inner(Error::literal(code, message)),
+    match payload.downcast_ref::<FrameworkError>() {
+        Some(framework) => error.with_inner(framework.to_error()),
         None => error,
     }
 }

@@ -331,6 +331,40 @@ fn framework_panics_become_inner_errors() {
     let inner = crashed.inner().expect("the framework error is the inner error");
     assert_eq!((inner.code(), inner.message_key()), (ERROR_CODE_INVALID_ARGUMENT, None));
     assert!(inner.message().contains("'not-a-code'"), "{}", inner.message());
+
+    // 按 panic 内容的类型认出框架错误，不看文本：看起来像「码: 说明」的字符串 panic 没有内部错误
+    let registry = Registry::new();
+    registry
+        .add(
+            Contract::new("orders.lookalike"),
+            operation::handler_fn::<CreateOrder, (), _>(|_ctx, _request| {
+                Box::pin(async move { panic!("{ERROR_CODE_INVALID_ARGUMENT}: not a framework error") })
+            }),
+        )
+        .unwrap();
+    registry
+        .add(
+            Contract::new("orders.thrown"),
+            operation::handler_fn::<CreateOrder, (), _>(|_ctx, _request| {
+                Box::pin(async move {
+                    std::panic::panic_any(xihan_framework::primitives::FrameworkError::with_message(
+                        "ORDERS_CONFLICT_001",
+                        "orders.duplicate",
+                        [("id".to_owned(), json!("o1"))].into(),
+                    ))
+                })
+            }),
+        )
+        .unwrap();
+    let invoker = Invoker::new(Arc::new(registry), &Builder::new()).unwrap();
+    let lookalike = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.lookalike", "{}"))).unwrap_err();
+    assert!(lookalike.inner().is_none(), "a string panic is not a framework error");
+    let thrown = common::block_on(invoker.invoke(&Context::background(), Request::new("orders.thrown", "{}"))).unwrap_err();
+    let inner = thrown.inner().expect("a FrameworkError payload is the inner error");
+    assert_eq!(
+        (inner.code(), inner.message_key(), inner.details().map(|details| details["id"].clone())),
+        ("ORDERS_CONFLICT_001", Some("orders.duplicate"), Some(json!("o1")))
+    );
 }
 
 /// 记下进入过的中间件名。

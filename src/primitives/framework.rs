@@ -26,7 +26,9 @@ pub const DOCUMENTATION: &str = "https://framework.docs.xihanfun.com";
 /// 配置或编程错误（RFC-0001 FrameworkException）：带错误码，消息是英文、不本地化。
 ///
 /// 可恢复的业务失败用 [`Error`] 与 `Result`，不用它。清单校验、管道排序、操作登记等配置期失败以它返回；
-/// 原语的非法参数（如不合文法的错误码）以它为内容 panic。
+/// 原语的非法参数（如不合文法的错误码）以它本身为 panic 的内容（`std::panic::panic_any`），接住 panic 的一方用
+/// `downcast_ref::<FrameworkError>()` 精确认出它：调用器据此把它放进未处理失败的 `inner`（RFC-0011 规则 10）。
+/// 标准库缺省的 panic hook 只打印字符串内容，对它打印 `Box<dyn Any>`；要看到错误码与说明，装自己的 hook 或接住后 downcast。
 ///
 /// 有登记消息键的配置期错误（如 `KERNEL_OPERATION_001` + `kernel.operation.duplicate`，RFC-0011「错误码」）以
 /// [`FrameworkError::with_message`] 创建，带上键与参数，说明取 SDK 自带的 en-US 模板，转成 [`Error`] 时一并带上。
@@ -112,8 +114,8 @@ impl StdError for FrameworkError {
     }
 }
 
-/// 以原语层的非法参数错误 panic：编程错误，消息是英文句子。
+/// 以原语层的非法参数错误 panic：编程错误，消息是英文句子，panic 的内容就是这个 [`FrameworkError`]。
 #[track_caller]
 pub(crate) fn invalid_argument(message: String) -> ! {
-    panic!("{}", FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, message))
+    std::panic::panic_any(FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, message))
 }

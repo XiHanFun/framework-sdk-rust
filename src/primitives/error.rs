@@ -34,11 +34,14 @@ impl Error {
     ///
     /// # Panics
     ///
-    /// 错误码不合 `<DOMAIN>_<KIND>_<NNN>` 或消息键不合文法时 panic（编程错误，内容是 `PRIMITIVES_VALIDATION_001`）；
+    /// 错误码不合 `<DOMAIN>_<KIND>_<NNN>` 或消息键不合文法时 panic（编程错误，内容是 `PRIMITIVES_VALIDATION_001` 的 [`FrameworkError`]）；
     /// 来自不可信输入的码与键用 [`Error::try_new`]。
     #[track_caller]
     pub fn new(code: impl Into<String>, message_key: impl Into<String>) -> Self {
-        Self::try_new(code, message_key).unwrap_or_else(|error| panic!("{error}"))
+        match Self::try_new(code, message_key) {
+            Ok(error) => error,
+            Err(error) => std::panic::panic_any(error),
+        }
     }
 
     /// 用错误码与消息键创建错误；码或键不合法时返回 `PRIMITIVES_VALIDATION_001`。
@@ -61,7 +64,10 @@ impl Error {
     /// 错误码不合文法或文案为空时 panic；来自不可信输入时用 [`Error::try_literal`]。
     #[track_caller]
     pub fn literal(code: impl Into<String>, text: impl Into<String>) -> Self {
-        Self::try_literal(code, text).unwrap_or_else(|error| panic!("{error}"))
+        match Self::try_literal(code, text) {
+            Ok(error) => error,
+            Err(error) => std::panic::panic_any(error),
+        }
     }
 
     /// 用已解析的文案创建错误；码不合法或文案为空时返回 `PRIMITIVES_VALIDATION_001`。
@@ -163,7 +169,7 @@ impl Error {
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         let code = code.into();
         if let Err(error) = validate_error_code(&code) {
-            panic!("{error}");
+            std::panic::panic_any(error);
         }
         self.code = code;
         self

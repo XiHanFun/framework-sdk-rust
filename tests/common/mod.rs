@@ -40,9 +40,12 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// 运行闭包并取出 panic 的消息；没有 panic 时测试失败。
+/// 运行闭包并取出 panic 的消息；没有 panic 时测试失败。SDK 的编程错误以 FrameworkError 为内容，取它的文本。
 pub fn panic_message(action: impl FnOnce() + std::panic::UnwindSafe) -> String {
     let payload = std::panic::catch_unwind(action).expect_err("the action must panic");
+    if let Some(error) = payload.downcast_ref::<xihan_framework::primitives::FrameworkError>() {
+        return error.to_string();
+    }
     if let Some(text) = payload.downcast_ref::<String>() {
         return text.clone();
     }
