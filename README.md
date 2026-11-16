@@ -121,7 +121,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 ## 状态
 
-`0.1`：原语、清单、调用上下文、管道与操作可用，通过规范仓库 `conformance/vectors/primitives/` 的全部向量（尚未发布到 crates.io，那里是名字占位的 0.0.1）。规划中：
+`0.1`：原语、清单、调用上下文、管道与操作可用，通过规范仓库 `conformance/vectors/` 下 primitives、manifest、pipeline、operations 的全部向量（尚未发布到 crates.io，那里是名字占位的 0.0.1）。规划中：
 
 - 进程外插件运行时 `plugin`（`xihan.plugin.v1`，基于 tonic，以 cargo feature 启用；unix 套接字 / Windows 命名管道 / tcp 回环），用规范仓库的黑盒运行器 `xihan-conformance plugin --dir <产物目录>` 验证；
 - Wasm 插件 ABI（RFC-0018，`xihan_*` 导出、`xihan` 导入，WASI preview 1 reactor），样板在 XiHan.Framework 的 `samples/EchoWasmPlugin`；
