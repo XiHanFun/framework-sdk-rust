@@ -727,6 +727,9 @@ impl Invoker {
     /// 排在 Observe 阶段内置步骤之后的 panic 成为 `KERNEL_UNEXPECTED_001`，之前的原样交给调用方。中间件以成功短路、没有执行操作时返回 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response`（规则 9）；载荷不合法时 `reason` 是出错位置的 JSON 路径（如 `$.quantity`）。
     ///
     /// 载荷先过共同的 JSON 读取检查，再按请求类型的 `Deserialize` 解码；必填、可选与接受 `null` 的成员怎么声明见 [`nullable`]。
+    ///
+    /// 取消与截止时间只经上下文的令牌通知（RFC-0003 规则 1）：调用器与内置步骤不中止中间件或处理器，不丢弃它们的 future；令牌触发之后
+    /// 处理器照常返回结果的，调用以那个结果结束，处理器把取消写成结果（如 `Err(ctx.cancellation()?)`）时按触发的令牌归因。
     // 返回类型写明 Send：签名即承诺 future 可以跨线程（gRPC 服务端要求），实现改动不会悄悄破坏这一点
     #[allow(clippy::manual_async_fn)]
     pub fn invoke<'a>(&'a self, ctx: &'a Context, request: Request) -> impl Future<Output = Result<Vec<u8>>> + Send + 'a {

@@ -641,3 +641,69 @@ fn payload_reasons_follow_the_vectors() {
         }
     }
 }
+
+/// 取消与截止时间只经令牌通知（RFC-0003 规则 1，ADR-0236）：调用器与内置步骤不中止处理器、不丢弃它的 future；令牌触发后处理器照常
+/// 返回结果的，调用以那个结果结束，只有处理器把取消写成结果时才按令牌归因。
+#[test]
+fn cancellation_only_notifies_through_the_token() {
+    let registry = Registry::new();
+    registry
+        .add(
+            Contract::new("waits.finish"),
+            operation::handler_fn(|ctx: &Context, _request: CreateOrder| {
+                Box::pin(async move {
+                    ctx.done().await;
+                    Ok(format!("finished after {}", if ctx.is_cancelled() { "the token fired" } else { "nothing" }))
+                })
+            }),
+        )
+        .unwrap();
+    registry
+        .add(
+            Contract::new("waits.report"),
+            operation::handler_fn(|ctx: &Context, _request: CreateOrder| {
+                Box::pin(async move {
+                    ctx.done().await;
+                    Err::<(), _>(ctx.cancellation().expect("the token fired"))
+                })
+            }),
+        )
+        .unwrap();
+    // 下游之后照常做事的中间件：令牌触发也不打断它
+    let after = Arc::new(Mutex::new(0));
+    let counting = {
+        let after = Arc::clone(&after);
+        pipeline::from_fn("Counting", move |ctx, next| {
+            let after = Arc::clone(&after);
+            Box::pin(async move {
+                let outcome = next.run(ctx).await;
+                *after.lock().unwrap() += 1;
+                outcome
+            })
+        })
+    };
+    let mut builder = Builder::new();
+    builder.use_middleware(counting).unwrap();
+    let invoker = Invoker::new(Arc::new(registry), &builder).unwrap();
+    let timeout = std::time::Duration::from_millis(20);
+
+    let timed = Context::builder().timeout(timeout).build();
+    let finished = common::block_on(invoker.invoke(&timed, Request::new("waits.finish", "{}"))).unwrap();
+    assert_eq!(finished, br#""finished after the token fired""#, "the deadline does not abort the handler");
+    let reported = common::block_on(invoker.invoke(&Context::builder().timeout(timeout).build(), Request::new("waits.report", "{}"))).unwrap_err();
+    common::assert_kernel_error(&reported, xihan_framework::invocation::MESSAGE_DEADLINE_EXCEEDED);
+
+    let token = xihan_framework::invocation::CancellationToken::new();
+    let cancelled = Context::builder().cancellation(&token).build();
+    let canceller = {
+        let token = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            token.cancel();
+        })
+    };
+    let typed = common::block_on(invoker.invoke_typed::<CreateOrder, String>(&cancelled, "waits.finish", CreateOrder::default())).unwrap();
+    assert_eq!(typed, "finished after the token fired", "a caller's cancellation does not abort the handler either");
+    canceller.join().unwrap();
+    assert_eq!(*after.lock().unwrap(), 3, "the middleware ran to the end every time");
+}
