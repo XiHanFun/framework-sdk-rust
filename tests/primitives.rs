@@ -294,9 +294,9 @@ struct ErrorCase {
     canonical: Option<serde_json::Value>,
 }
 
-/// 从线上文本读入再写出，返回写出的 JSON 值；读不出时返回错误文本。
+/// 从线上文本读入（先过共同的 JSON 读取检查）再写出，返回写出的 JSON 值；读不出时返回错误文本。
 fn round_trip<T: serde::de::DeserializeOwned + serde::Serialize>(json: &serde_json::Value) -> std::result::Result<serde_json::Value, String> {
-    let decoded: T = serde_json::from_str(&json.to_string()).map_err(|error| error.to_string())?;
+    let decoded: T = json::from_str(&json.to_string()).map_err(|error| error.to_string())?;
     Ok(serde_json::to_value(&decoded).unwrap())
 }
 
@@ -327,17 +327,30 @@ fn wire_encoding_follows_the_vectors() {
     for case in &vectors.errors.invalid {
         assert!(round_trip::<Error>(&case.json).is_err(), "{} must be rejected", case.name);
     }
-    // 同一层的重复成员不合法（RFC-0001「Result」，ADR-0235）；JSON 值表达不了，按原文读入
+    // 任何一层的重复成员都不合法，含值、细节与内部错误里面（RFC-0001「Result」，ADR-0235、ADR-0236）；JSON 值表达不了，按原文读入
     for case in &vectors.duplicates {
         let rejected = match (case.target.as_str(), case.kind.as_deref()) {
-            ("result", Some("value")) => serde_json::from_str::<WireResult<serde_json::Value>>(&case.text).is_err(),
-            ("result", Some("unit")) => serde_json::from_str::<WireResult<()>>(&case.text).is_err(),
-            ("result", Some("maybe")) => serde_json::from_str::<WireResult<Option<serde_json::Value>>>(&case.text).is_err(),
-            ("error", None) => serde_json::from_str::<Error>(&case.text).is_err(),
+            ("result", Some("value")) => json::from_str::<WireResult<serde_json::Value>>(&case.text).is_err(),
+            ("result", Some("unit")) => json::from_str::<WireResult<()>>(&case.text).is_err(),
+            ("result", Some("maybe")) => json::from_str::<WireResult<Option<serde_json::Value>>>(&case.text).is_err(),
+            ("error", None) => json::from_str::<Error>(&case.text).is_err(),
             other => panic!("unknown duplicate case {other:?}"),
         };
         assert!(rejected, "{} must be rejected", case.name);
     }
+}
+
+/// 值按模型读写（RFC-0001「Result」，ADR-0236）：非有限的浮点写成字符串，单精度换成双精度，-0 读成整数 0，整数值的浮点仍是浮点。
+#[test]
+fn wire_values_follow_the_value_model() {
+    let text = serde_json::to_string(&WireResult::<Vec<f64>>(Ok(vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY, 2.0, -0.0]))).unwrap();
+    assert_eq!(text, r#"{"ok":true,"value":["NaN","Infinity","-Infinity",2.0,-0.0]}"#);
+    assert_eq!(serde_json::to_string(&WireResult::<f32>(Ok(0.1))).unwrap(), r#"{"ok":true,"value":0.10000000149011612}"#);
+    let read: WireResult<serde_json::Value> = json::from_str(r#"{"ok":true,"value":[9007199254740993,-0,2.0,1e17]}"#).unwrap();
+    assert_eq!(serde_json::to_string(&read).unwrap(), r#"{"ok":true,"value":[9007199254740993,0,2.0,1e+17]}"#);
+    assert_eq!(json::to_value(&[f64::NAN]).unwrap(), json!(["NaN"]));
+    // 对象位置只收对象：Error 写成数组即不合法
+    assert!(json::from_str::<Error>(r#"["KERNEL_UNEXPECTED_001","x"]"#).is_err());
 }
 
 #[test]

@@ -8,6 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::error::Error;
 use super::error_code::ERROR_CODE_INVALID_ARGUMENT;
+use super::json::Model;
 
 /// 成功或失败（RFC-0001 Result / Result&lt;T&gt;）：成功带值，失败带 [`Error`]。
 ///
@@ -28,6 +29,10 @@ pub type Maybe<T> = Option<T>;
 /// - 有值成功的 `value` 必填；值类型是 `Maybe`（`Option`）时无值写 `null`，其他类型的 `value` 不能是 `null`。
 /// - 失败的 `error` 必填且不能是 `null`；失败不能带 `value`，成功不能带 `error`。
 /// - 只收 JSON 对象；未知成员忽略。
+/// - 任何一层都不能有重复成员，含 `value` 与错误细节的内部：读线上文本用 [`json::from_slice`](super::json::from_slice)，它先过共同的读取检查。
+///   直接交给 `serde_json` 时只查得出同一层的重复，值里面的重复取最后一个。
+/// - 数字按值模型往返（RFC-0010「模板」）：64 位范围内的整数原样，整数值的浮点写出时仍是浮点（`2.0`、`-0.0`、`1e17`）；
+///   值经 [`json::Model`](super::json::Model) 写出，单精度先换成双精度，非有限的浮点写成字符串 `NaN`、`Infinity`、`-Infinity`。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WireResult<T>(pub Result<T>);
 
@@ -66,7 +71,8 @@ where
         Ok(value) => {
             map.serialize_entry("ok", &true)?;
             if !is_unit::<T>() {
-                map.serialize_entry("value", value)?;
+                // 按值模型写出：非有限的浮点写成字符串，serde_json 自己会写成 null
+                map.serialize_entry("value", &Model(value))?;
             }
         }
         Err(error) => {
