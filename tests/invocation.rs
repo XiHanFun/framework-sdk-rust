@@ -1,4 +1,4 @@
-//! 调用上下文：Go SDK `invocation` 测试的移植，以及截止时间与取消的归因（RFC-0003 规则 1、RFC-0004）。
+//! 调用上下文（RFC-0003）：回放向量 `primitives/trace-context.json` 与 Baggage 值的向量，以及截止时间与取消的归因（规则 1、RFC-0004）。
 
 mod common;
 

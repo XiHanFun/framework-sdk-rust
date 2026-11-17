@@ -381,7 +381,7 @@ impl Contributions {
     }
 }
 
-/// 一份清单；字段顺序与 Schema 和 Go SDK 一致，也是 [`write()`] 的输出顺序。
+/// 一份清单；字段按 RFC-0002「写出」的成员顺序排列，也是 [`write()`] 的输出顺序。
 ///
 /// 构造只收必需字段（[`Manifest::new`]），可选字段直接赋值；`#[non_exhaustive]` 让以后只加可选字段而不破坏调用方。
 /// 与 .NET 的类型化模型一样，读出时填上缺省值：`role` 为 `provider`，`activation` 为 `["onStartup"]`，绑定的 `required` 为

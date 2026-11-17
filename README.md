@@ -22,7 +22,7 @@
 
 </div>
 
-XiHan Framework SDK for Rust is the Rust implementation of [XiHan Spec](https://github.com/XiHanFun/framework-spec), providing the primitives layer, manifests, the invocation context, the pipeline and operation contracts, with semantics and wire encoding that match the .NET reference implementation ([XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework)) and the Go SDK ([framework-sdk-go](https://github.com/XiHanFun/framework-sdk-go)). The spec sits in `spec/` as a submodule, and conformance is verified by the spec repository's vectors: the tests read `spec/conformance/vectors/` directly instead of copying the vector files.
+XiHan Framework SDK for Rust is the Rust implementation of [XiHan Spec](https://github.com/XiHanFun/framework-spec), providing the primitives layer, manifests, the invocation context, the pipeline and operation contracts, with semantics and wire encoding defined by the spec's RFCs; the .NET reference implementation is [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework). The spec sits in `spec/` as a submodule, and conformance is verified by the spec repository's vectors: the tests read `spec/conformance/vectors/` directly instead of copying the vector files.
 
 ## Modules
 

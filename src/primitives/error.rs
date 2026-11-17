@@ -245,7 +245,8 @@ impl StdError for Error {
     }
 }
 
-/// 线上编码的写出形态，字段顺序与 Go、.NET 一致。
+/// 线上编码的写出形态（RFC-0001「Result」）：成员按 `code`、`message`、`messageKey`、`details`、`inner` 写出；顺序不是契约，
+/// 向量 `wire-encoding.json` 按 JSON 值比较。
 #[derive(Serialize)]
 struct ErrorOut<'a> {
     code: &'a str,

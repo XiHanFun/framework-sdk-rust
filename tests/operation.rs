@@ -1,4 +1,5 @@
-//! 操作：Go SDK `operation` 测试的移植，以及容量、短路、嵌套调用与 `'static` 调用。
+//! 操作（RFC-0011）：回放向量 `operations/payload-reasons.json` 与 `primitives/kernel-messages.json`，以及登记、调用器、内置步骤、
+//! 容量、短路、嵌套调用与 `'static` 调用。
 
 mod common;
 

@@ -1,4 +1,4 @@
-//! 管道：Go SDK `pipeline` 测试的移植、ordering.json 的回放，以及按名字的约束、多次进入下游与派生上下文。
+//! 管道（RFC-0004）：回放向量 `pipeline/ordering.json`，以及排序规则、按名字的约束、多次进入下游与派生上下文。
 
 mod common;
 

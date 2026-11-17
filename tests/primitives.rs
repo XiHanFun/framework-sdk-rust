@@ -1,4 +1,4 @@
-//! 原语层：一致性向量与 Go SDK `primitives` 测试的移植。
+//! 原语层（RFC-0001、RFC-0010）：回放 `primitives/` 下的一致性向量，以及错误、结果、标识、Baggage 与消息原语的单元测试。
 
 mod common;
 

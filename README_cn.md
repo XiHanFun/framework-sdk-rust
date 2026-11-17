@@ -22,7 +22,7 @@
 
 </div>
 
-XiHan Framework SDK for Rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 的 Rust 实现，提供原语层、清单、调用上下文、管道与操作契约，语义与线上编码和 .NET 参考实现（[XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework)）及 Go SDK（[framework-sdk-go](https://github.com/XiHanFun/framework-sdk-go)）一致。规范以 submodule 放在 `spec/`，一致性由规范仓库的向量验证：测试直接读取 `spec/conformance/vectors/`，不复制向量文件。
+XiHan Framework SDK for Rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 的 Rust 实现，提供原语层、清单、调用上下文、管道与操作契约，语义与线上编码按规范的 RFC；.NET 参考实现是 [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework)。规范以 submodule 放在 `spec/`，一致性由规范仓库的向量验证：测试直接读取 `spec/conformance/vectors/`，不复制向量文件。
 
 ## 模块
 

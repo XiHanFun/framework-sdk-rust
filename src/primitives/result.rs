@@ -18,7 +18,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// 可能没有的值（RFC-0001 Maybe&lt;T&gt;）：就是标准库的 `Option`。
 ///
-/// 线上编码与 serde 对 `Option` 的处理相同：有值为值本身，无值为 `null`；`ok_or(error)` 即 Go 的 `ToResult`。
+/// 线上编码与 serde 对 `Option` 的处理相同：有值为值本身，无值为 `null`；RFC-0001 的 `Maybe<T>.ToResult(error)` 就是 `ok_or(error)`。
 pub type Maybe<T> = Option<T>;
 
 /// [`Result`] 的线上编码包装：`{"ok":true,"value":…}` 或 `{"ok":false,"error":{…}}`。

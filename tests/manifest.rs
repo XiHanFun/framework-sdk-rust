@@ -1,4 +1,5 @@
-//! 清单：一致性向量与 Go SDK `manifest` 测试的移植。
+//! 清单（RFC-0002）：回放向量 `manifest/manifests.json` 与 `primitives/capability-requirements.json`，以及读取的检查顺序、
+//! 跨字段约束、写出与再读。
 
 mod common;
 

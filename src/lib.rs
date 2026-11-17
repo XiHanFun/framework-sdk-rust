@@ -1,8 +1,7 @@
 //! XiHan Framework SDK for Rust：[XiHan Framework Spec](https://github.com/XiHanFun/framework-spec) 的 Rust 实现。
 //!
-//! 本 crate 提供原语层、清单、调用上下文、管道与操作契约，语义与线上编码和 .NET 参考实现
-//! （[XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework)）及 Go SDK
-//! （[framework-sdk-go](https://github.com/XiHanFun/framework-sdk-go)）一致，由规范仓库的一致性向量验证。
+//! 本 crate 提供原语层、清单、调用上下文、管道与操作契约，语义与线上编码按规范的 RFC，由规范仓库的一致性向量验证；
+//! .NET 参考实现是 [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework)。
 //!
 //! 中间件、处理器与调用器都是异步的，返回与运行时无关的 future（[`BoxFuture`]），可以在任何执行器里运行。
 
