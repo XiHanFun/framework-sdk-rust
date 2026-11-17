@@ -155,7 +155,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 - Wasm 插件 ABI（RFC-0018，`xihan_*` 导出、`xihan` 导入，WASI preview 1 reactor），样板在 XiHan.Framework 的 `samples/EchoWasmPlugin`；
 - 远程 Provider 的操作集（RFC-0019，首个是 `caching.distributed@1`）与示例插件。
 
-拆成多个 crate 时用 `xihan-framework-<模块>` 前缀；领域词与规范术语表（`conventions/vocabulary.md`）一致，只换本语言的大小写风格。公开契约的变更不在 SDK 仓库里做：走 framework-spec 的 RFC 流程，再同步到各 SDK。
+整个 SDK 是一个 crate `xihan-framework`，各语言的 SDK 都只有一个包；领域词与规范术语表（`conventions/vocabulary.md`）一致，只换本语言的大小写风格。公开契约的变更不在 SDK 仓库里做：走 framework-spec 的 RFC 流程，再同步到各 SDK。
 
 ## 许可
 
