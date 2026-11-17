@@ -1,0 +1,18 @@
+[package]
+name = "xihan-protogen"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Regenerates the protocol code of the plugin runtime from spec/plugin/plugin.proto (development only)."
+license = "MIT"
+
+# 只在开发时运行的生成器：版本钉死，同一份 .proto 总是生成同一份代码；CI 重新生成并核对与提交的一致
+[dependencies]
+# 生成的代码要能在 tonic 0.14.5（rust-version 1.85 能用的最新版）上编译，所以用同一版本的生成器
+tonic-prost-build = { version = "=0.14.5", default-features = false }
+prost-build = "=0.14.6"
+# 纯 Rust 的 .proto 编译器：不要求本机装 protoc
+protox = "=0.9.1"
+
+# 独立的工作区：不并入根目录的 crate，也不进它的包
+[workspace]

@@ -2,9 +2,9 @@
 name = "xihan-framework"
 version = "0.1.0"
 edition = "2024"
-# edition 2024 需要 1.85；clippy 的 incompatible_msrv 按这里核对标准库 API
+# edition 2024 需要 1.85；clippy 的 incompatible_msrv 按这里核对标准库 API，依赖也按它解析到兼容的版本
 rust-version = "1.85"
-description = "XiHan Framework SDK for Rust: primitives, manifest, invocation context, pipeline and operations."
+description = "XiHan Framework SDK for Rust: primitives, manifest, invocation context, pipeline, operations and the out-of-process plugin runtime."
 license = "MIT"
 repository = "https://github.com/XiHanFun/framework-sdk-rust"
 homepage = "https://framework.xihanfun.com"
@@ -12,8 +12,12 @@ documentation = "https://docs.rs/xihan-framework"
 readme = "README.md"
 keywords = ["xihan", "framework", "plugin", "pipeline"]
 categories = ["development-tools"]
-# 规范 submodule 与读取它的一致性测试不进 crate 包
-exclude = [".github/", ".gitattributes", ".gitignore", ".gitmodules", ".editorconfig", "/spec", "/tests"]
+# 规范 submodule、读取它的一致性测试与开发时的生成器不进 crate 包
+exclude = [".github/", ".gitattributes", ".gitignore", ".gitmodules", ".editorconfig", "/spec", "/tests", "/tools"]
+
+[features]
+# 进程外插件运行时（RFC-0017，模块 plugin）；gRPC、protobuf 与异步运行时只在打开它时进依赖
+plugin = ["dep:tonic", "dep:tonic-prost", "dep:prost", "dep:tokio", "dep:tokio-stream", "dep:hyper-util"]
 
 [dependencies]
 # JSON 编码（Result / Error 线上形态、XGI 载荷）与清单读取；raw_value 让任意 JSON 的成员（json::Json）照原文写回
@@ -21,8 +25,38 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # 载荷不合法时报出错位置的 JSON 路径（RFC-0011 规则 2：reason 只写路径）
 serde_path_to_error = "0.1"
-# 追踪 ID 与 Span ID 的随机数
+# 追踪 ID、Span ID 与插件端点名的随机数
 getrandom = "0.3"
+
+# 以下只给插件运行时（feature plugin）用。tonic 与 tonic-prost 从 0.14.6 起要 Rust 1.88，按 rust-version 解析到 0.14.5；
+# src/plugin/generated 由同一版本的生成器生成（tools/protogen）
+# gRPC 服务端（Plugin 服务）与客户端（Host 回调）；codegen 是生成代码要的 async-trait
+tonic = { version = "0.14.5", default-features = false, features = ["codegen", "server", "channel"], optional = true }
+# 生成代码的 protobuf 编解码
+tonic-prost = { version = "0.14.5", optional = true }
+prost = { version = "0.14.6", optional = true }
+# 异步运行时：监听端点、在途调用、健康推送、停止宽限与 SIGTERM；不要求多线程运行时，由插件作者选
+tokio = { version = "1.54.1", features = ["rt", "net", "time", "sync", "macros", "io-util", "signal"], optional = true }
+# 健康推送与端点连接的流
+tokio-stream = { version = "0.1.19", optional = true }
+# 回调宿主时自建连接（Unix 域套接字、命名管道、回环 TCP）要的 IO 适配
+hyper-util = { version = "0.1.21", features = ["tokio"], optional = true }
+
+[[example]]
+name = "echo"
+path = "examples/echo/main.rs"
+required-features = ["plugin"]
+
+[[test]]
+name = "plugin"
+required-features = ["plugin"]
+
+[[test]]
+name = "plugin_conformance"
+required-features = ["plugin"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lints.rust]
 unsafe_code = "forbid"

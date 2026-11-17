@@ -22,7 +22,7 @@
 
 </div>
 
-XiHan Framework SDK for Rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 的 Rust 实现，提供原语层、清单、调用上下文、管道与操作契约，语义与线上编码按规范的 RFC；.NET 参考实现是 [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework)。规范以 submodule 放在 `spec/`，一致性由规范仓库的向量验证：测试直接读取 `spec/conformance/vectors/`，不复制向量文件。
+XiHan Framework SDK for Rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 的 Rust 实现，提供原语层、清单、调用上下文、管道与操作契约，以及进程外插件运行时（cargo feature `plugin`），语义与线上编码按规范的 RFC；.NET 参考实现是 [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework)。规范以 submodule 放在 `spec/`，一致性由规范仓库的向量验证：测试直接读取 `spec/conformance/vectors/`，不复制向量文件。
 
 ## 模块
 
@@ -35,6 +35,9 @@ XiHan Framework SDK for Rust 是 [XiHan Spec](https://github.com/XiHanFun/framew
 | `invocation` | `Context`：可等待、父子传播的 `CancellationToken`，后台定时器触发的截止时间，W3C 追踪（`traceparent` 只认版本 `00` 与小写十六进制，不合法的当作没有给出；采样只看最低位，写出 `00` 或 `01`，没有上游时写 `01`）、已登记的 Baggage（已登记键的值非空、按 UTF-16 码元最多 256、不含控制字符，幂等键除外：构建上下文时按外部输入丢弃不合的成员、保留原值，`with_baggage` 给出不合的值即 panic）、按类型存取的对象袋；超时与取消只按截止令牌归因为 `KERNEL_TIMEOUT_001` / `KERNEL_CANCELLED_001` | RFC-0003 |
 | `pipeline` | 十一阶段的 `Builder`：`use_middleware` / `use_at` / `use_named_instance`、`before` / `after`（按名字登记的实例用实例名，其余用中间件名；约束的主体在声明时必须已登记）、`describe` / `dump` / `build`；排序规则、错误码 `KERNEL_PIPELINE_00x` 与错误消息的英文原文（向量 `pipeline/ordering.json`，按名字登记的实例写成 `中间件名[实例名]`）：登记方法以 `&mut self` 返回 `Result`，重复登记、约束主体未登记在登记时即报，约束目标未登记、跨阶段与成环在排序时报；中间件与终点都是异步的 | RFC-0004 |
 | `operation` | `Contract`、`Schema`、异步 `Handler<Req, Res>`、容量 10000 的 `Registry`、经完整管道执行的 `Invoker`（XGI：JSON 请求与响应；另有不经 JSON 的类型化入口）；管道里带三个内置步骤，位置与 .NET 的内置中间件相同；内核错误的码、键、参数与 en-US 模板同向量 `kernel-messages.json`（`type_mismatch` 只带 `id`）；载荷先过共同的 JSON 读取检查，按文本顺序报第一处问题，`reason` 是 JSON 路径（向量 `operations/payload-reasons.json`）；任意 JSON 的成员用 `json::Json` 原样保留数字；响应在管道结束之后才编码，写不出时报 `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception`；中间件以成功短路而没有响应时报 `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response` | RFC-0011 |
+| `plugin`（feature `plugin`） | 进程外插件运行时：`Plugin` 读清单与宿主下发的环境变量、监听本机端点、向 stdout 写握手行，以 gRPC 服务端提供 `xihan.plugin.v1` 的 `Plugin` 服务（握手、配置、启停、健康与健康推送、调用、事件投递），每个 RPC 先按常数时间核对会话令牌；生命周期状态机用 `LifecycleState`；`Invoke` 经 `operation::Invoker` 与完整管道执行，上下文从 `InvocationMetadata` 还原；`Host` 回调 `Host.Invoke` 与 `Host.Publish`，只带宿主交给插件的租户；`Logger` 往 stderr 写 JSON 行日志；`plugin::v1` 是 `plugin.proto` 的生成代码；向量 `plugin/handshake-lines.json`、`plugin/protocol-versions.json` | RFC-0017、`plugin/handshake.md`、`plugin/lifecycle.md`、`plugin/invocation.md`、`plugin/plugin.proto` |
+
+`plugin` 模块是可选的：`cargo add xihan-framework --features plugin`。它带来 tonic、prost 与 tokio，不打开这个 feature 时这些依赖都不进来，其余模块也不依赖任何异步运行时。
 
 ## 快速开始
 
@@ -103,6 +106,74 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 3. 编程错误（不合文法的错误码、消息键或 Baggage 键）panic，各函数的文档写明 panic 条件；panic 的内容是 `FrameworkError` 本身（`std::panic::panic_any`），不是字符串，接住后用 `downcast_ref::<FrameworkError>()` 取出；标准库缺省的 panic hook 对它只打印 `Box<dyn Any>`，要看到码与说明就装自己的 hook。来自不可信输入的值先用 `is_error_code`、`is_baggage_key_well_formed` 判断，或用 `Error::try_new`。清单校验、管道排序、操作登记等配置期失败返回 `FrameworkError`。
 4. `Context` 的截止时间由进程里一个后台线程（`xihan-deadline-timer`，第一次登记截止时间时启动）按时触发；`Context::done()` 在调用方取消或到达截止时间时完成，`Context::cancellation()` 给出 `KERNEL_TIMEOUT_001`（`kernel.invocation.deadline_exceeded`）或 `KERNEL_CANCELLED_001`（`kernel.invocation.cancelled`）。调用器的管道里有三个内置步骤，都按归属 `xihan.kernel.core`（`operation::KERNEL_OWNER`）放在所在阶段的 `Beginning`，与同位置的中间件按 RFC-0004 排序：Observe 阶段的 `ObserveMiddleware` 把排在它之后的中间件与处理器的 panic 翻译成 `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception`（内容是 `FrameworkError` 时它进 `inner`），排在它之前的 panic 原样交给调用方；Resilience 阶段的 `DeadlineMiddleware` 在进入时按时钟核对截止时间，已到即报 `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_before_start`，后面的中间件与处理器不执行（Ingress 与 Observe 阶段照常执行）；Validate 阶段的 `ValidationMiddleware` 解码原始调用的载荷，类型化调用跳过。进管道前只核对未登记与类型化调用的类型不符，按这个顺序。panic 的翻译要 `panic = "unwind"`。XGI 入口在管道结束之后才把响应编码成载荷，中间件经 `operation::with_response` 看到的是编码之前的对象（类型化调用的响应同样写进这个位置，与 .NET 的 `FindOperationResponse` 一样，只是不编码）；写不出（类型化的浮点是 NaN 或无穷、序列化不支持的值、序列化时 panic）时调用以 `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception` 结束，不抛给调用方。取消与截止时间只经令牌通知：调用器与内置步骤不中止处理器、不丢弃它的 future，令牌触发之后处理器照常返回的结果就是调用的结果，处理器把取消写成结果（`Err(ctx.cancellation()…)`）时才按令牌归因。
 
+### 写一个插件
+
+```bash
+cargo add xihan-framework --features plugin
+cargo add tokio --features macros,rt
+cargo add serde --features derive
+```
+
+```rust,ignore
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use xihan_framework::operation::{self, Contract, Registry};
+use xihan_framework::plugin::{MANIFEST_FILE_NAME, Plugin};
+
+#[derive(Deserialize)]
+struct Ping {
+    text: String,
+}
+
+#[derive(Serialize)]
+struct Pong {
+    text: String,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = Arc::new(Registry::new());
+    registry.add(
+        Contract::new("pings.create"),
+        operation::handler_fn(|_ctx, ping: Ping| Box::pin(async move { Ok(Pong { text: ping.text }) })),
+    )?;
+    // 握手交给宿主的清单必须与插件目录里的文件一致：工作目录就是插件目录，直接读它
+    Plugin::from_manifest_file(MANIFEST_FILE_NAME)?.with_operations(registry).serve().await?;
+    Ok(())
+}
+```
+
+插件目录里放可执行文件与清单 `xihan.manifest.json`：
+
+```json
+{
+  "id": "xihan.samples.ping",
+  "version": "1.0.0",
+  "primitives": "1",
+  "stability": "experimental",
+  "kind": "plugin",
+  "isolation": "out-of-process",
+  "contributes": { "operations": [ "pings.create" ] },
+  "entry": "ping"
+}
+```
+
+上面的示例要打开 feature `plugin`，而 README 的示例在不带 feature 的测试里也会编译，所以标为 `ignore`；同一段代码是 `plugin` 模块文档的示例，在 `--features plugin` 下编译。完整的示例是 `examples/echo`（操作、事件订阅、健康项、配置与宿主回调）。
+
+1. 清单：`kind` 为 `plugin`、`isolation` 为 `out-of-process`，`entry` 是相对插件目录的可执行文件（Windows 上没有扩展名时宿主补 `.exe`）；登记的每个操作都要在 `contributes.operations` 里，健康项在 `contributes.health` 里，回调宿主要在 `permissions` 里声明 `capability:kernel.pipeline`（`Host.Invoke`）或 `capability:messaging.queue`（`Host.Publish`）；进程外插件不能写 `contributes.pipeline`（只有 Wasm 插件能贡献中间件）。握手交出的是清单原文，宿主逐字段核对它与目录里的文件；`Plugin::start` 在监听之前按 RFC-0002 读清单并核对上面这些、订阅的主题文法与（主题，类型）对不重复、消息目录有 `en-US`，不合即返回 `FrameworkError`。
+2. 端点：Unix 上是 Unix 域套接字，放在临时目录下新建的私有目录里（目录 `0700`、名字随机、已经存在就换个名字，套接字 `0600`），停止后连同目录删掉；Windows 上是命名管道 `\\.\pipe\xihan-plugin-<随机>`，只接受本机连接，用系统缺省的安全描述符：本用户、管理员与 SYSTEM 能读写，其他用户只能读、发不出请求（本 crate 禁用 `unsafe`，设不了只含当前用户的访问控制表）；`with_network(Network::Tcp)` 改成只绑定 `127.0.0.1` 的回环 TCP，同机的其他用户连得上，隔离只靠会话令牌。
+3. 运行：`serve` 读环境变量（`XIHAN_PLUGIN_SESSION` 必填）、监听、往 stdout 写一行握手行，之后 stdout 不再写任何东西，插件自己也不要写；服务到 `Stop` 完成、stdin 关闭或收到 SIGTERM（Unix）时返回。每个 RPC（含 `Handshake`）先按常数时间核对元数据 `xihan-plugin-session`，缺失或不匹配以 `Unauthenticated` 拒绝、不执行。生命周期顺序不对的 RPC（`Configure` 早于握手、`Start` 早于 `Configure`、重复握手）以 `FailedPrecondition` 拒绝。`Start` 成功后插件报 `Ready`；`Stop` 进入 `Draining`、拒绝新调用，在宽限内（`grace_seconds`，为 0 时 `with_stop_grace`，缺省 5 秒）等在途调用完成，再调用 `Hooks::stop`，应答之后停止服务；stdin 关闭与 SIGTERM 按同样的步骤收尾。
+4. 调用：`Invoke` 经调用器与完整管道（插件进程里的管道用 `with_pipeline` 给），未声明的操作以 `Unimplemented` 结束，`Start` 之前与排空中为 `PLUGINS_UNAVAILABLE_001`；上下文从 `InvocationMetadata` 还原：追踪取 `trace_parent`，截止时间取 `deadline`（没有时取 gRPC 的截止时间），Baggage 只收已登记的键；宿主取消调用时上下文的令牌触发，处理器照常在独立任务里跑完。业务失败放进 `Status.error`（`text` 是已解析的文案，`details` 是 JSON 对象文本），gRPC 状态保持 `OK`。事件按（主题，方式）找订阅再看类型，找不到以这种方式声明的订阅时返回错误，不改交给另一种方式；`InvokeStream` 只核对帧序（第一帧不是 `start` 为 `InvalidArgument`），操作契约还没有流式操作，合法的流一律 `Unimplemented`。
+5. 回调：处理器经 `plugin::host(ctx)`（调用之外经 `Configuration::host()`）取 `Host`，`invoke` 与 `publish` 带会话令牌、追踪、截止时间与已登记的 Baggage。发出之前在本地核对：权限要在清单 `permissions` 里声明并且已被授予；租户只能是宿主此刻交给本插件处理的某个调用的租户（`Host.Invoke` 看上下文的 `xihan.tenant`，`Host.Publish` 逐项看信封的 `xihantenant`），不合的不发出，以 `PLUGINS_DENIED_002` 失败。
+6. 日志与错误：`Logger` 往 stderr 写一行一个 JSON 对象（`level` 为 `trace` / `debug` / `information` / `warning` / `error` / `critical`，`message`，其余成员是作用域属性，运行时的每行带 `plugin`）。运行时自己的错误是 `PLUGINS_UNAVAILABLE_001`、`PLUGINS_DENIED_002`、`PLUGINS_UNEXPECTED_001`，消息键 `plugins.*` 的 10 种区域文案作为目录 `framework-sdk-rust` 附在插件的目录后面交给宿主，en-US 模板并进 `primitives::builtin_catalog()`。插件自己的目录用 `MessageCatalog`（至少要有 `en-US`），`to_catalog()` 可以交给 `primitives::set_default_messages`。
+7. 验证：用规范仓库的黑盒运行器跑全部用例（需要 Go）：
+
+```bash
+cd spec/conformance
+go run ./cmd/xihan-conformance plugin --dir <插件目录> --exclude <会崩溃的操作 ID> --sample '<操作 ID>=<请求 JSON>'
+```
+
 ## 与宿主共用的行为
 
 线上编码与 .NET 参考实现一致：
@@ -155,8 +226,10 @@ assert_eq!(failed, r#"{"ok":false,"error":{"code":"ORDERS_CONFLICT_001","message
 | crate | 用途 |
 | --- | --- |
 | `serde`（`derive`）、`serde_json`（`raw_value`） | `Result` / `Error` / `Maybe` 的线上编码、XGI 载荷编解码、清单读写；`serde_json::Value` 是错误细节与模板参数的值类型；`raw_value` 让 `json::Json` 照原文写出 |
-| `getrandom` | 追踪 ID 与 Span ID 的随机数 |
+| `getrandom` | 追踪 ID、Span ID 与插件端点名的随机数 |
 | `serde_path_to_error` | 载荷不合法时给出出错位置的 JSON 路径（`$.lines[1].quantity`）：RFC-0011 规则 2 要求 `reason` 只写路径，`serde_json` 本身只报行列 |
+| `tonic`（`codegen`、`server`、`channel`）、`tonic-prost`、`prost` | 只在 feature `plugin`：`xihan.plugin.v1` 的 gRPC 服务端与回调客户端、protobuf 编解码；tonic 0.14.6 起要 Rust 1.88，依赖按 `rust-version` 解析到 0.14.5，生成代码也由 0.14.5 的生成器生成 |
+| `tokio`、`tokio-stream`、`hyper-util` | 只在 feature `plugin`：监听端点、在途调用、健康推送、停止宽限与 SIGTERM，回调时自建连接；只用到当前线程的运行时，多线程与否由插件作者选 |
 
 JSON 文本的共同读取检查是自带的逐字节读取器（`primitives::json`），读出保留文档顺序的值树，再经自带的 serde `Deserializer` 读入目标类型：`serde_json` 对重复成员取最后一个、不查孤立的代理项转义、把 `-0` 读成浮点、对 `1e400` 报错，`Value` 又按键排序，都与规范不符。
 
@@ -169,22 +242,34 @@ git submodule update --init
 ```
 
 ```bash
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features plugin -- -D warnings
 ```
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+cargo test && cargo test --features plugin
 ```
 
-最低 Rust 版本 1.85（edition 2024 的要求），clippy 的 `incompatible_msrv` 按它核对标准库 API。`spec/` 与 `tests/` 不进 crate 包。
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features plugin
+```
+
+最低 Rust 版本 1.85（edition 2024 的要求），clippy 的 `incompatible_msrv` 按它核对标准库 API，依赖也按它解析（tonic 解析到 0.14.5）。`spec/`、`tests/` 与 `tools/` 不进 crate 包。
+
+插件运行时的一致性测试 `tests/plugin_conformance.rs` 要 Go（版本见 `spec/conformance/go.mod`）：它构建示例 echo，与清单一起放进临时目录，在 `spec/conformance` 用 `go run ./cmd/xihan-conformance plugin` 跑黑盒运行器的全部用例，断言都通过；没有 Go 时打印原因并跳过。
+
+协议代码 `src/plugin/generated/xihan.plugin.v1.rs` 由 `spec/plugin/plugin.proto` 生成并提交，使用者不需要 protoc。规范子模块升级之后重新生成并一并提交（`.proto` 由纯 Rust 的 protox 编译，也不需要 protoc；CI 重新生成并核对与提交的一致）：
+
+```bash
+cargo run --manifest-path tools/protogen/Cargo.toml
+```
 
 ## 状态
 
-`0.1`：原语、清单、调用上下文、管道与操作可用，通过规范仓库 `conformance/vectors/` 下 primitives（含 `json-text.json`）、manifest、pipeline、operations 的全部向量（尚未发布到 crates.io，那里是名字占位的 0.0.1）。规划中：
+`0.1`：原语、清单、调用上下文、管道、操作与进程外插件运行时可用，通过规范仓库 `conformance/vectors/` 下 primitives（含 `json-text.json`）、manifest、pipeline、operations 与 plugin（握手行、版本协商）的全部向量；示例 echo 通过黑盒运行器 `xihan-conformance plugin` 的全部用例（尚未发布到 crates.io，那里是名字占位的 0.0.1）。尚未提供：
 
-- 进程外插件运行时 `plugin`（`xihan.plugin.v1`，基于 tonic，以 cargo feature 启用；unix 套接字 / Windows 命名管道 / tcp 回环），用规范仓库的黑盒运行器 `xihan-conformance plugin --dir <产物目录>` 验证；
+- 流式操作：操作契约（RFC-0011）还没有流式形态，`InvokeStream` 只核对帧序；
 - Wasm 插件 ABI（RFC-0018，`xihan_*` 导出、`xihan` 导入，WASI preview 1 reactor），样板在 XiHan.Framework 的 `samples/EchoWasmPlugin`；
-- 远程 Provider 的操作集（RFC-0019，首个是 `caching.distributed@1`）与示例插件。
+- 远程 Provider 的操作集（RFC-0019，首个是 `caching.distributed@1`）。
 
 ## 生态
 
@@ -192,7 +277,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 | --- | --- |
 | [framework-spec](https://github.com/XiHanFun/framework-spec) | XiHan Spec：RFC、术语表、协议映射与一致性向量 |
 | [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework) | .NET 参考实现 |
-| [framework-sdk-go](https://github.com/XiHanFun/framework-sdk-go) | Go SDK，含进程外插件运行时 |
+| [framework-sdk-go](https://github.com/XiHanFun/framework-sdk-go) | Go SDK |
 | [framework-sdk-typescript](https://github.com/XiHanFun/framework-sdk-typescript) | TypeScript SDK |
 | [framework-sdk-java](https://github.com/XiHanFun/framework-sdk-java) | Java SDK |
 | [framework-sdk-python](https://github.com/XiHanFun/framework-sdk-python) | Python SDK |
@@ -200,7 +285,10 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 
 ## 参与
 
-欢迎提交 [Issue](https://github.com/XiHanFun/framework-sdk-rust/issues) 与 Pull Request。公开契约的变更不在 SDK 仓库里做：走 [framework-spec](https://github.com/XiHanFun/framework-spec) 的 RFC 流程，再同步到各 SDK。
+欢迎提交 [Issue](https://github.com/XiHanFun/framework-sdk-rust/issues) 与 Pull Request。
+
+1. 先读 framework-spec 的 README 与相关 RFC。
+2. 公开契约的变更不在 SDK 仓库里做：走 [framework-spec](https://github.com/XiHanFun/framework-spec) 的 RFC 流程，再同步到各 SDK。
 
 ## 许可证
 

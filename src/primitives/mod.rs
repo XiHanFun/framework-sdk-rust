@@ -39,6 +39,8 @@ pub(crate) use framework::invalid_argument;
 pub use framework::{DOCUMENTATION, FrameworkError, NAME, REPOSITORY, SDK_NAME, SDK_VERSION, SPEC_VERSION};
 pub use id::TypedId;
 pub use lifecycle::LifecycleState;
+#[cfg(feature = "plugin")]
+pub(crate) use messages::is_locale_name;
 pub use messages::{
     Catalog, DEFAULT_LOCALE, Details, MESSAGE_KEY_MAX_LENGTH, MESSAGE_UNINITIALIZED_RESULT, MessageResolver, builtin_catalog, default_locale, describe,
     format_message, format_message_in, format_value, format_value_in, is_message_key, message_key_domain, placeholders, positional, resolve_message,

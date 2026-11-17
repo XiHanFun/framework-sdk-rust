@@ -1,0 +1,5 @@
+{
+  "echo.configuration.invalid": "The configuration section XiHan:Echo is not valid: {reason}",
+  "echo.host.unavailable": "The host did not provide a callback endpoint.",
+  "echo.text.empty": "The text must not be empty."
+}

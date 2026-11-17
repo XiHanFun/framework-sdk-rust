@@ -3,6 +3,10 @@
 Cargo.lock
 **/*.rs.bk
 
+# 开发时的协议生成器（tools/protogen）是独立的可执行程序：锁文件提交，同一份 .proto 总是生成同一份代码
+/tools/protogen/target/
+!/tools/protogen/Cargo.lock
+
 # 编辑器
 .idea/
 .vs/

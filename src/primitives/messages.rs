@@ -501,12 +501,18 @@ const BUILTIN_TEMPLATES: &[(&str, &str)] = &[
     ("primitives.manifest.isolation_required", "Plugin manifest '{id}' must declare 'isolation'."),
 ];
 
-/// SDK 自带的消息目录：只有 [`DEFAULT_LOCALE`]，内容是 SDK 与宿主共用的内核错误模板。
+/// SDK 自带的消息目录：只有 [`DEFAULT_LOCALE`]，内容是 SDK 与宿主共用的内核错误模板；打开 feature `plugin` 时另有插件运行时
+/// 自己产生的错误（`plugins.*`，见 `plugin` 模块）。
 ///
 /// [`Error::message`](super::Error::message) 在进程默认解析器解析不出时用它，再不行才退回描述；宿主收到错误后按键用自己的目录再翻译。
 pub fn builtin_catalog() -> &'static Catalog {
     static CATALOG: OnceLock<Catalog> = OnceLock::new();
-    CATALOG.get_or_init(|| BUILTIN_TEMPLATES.iter().fold(Catalog::new(), |catalog, (key, template)| catalog.with(DEFAULT_LOCALE, *key, *template)))
+    CATALOG.get_or_init(|| {
+        let templates = BUILTIN_TEMPLATES.iter();
+        #[cfg(feature = "plugin")]
+        let templates = templates.chain(crate::plugin::BUILTIN_TEMPLATES);
+        templates.fold(Catalog::new(), |catalog, (key, template)| catalog.with(DEFAULT_LOCALE, *key, *template))
+    })
 }
 
 /// 解析一条消息的文案：进程默认解析器，再 SDK 自带的 en-US 模板，都解析不出（含占位符缺参数）时为 `None`。
@@ -515,7 +521,7 @@ pub(crate) fn resolve_with_builtin(key: &str, arguments: &Details) -> Option<Str
 }
 
 /// 区域名文法 `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`，最长 35 个字符。
-fn is_locale_name(locale: &str) -> bool {
+pub(crate) fn is_locale_name(locale: &str) -> bool {
     let mut parts = locale.split('-');
     locale.len() <= LOCALE_MAX_LENGTH
         && parts.next().is_some_and(|language| (2..=3).contains(&language.len()) && language.bytes().all(|byte| byte.is_ascii_alphabetic()))

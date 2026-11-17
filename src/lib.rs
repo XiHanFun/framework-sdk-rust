@@ -4,6 +4,7 @@
 //! .NET 参考实现是 [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework)。
 //!
 //! 中间件、处理器与调用器都是异步的，返回与运行时无关的 future（[`BoxFuture`]），可以在任何执行器里运行。
+//! 打开 cargo feature `plugin` 时另有进程外插件运行时 `plugin`（RFC-0017），它基于 tonic 与 tokio。
 
 #![forbid(unsafe_code)]
 
@@ -15,6 +16,8 @@ pub mod invocation;
 pub mod manifest;
 pub mod operation;
 pub mod pipeline;
+#[cfg(feature = "plugin")]
+pub mod plugin;
 pub mod primitives;
 
 /// 本 crate 的版本，同 [`primitives::SDK_VERSION`]。

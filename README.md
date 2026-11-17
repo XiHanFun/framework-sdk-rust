@@ -22,7 +22,7 @@
 
 </div>
 
-XiHan Framework SDK for Rust is the Rust implementation of [XiHan Spec](https://github.com/XiHanFun/framework-spec), providing the primitives layer, manifests, the invocation context, the pipeline and operation contracts, with semantics and wire encoding defined by the spec's RFCs; the .NET reference implementation is [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework). The spec sits in `spec/` as a submodule, and conformance is verified by the spec repository's vectors: the tests read `spec/conformance/vectors/` directly instead of copying the vector files.
+XiHan Framework SDK for Rust is the Rust implementation of [XiHan Spec](https://github.com/XiHanFun/framework-spec), providing the primitives layer, manifests, the invocation context, the pipeline and operation contracts, plus the out-of-process plugin runtime (cargo feature `plugin`), with semantics and wire encoding defined by the spec's RFCs; the .NET reference implementation is [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework). The spec sits in `spec/` as a submodule, and conformance is verified by the spec repository's vectors: the tests read `spec/conformance/vectors/` directly instead of copying the vector files.
 
 ## Modules
 
@@ -35,6 +35,9 @@ The whole SDK is a single crate, `xihan-framework`, and every language's SDK is 
 | `invocation` | `Context`: an awaitable `CancellationToken` that propagates from parent to child, deadlines fired by a background timer, W3C tracing (`traceparent` accepts only version `00` and lowercase hex, and an invalid one is treated as absent; sampling looks only at the lowest bit and writes `00` or `01`, writing `01` when there is no upstream), registered Baggage (values of registered keys are non-empty, at most 256 UTF-16 code units and free of control characters, except the idempotency key: building a context treats members as external input, dropping non-conforming ones and keeping the existing value, while `with_baggage` panics on a non-conforming value), and an item bag accessed by type; timeouts and cancellation are attributed to `KERNEL_TIMEOUT_001` / `KERNEL_CANCELLED_001` by the deadline token alone | RFC-0003 |
 | `pipeline` | The eleven-stage `Builder`: `use_middleware` / `use_at` / `use_named_instance`, `before` / `after` (instances registered by name use the instance name, everything else the middleware name; the subject of a constraint must already be registered when it is declared), `describe` / `dump` / `build`; ordering rules, error codes `KERNEL_PIPELINE_00x` and the exact English error messages (vector `pipeline/ordering.json`, where an instance registered by name is written `middleware-name[instance-name]`): registration methods take `&mut self` and return `Result`, duplicate registration and an unregistered constraint subject are reported at registration, while an unregistered constraint target, cross-stage constraints and cycles are reported at ordering; middleware and terminals are all asynchronous | RFC-0004 |
 | `operation` | `Contract`, `Schema`, the asynchronous `Handler<Req, Res>`, a `Registry` with a capacity of 10000, and an `Invoker` that runs through the full pipeline (XGI: JSON request and response; plus a typed entry point that bypasses JSON); the pipeline carries three built-in steps, placed where the .NET built-in middleware sits; kernel error codes, keys, arguments and en-US templates match vector `kernel-messages.json` (`type_mismatch` carries only `id`); payloads first pass the shared JSON text check, the first problem in text order is reported, and `reason` is a JSON path (vector `operations/payload-reasons.json`); members holding arbitrary JSON use `json::Json` to keep numbers verbatim; the response is encoded only after the pipeline finishes, and a response that cannot be written is reported as `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception`; middleware that short-circuits with success but no response is reported as `KERNEL_UNEXPECTED_001` + `kernel.operation.no_response` | RFC-0011 |
+| `plugin` (feature `plugin`) | The out-of-process plugin runtime: `Plugin` reads the manifest and the environment variables passed by the host, listens on a local endpoint, writes the handshake line to stdout, and serves the `Plugin` service of `xihan.plugin.v1` as a gRPC server (handshake, configure, start and stop, health and health push, invocations, event delivery), checking the session token in constant time before every RPC; the lifecycle state machine uses `LifecycleState`; `Invoke` runs through `operation::Invoker` and the full pipeline, with the invocation context restored from `InvocationMetadata`; `Host` calls back `Host.Invoke` and `Host.Publish`, carrying only tenants the host has handed to the plugin; `Logger` writes JSON log lines to stderr; `plugin::v1` is the code generated from `plugin.proto`; vectors `plugin/handshake-lines.json` and `plugin/protocol-versions.json` | RFC-0017, `plugin/handshake.md`, `plugin/lifecycle.md`, `plugin/invocation.md`, `plugin/plugin.proto` |
+
+The `plugin` module is optional: `cargo add xihan-framework --features plugin`. It brings in tonic, prost and tokio; without the feature none of these dependencies are pulled in, and the other modules depend on no async runtime.
 
 ## Getting Started
 
@@ -103,6 +106,74 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 3. Programming errors (error codes, message keys or Baggage keys that break the grammar) panic, and each function's documentation states its panic conditions. The panic payload is the `FrameworkError` itself (`std::panic::panic_any`), not a string; after catching it, take it out with `downcast_ref::<FrameworkError>()`. The standard library's default panic hook prints only `Box<dyn Any>` for it, so install your own hook to see the code and description. Check values from untrusted input with `is_error_code` and `is_baggage_key_well_formed` first, or use `Error::try_new`. Configuration-time failures such as manifest validation, pipeline ordering and operation registration return `FrameworkError`.
 4. `Context` deadlines are fired on time by a background thread in the process (`xihan-deadline-timer`, started when the first deadline is registered); `Context::done()` completes when the caller cancels or the deadline is reached, and `Context::cancellation()` gives `KERNEL_TIMEOUT_001` (`kernel.invocation.deadline_exceeded`) or `KERNEL_CANCELLED_001` (`kernel.invocation.cancelled`). The invoker's pipeline holds three built-in steps, all placed at `Beginning` of their stage under the owner `xihan.kernel.core` (`operation::KERNEL_OWNER`) and ordered against middleware in the same position by RFC-0004: `ObserveMiddleware` in the Observe stage translates panics from the middleware and handler after it into `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception` (a `FrameworkError` payload goes into `inner`), while panics from middleware before it reach the caller unchanged; `DeadlineMiddleware` in the Resilience stage checks the deadline against the clock on entry and, if it has passed, reports `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_before_start` without running the middleware and handler after it (the Ingress and Observe stages still run); `ValidationMiddleware` in the Validate stage decodes the payload of raw calls and is skipped for typed calls. Before the pipeline, only an unregistered operation and a type mismatch of a typed call are checked, in that order. Translating panics requires `panic = "unwind"`. The XGI entry point encodes the response into a payload only after the pipeline finishes, so middleware sees the object before encoding through `operation::with_response` (the response of a typed call is written to the same slot, like .NET's `FindOperationResponse`, just not encoded); when it cannot be written (a typed float that is NaN or infinite, a value the serializer does not support, a panic during serialization), the call ends with `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception` instead of propagating to the caller. Cancellation and deadlines are signaled only through the token: the invoker and the built-in steps neither abort the handler nor drop its future, the result the handler returns after the token fires is the result of the call, and attribution by the token happens only when the handler turns cancellation into its result (`Err(ctx.cancellation()…)`).
 
+### Write a Plugin
+
+```bash
+cargo add xihan-framework --features plugin
+cargo add tokio --features macros,rt
+cargo add serde --features derive
+```
+
+```rust,ignore
+use std::sync::Arc;
+
+use serde::{Deserialize, Serialize};
+use xihan_framework::operation::{self, Contract, Registry};
+use xihan_framework::plugin::{MANIFEST_FILE_NAME, Plugin};
+
+#[derive(Deserialize)]
+struct Ping {
+    text: String,
+}
+
+#[derive(Serialize)]
+struct Pong {
+    text: String,
+}
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let registry = Arc::new(Registry::new());
+    registry.add(
+        Contract::new("pings.create"),
+        operation::handler_fn(|_ctx, ping: Ping| Box::pin(async move { Ok(Pong { text: ping.text }) })),
+    )?;
+    // The manifest handed to the host in the handshake must match the file in the plugin directory: the working directory is the plugin directory, so read it from there
+    Plugin::from_manifest_file(MANIFEST_FILE_NAME)?.with_operations(registry).serve().await?;
+    Ok(())
+}
+```
+
+The plugin directory holds the executable and the manifest `xihan.manifest.json`:
+
+```json
+{
+  "id": "xihan.samples.ping",
+  "version": "1.0.0",
+  "primitives": "1",
+  "stability": "experimental",
+  "kind": "plugin",
+  "isolation": "out-of-process",
+  "contributes": { "operations": [ "pings.create" ] },
+  "entry": "ping"
+}
+```
+
+The example above needs the `plugin` feature, while the README examples are also compiled by the tests without features, so it is marked `ignore`; the same code is the example in the `plugin` module documentation, compiled under `--features plugin`. The complete example is `examples/echo` (operations, event subscriptions, a health item, configuration and host callbacks).
+
+1. Manifest: `kind` is `plugin`, `isolation` is `out-of-process`, and `entry` is the executable relative to the plugin directory (on Windows the host appends `.exe` when there is no extension); every registered operation must be in `contributes.operations` and health items in `contributes.health`, and calling back the host requires declaring `capability:kernel.pipeline` (`Host.Invoke`) or `capability:messaging.queue` (`Host.Publish`) in `permissions`; an out-of-process plugin may not write `contributes.pipeline` (only Wasm plugins can contribute middleware). The handshake hands over the manifest text as written, and the host compares it field by field with the file in the directory; before listening, `Plugin::start` reads the manifest by RFC-0002 and checks the points above, the topic grammar of subscriptions and that no (topic, type) pair repeats, and that every message catalog has `en-US`, returning a `FrameworkError` otherwise.
+2. Endpoints: on Unix a Unix domain socket in a private directory newly created under the temp directory (directory `0700`, random name, a different name when it already exists, socket `0600`), removed together with the directory after stopping; on Windows a named pipe `\\.\pipe\xihan-plugin-<random>` that accepts only local connections and uses the system's default security descriptor: the current user, administrators and SYSTEM can read and write, other users can only read and cannot send requests (this crate forbids `unsafe`, so it cannot set an access control list containing only the current user); `with_network(Network::Tcp)` switches to TCP loopback bound only to `127.0.0.1`, which other users on the machine can reach, so isolation relies on the session token alone.
+3. Running: `serve` reads the environment variables (`XIHAN_PLUGIN_SESSION` is required), listens and writes one handshake line to stdout, after which nothing more is written to stdout, and the plugin must not write there either; it returns when `Stop` completes, stdin closes or SIGTERM arrives (Unix). Every RPC (including `Handshake`) first checks the metadata `xihan-plugin-session` in constant time, and a missing or mismatched token is refused with `Unauthenticated` without running anything. RPCs out of lifecycle order (`Configure` before the handshake, `Start` before `Configure`, a second handshake) are refused with `FailedPrecondition`. After a successful `Start` the plugin reports `Ready`; `Stop` enters `Draining` and refuses new calls, waits within the grace period (`grace_seconds`, or `with_stop_grace` when it is 0, 5 seconds by default) for calls in flight, then calls `Hooks::stop` and stops serving after replying; closing stdin and SIGTERM wind down the same way.
+4. Invocations: `Invoke` runs through the invoker and the full pipeline (the pipeline inside the plugin process is given with `with_pipeline`); an undeclared operation ends with `Unimplemented`, and calls before `Start` or while draining get `PLUGINS_UNAVAILABLE_001`. The context is restored from `InvocationMetadata`: tracing from `trace_parent`, the deadline from `deadline` (the gRPC deadline when absent), and Baggage only for registered keys; when the host cancels a call the context token fires, and the handler still runs to the end in its own task. Business failures go into `Status.error` (`text` is the resolved text, `details` is JSON object text) and the gRPC status stays `OK`. Events find their subscription by (topic, mode) and then by type, and when no subscription is declared for that mode an error is returned instead of handing the message to the other mode; `InvokeStream` only checks frame order (a first frame other than `start` is `InvalidArgument`), and because operation contracts have no streaming operations yet, every valid stream is `Unimplemented`.
+5. Callbacks: handlers get the `Host` through `plugin::host(ctx)` (outside calls through `Configuration::host()`), and `invoke` and `publish` carry the session token, tracing, the deadline and registered Baggage. Before sending, two checks run locally: the permission must be declared in the manifest `permissions` and granted; the tenant can only be the tenant of a call the host is currently handing to this plugin (`Host.Invoke` looks at `xihan.tenant` in the context, `Host.Publish` at the `xihantenant` extension of each envelope); what fails is not sent and fails with `PLUGINS_DENIED_002`.
+6. Logs and errors: `Logger` writes one JSON object per line to stderr (`level` is `trace` / `debug` / `information` / `warning` / `error` / `critical`, plus `message`, with the other members as scope properties; every runtime line carries `plugin`). The runtime's own errors are `PLUGINS_UNAVAILABLE_001`, `PLUGINS_DENIED_002` and `PLUGINS_UNEXPECTED_001`; the texts of the message keys `plugins.*` in 10 locales go to the host as the catalog `framework-sdk-rust` after the plugin's catalogs, and the en-US templates join `primitives::builtin_catalog()`. The plugin's own catalogs use `MessageCatalog` (at least `en-US`), and `to_catalog()` can be handed to `primitives::set_default_messages`.
+7. Verification: run every case of the spec repository's black-box runner (requires Go):
+
+```bash
+cd spec/conformance
+go run ./cmd/xihan-conformance plugin --dir <plugin-dir> --exclude <crashing-operation-id> --sample '<operation-id>=<request-json>'
+```
+
 ## Behavior Shared with the Host
 
 The wire encoding matches the .NET reference implementation:
@@ -155,8 +226,10 @@ Dependencies:
 | Crate | Purpose |
 | --- | --- |
 | `serde` (`derive`), `serde_json` (`raw_value`) | Wire encoding of `Result` / `Error` / `Maybe`, XGI payload encoding and decoding, manifest reading and writing; `serde_json::Value` is the value type of error details and template arguments; `raw_value` lets `json::Json` write out its original text |
-| `getrandom` | Random numbers for trace IDs and span IDs |
+| `getrandom` | Random numbers for trace IDs, span IDs and plugin endpoint names |
 | `serde_path_to_error` | The JSON path of the error location when a payload is invalid (`$.lines[1].quantity`): RFC-0011 rule 2 requires `reason` to contain only the path, and `serde_json` itself reports only line and column |
+| `tonic` (`codegen`, `server`, `channel`), `tonic-prost`, `prost` | Only with the `plugin` feature: the gRPC server and callback client of `xihan.plugin.v1` and protobuf encoding; tonic requires Rust 1.88 from 0.14.6 on, so dependencies resolve to 0.14.5 by `rust-version`, and the generated code comes from the 0.14.5 generator as well |
+| `tokio`, `tokio-stream`, `hyper-util` | Only with the `plugin` feature: listening on endpoints, calls in flight, health push, the stop grace period and SIGTERM, and building connections for callbacks; only the current-thread runtime is required, and whether to use the multi-threaded one is up to the plugin author |
 
 The shared JSON text check is a built-in byte-by-byte reader (`primitives::json`) that produces a value tree in document order, which a built-in serde `Deserializer` then reads into the target type: `serde_json` keeps the last of duplicate members, does not check lone surrogate escapes, reads `-0` as a float and rejects `1e400`, and `Value` sorts keys, none of which matches the spec.
 
@@ -169,22 +242,34 @@ git submodule update --init
 ```
 
 ```bash
-cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
+cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo clippy --all-targets --features plugin -- -D warnings
 ```
 
 ```bash
-RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+cargo test && cargo test --features plugin
 ```
 
-The minimum Rust version is 1.85 (required by edition 2024), and clippy's `incompatible_msrv` checks standard library APIs against it. `spec/` and `tests/` are not included in the crate package.
+```bash
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features plugin
+```
+
+The minimum Rust version is 1.85 (required by edition 2024), and clippy's `incompatible_msrv` checks standard library APIs against it; dependencies are resolved against it too (tonic resolves to 0.14.5). `spec/`, `tests/` and `tools/` are not included in the crate package.
+
+The plugin runtime's conformance test `tests/plugin_conformance.rs` requires Go (version in `spec/conformance/go.mod`): it builds the echo example, puts it with its manifest into a temporary directory, runs every case of the black-box runner with `go run ./cmd/xihan-conformance plugin` in `spec/conformance`, and asserts that all pass; without Go it prints the reason and is skipped.
+
+The protocol code `src/plugin/generated/xihan.plugin.v1.rs` is generated from `spec/plugin/plugin.proto` and committed, so users need no protoc. After upgrading the spec submodule, regenerate it and commit it along (the `.proto` is compiled by protox in pure Rust, so no protoc is needed here either; CI regenerates it and checks that it matches the committed code):
+
+```bash
+cargo run --manifest-path tools/protogen/Cargo.toml
+```
 
 ## Status
 
-`0.1`: primitives, manifests, the invocation context, the pipeline and operations are usable and pass all vectors for primitives (including `json-text.json`), manifest, pipeline and operations under `conformance/vectors/` in the spec repository (not yet published to crates.io, where 0.0.1 is a name placeholder). Planned:
+`0.1`: primitives, manifests, the invocation context, the pipeline, operations and the out-of-process plugin runtime are usable and pass all vectors for primitives (including `json-text.json`), manifest, pipeline, operations and plugin (handshake lines, version negotiation) under `conformance/vectors/` in the spec repository; the echo example passes every case of the black-box runner `xihan-conformance plugin` (not yet published to crates.io, where 0.0.1 is a name placeholder). Not yet provided:
 
-- the out-of-process plugin runtime `plugin` (`xihan.plugin.v1`, based on tonic, enabled through a cargo feature; Unix sockets / Windows named pipes / TCP loopback), verified with the spec repository's black-box runner `xihan-conformance plugin --dir <artifact-dir>`;
+- streaming operations: operation contracts (RFC-0011) have no streaming form yet, and `InvokeStream` only checks frame order;
 - the Wasm plugin ABI (RFC-0018, `xihan_*` exports, `xihan` imports, WASI preview 1 reactor), with a template in XiHan.Framework's `samples/EchoWasmPlugin`;
-- operation sets for remote providers (RFC-0019, starting with `caching.distributed@1`) and sample plugins.
+- operation sets for remote providers (RFC-0019, starting with `caching.distributed@1`).
 
 ## Ecosystem
 
@@ -192,7 +277,7 @@ The minimum Rust version is 1.85 (required by edition 2024), and clippy's `incom
 | --- | --- |
 | [framework-spec](https://github.com/XiHanFun/framework-spec) | XiHan Spec: RFCs, vocabulary, protocol mappings and conformance vectors |
 | [XiHan.Framework](https://github.com/XiHanFun/XiHan.Framework) | The .NET reference implementation |
-| [framework-sdk-go](https://github.com/XiHanFun/framework-sdk-go) | Go SDK, including the out-of-process plugin runtime |
+| [framework-sdk-go](https://github.com/XiHanFun/framework-sdk-go) | Go SDK |
 | [framework-sdk-typescript](https://github.com/XiHanFun/framework-sdk-typescript) | TypeScript SDK |
 | [framework-sdk-java](https://github.com/XiHanFun/framework-sdk-java) | Java SDK |
 | [framework-sdk-python](https://github.com/XiHanFun/framework-sdk-python) | Python SDK |
@@ -200,7 +285,10 @@ The minimum Rust version is 1.85 (required by edition 2024), and clippy's `incom
 
 ## Contributing
 
-[Issues](https://github.com/XiHanFun/framework-sdk-rust/issues) and pull requests are welcome. Changes to public contracts are not made in the SDK repositories: they go through the RFC process in [framework-spec](https://github.com/XiHanFun/framework-spec) and are then synced to every SDK.
+[Issues](https://github.com/XiHanFun/framework-sdk-rust/issues) and pull requests are welcome.
+
+1. Start with the README and the relevant RFCs of framework-spec.
+2. Changes to public contracts are not made in the SDK repositories: they go through the RFC process in [framework-spec](https://github.com/XiHanFun/framework-spec) and are then synced to every SDK.
 
 ## License
 

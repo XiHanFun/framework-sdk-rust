@@ -1,0 +1,5 @@
+{
+  "echo.configuration.invalid": "配置节 XiHan:Echo 不合法：{reason}",
+  "echo.host.unavailable": "宿主没有提供回调端点。",
+  "echo.text.empty": "文本不能为空。"
+}
