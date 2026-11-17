@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, Mutex, PoisonError, RwLock};
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
 use tonic::Code;
 use tonic::metadata::MetadataValue;
@@ -19,28 +19,28 @@ use crate::invocation::{Context, ERROR_CODE_CANCELLED, ERROR_CODE_DEADLINE_EXCEE
 use crate::operation::{ERROR_CODE_INVALID_PAYLOAD, ERROR_CODE_NOT_FOUND, MESSAGE_INVALID_PAYLOAD, MESSAGE_NOT_FOUND};
 use crate::primitives::{Error, Result};
 
-/// gRPC 的 `Cancelled` 来得比上下文的截止令牌早一点时（gRPC 客户端与上下文各按同一个截止时间计时），最多等令牌这么久再归因。
-const DEADLINE_SETTLE: Duration = Duration::from_millis(100);
-
 /// 宿主回调服务的客户端：每次调用带会话令牌，追踪、截止时间与已登记的 Baggage 取自调用上下文（`invocation.md` §5）。
 ///
-/// 在调用与投递里经 [`host`] 取得，在调用之外经 [`Configuration::host`](super::Configuration::host)。发出之前在本地按宿主的顺序核对，
-/// 与宿主给出同样的错误、不合即不发请求：
+/// 在调用与投递里经 [`host`] 取得，在调用之外经 [`Configuration::host`](super::Configuration::host)。发出之前依次核对，不合即不发请求：
 ///
-/// 1. 权限：所需的权限（`Host.Invoke` 要 `capability:kernel.pipeline`，`Host.Publish` 要 `capability:messaging.queue`）在清单
+/// 1. 回调端点：`XIHAN_PLUGIN_HOST_ADDRESS` 里没有本运行时能连的项时（[`Host::endpoint`] 为 `None`），`PLUGINS_UNAVAILABLE_001` +
+///    `plugins.host.unavailable`（`reason` 为 `no supported callback endpoint`）；
+/// 2. 权限：所需的权限（`Host.Invoke` 要 `capability:kernel.pipeline`，`Host.Publish` 要 `capability:messaging.queue`）在清单
 ///    `permissions` 里、也在 `Configure` 下发的 `granted_permissions` 里，否则 `PLUGINS_DENIED_002` + `plugins.callback.denied`；
-/// 2. 租户：上下文的 `xihan.tenant` 必须是宿主此刻交给本插件处理的某个调用或投递的租户（同一租户可以同时有多个），否则
-///    `PLUGINS_DENIED_002` + `plugins.callback.tenant_denied`；宿主没有在处理本插件的调用时（调用已结束、后台回调）不能带租户。
+/// 3. 租户：上下文的 `xihan.tenant` 必须是宿主此刻交给本插件处理的某个调用或投递的租户（同一租户可以同时有多个），否则
+///    `PLUGINS_DENIED_002` + `plugins.callback.tenant_denied`；宿主没有在处理本插件的调用时（调用已结束、后台回调）不能带租户；
+/// 4. 上下文的截止时间已过按 `DeadlineExceeded`（`KERNEL_TIMEOUT_001`），已被取消按「`Cancelled`，取消信号已触发」
+///    （`KERNEL_CANCELLED_001`），与下面映射表的那一行相同；发出之后上下文取消时放弃这次调用，按同样的两行给出结果。
 ///
-/// `Host.Publish` 的这两项都是整批的结果，每一项都是那个错误；信封的 `xihantenant` 扩展不在本地核对，由宿主逐项判定。
-/// `XIHAN_PLUGIN_HOST_ADDRESS` 里没有本运行时能连的端点时（[`Host::endpoint`] 为 `None`），核对之后不发请求，以
-/// `PLUGINS_UNAVAILABLE_001` + `plugins.host.unavailable`（`reason` 为 `no supported callback endpoint`）失败。
+/// 第 2、3 项与宿主的顺序相同、给出同样的错误；`Host.Publish` 的每一项都是整批的结果。信封的 `xihantenant` 扩展不在本地核对，由宿主
+/// 逐项判定。
 ///
-/// 宿主的 gRPC 状态按 `invocation.md` §5 的表映射（向量 `plugin/callback-status.json`）：`Unauthenticated` 为
-/// `plugins.callback.session_invalid`，`PermissionDenied` 为 `plugins.callback.denied`，`DeadlineExceeded` 为 `KERNEL_TIMEOUT_001`，
-/// 上下文已取消时的 `Cancelled` 为 `KERNEL_CANCELLED_001`，其余的 `Cancelled`、`Unavailable` 与连接失败为 `plugins.host.unavailable`，
-/// `Host.Invoke` 的 `Unimplemented` 与 `InvalidArgument` 为 `kernel.operation.unknown` 与 `kernel.operation.invalid_payload`，
-/// 其余为 `plugins.process.failed`。
+/// 宿主的 gRPC 状态按 `invocation.md` §5 的表映射（向量 `plugin/callback-status.json`），只按表、不另按时钟或令牌改写（超时的归因交给
+/// 插件自己管道里的截止时间步骤，RFC-0003 规则 1）：`Unauthenticated` 为 `plugins.callback.session_invalid`，`PermissionDenied` 为
+/// `plugins.callback.denied`，`DeadlineExceeded` 为 `KERNEL_TIMEOUT_001`，上下文已取消时的 `Cancelled` 为 `KERNEL_CANCELLED_001`，
+/// 其余的 `Cancelled`、`Unavailable` 与连接失败为 `plugins.host.unavailable`，`Host.Invoke` 的 `Unimplemented` 与 `InvalidArgument`
+/// 为 `kernel.operation.unknown` 与 `kernel.operation.invalid_payload`，其余为 `plugins.process.failed`。tonic 按截止时间在本端中止
+/// 调用时报的 `Cancelled`（`Timeout expired`）先换成 `DeadlineExceeded`。
 pub struct Host {
     endpoint: Option<Endpoint>,
     plugin: String,
@@ -115,13 +115,12 @@ impl Host {
     /// 截止时间设置 gRPC 截止时间，上下文取消时放弃这次调用。
     pub async fn invoke(&self, ctx: &Context, operation: &str, payload: impl Into<Vec<u8>>) -> Result<Vec<u8>> {
         let rpc = Rpc::Invoke(operation);
-        self.check(ctx, rpc)?;
-        let request = v1::InvokeRequest { operation: operation.to_owned(), payload: payload.into(), metadata: Some(metadata_of(ctx)) };
-        let (mut client, request) = self.prepare(ctx, request)?;
+        let mut client = self.check(ctx, rpc)?;
+        let request = self.request(ctx, v1::InvokeRequest { operation: operation.to_owned(), payload: payload.into(), metadata: Some(metadata_of(ctx)) });
         let response = tokio::select! {
             biased;
             // 上下文取消就放弃这次调用：丢弃请求的 future 会让 gRPC 取消它，宿主那边随之取消
-            () = ctx.done() => return Err(cancellation(ctx)),
+            () = ctx.done() => return Err(self.abandoned(ctx, rpc)),
             response = client.invoke(request) => response,
         };
         match response {
@@ -129,7 +128,7 @@ impl Host {
                 let response = response.into_inner();
                 result_of(response.status.as_ref(), &self.plugin, operation).map(|()| response.payload)
             }
-            Err(status) => Err(self.status_error(ctx, rpc, &status).await),
+            Err(status) => Err(self.status_error(ctx, rpc, &status)),
         }
     }
 
@@ -142,17 +141,15 @@ impl Host {
         if count == 0 {
             return Vec::new();
         }
-        if let Err(error) = self.check(ctx, Rpc::Publish) {
-            return vec![Err(error); count];
-        }
-        let request = v1::PublishRequest { envelopes: envelopes.into_iter().map(proto_envelope).collect(), metadata: Some(metadata_of(ctx)) };
-        let (mut client, request) = match self.prepare(ctx, request) {
-            Ok(prepared) => prepared,
+        let mut client = match self.check(ctx, Rpc::Publish) {
+            Ok(client) => client,
             Err(error) => return vec![Err(error); count],
         };
+        let request =
+            self.request(ctx, v1::PublishRequest { envelopes: envelopes.into_iter().map(proto_envelope).collect(), metadata: Some(metadata_of(ctx)) });
         let response = tokio::select! {
             biased;
-            () = ctx.done() => return vec![Err(cancellation(ctx)); count],
+            () = ctx.done() => return vec![Err(self.abandoned(ctx, Rpc::Publish)); count],
             response = client.publish(request) => response,
         };
         match response {
@@ -164,51 +161,56 @@ impl Host {
                 }
                 results.iter().map(|status| result_of(Some(status), &self.plugin, PHASE_PUBLISH)).collect()
             }
-            Err(status) => vec![Err(self.status_error(ctx, Rpc::Publish, &status).await); count],
+            Err(status) => vec![Err(self.status_error(ctx, Rpc::Publish, &status)); count],
         }
     }
 
-    /// 发出之前的本地核对（`invocation.md` §5），按宿主的顺序：权限，然后租户。
-    fn check(&self, ctx: &Context, rpc: Rpc<'_>) -> Result<()> {
+    /// 发出之前的核对（`invocation.md` §5），依次：回调端点，权限，租户，上下文的截止时间与取消；通过时返回客户端。
+    fn check(&self, ctx: &Context, rpc: Rpc<'_>) -> Result<HostClient<Channel>> {
+        let Some(client) = &self.client else {
+            return Err(host_unavailable(&self.plugin, REASON_NO_ENDPOINT));
+        };
         let permission = rpc.permission();
         if !self.grants.allows(permission) {
             return Err(denied(&self.plugin, permission));
         }
-        match ctx.tenant() {
-            Some(tenant) if !self.tenants.contains(tenant) => Err(tenant_denied(&self.plugin, tenant)),
-            _ => Ok(()),
+        if let Some(tenant) = ctx.tenant().filter(|tenant| !self.tenants.contains(tenant)) {
+            return Err(tenant_denied(&self.plugin, tenant));
         }
+        // 注定超时或已被放弃的调用不发出；结果与映射表相应的一行相同
+        if ctx.is_expired(SystemTime::now()) || ctx.is_cancelled() {
+            return Err(self.abandoned(ctx, rpc));
+        }
+        Ok(client.clone())
     }
 
-    /// 取客户端并包装请求：带会话令牌，按上下文的剩余时间设置 gRPC 截止时间（与 `metadata.deadline` 相同）。没有可用的回调端点时
-    /// 不发请求；截止时间已经过去时同样不发出注定超时的调用。
-    fn prepare<T>(&self, ctx: &Context, message: T) -> Result<(HostClient<Channel>, tonic::Request<T>)> {
-        let Some(client) = &self.client else {
-            return Err(host_unavailable(&self.plugin, REASON_NO_ENDPOINT));
-        };
+    /// 包装请求：带会话令牌，按上下文的剩余时间设置 gRPC 截止时间（与 `metadata.deadline` 相同）。
+    fn request<T>(&self, ctx: &Context, message: T) -> tonic::Request<T> {
         let mut request = tonic::Request::new(message);
         request.metadata_mut().insert(SESSION_METADATA_KEY, self.session.clone());
         if let Some(remaining) = ctx.remaining_time(SystemTime::now()) {
-            // 定时器可能还没触发令牌，直接按超时结束
-            if remaining == Duration::ZERO {
-                return Err(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_EXCEEDED));
-            }
             request.set_timeout(remaining);
         }
-        Ok((client.clone(), request))
+        request
     }
 
-    /// gRPC 失败 → 错误：按 [`callback_failure`] 的表，调用方取消的再按上下文的令牌归因。
-    async fn status_error(&self, ctx: &Context, rpc: Rpc<'_>, status: &tonic::Status) -> Error {
-        // gRPC 客户端按同一个截止时间计时，它的 Cancelled 可能比上下文的截止令牌早到一点：时钟已过截止时间时等令牌触发再判定，
-        // 否则会把超时误报成宿主不可用；归因仍只看令牌
-        if status.code() == Code::Cancelled && !ctx.is_cancelled() && ctx.is_expired(SystemTime::now()) {
-            let _ = tokio::time::timeout(DEADLINE_SETTLE, ctx.done()).await;
-        }
-        let error = callback_failure(rpc, status.code(), status.message(), ctx.is_cancelled(), &self.plugin);
-        // 超时的归因交给截止令牌（RFC-0003 规则 1）：本 SDK 的调用器不改写处理器返回的错误，所以在这里按令牌归因
-        if error.code() == ERROR_CODE_CANCELLED { ctx.cancellation().unwrap_or(error) } else { error }
+    /// 上下文的截止时间已过或已被取消、回调不发出或被放弃时的结果（`invocation.md` §5）：截止时间已过按 `DeadlineExceeded`，否则按
+    /// 「`Cancelled`，取消信号已触发」。上下文的截止时间就是 gRPC 截止时间，到点时 gRPC 自己也以截止时间中止，两者给出同一行。
+    fn abandoned(&self, ctx: &Context, rpc: Rpc<'_>) -> Error {
+        let code = if ctx.is_expired(SystemTime::now()) { Code::DeadlineExceeded } else { Code::Cancelled };
+        callback_failure(rpc, code, "", true, &self.plugin)
     }
+
+    /// gRPC 失败 → 错误：库自己的叫法先换成标准状态，再只按 [`callback_failure`] 的表映射。
+    fn status_error(&self, ctx: &Context, rpc: Rpc<'_>, status: &tonic::Status) -> Error {
+        callback_failure(rpc, standard_code(status), status.message(), ctx.is_cancelled(), &self.plugin)
+    }
+}
+
+/// gRPC 库自己的叫法换成标准状态（`invocation.md` §5）：tonic 按截止时间在本端中止调用时以 `Cancelled` 报 `Timeout expired`
+/// （[`tonic::TimeoutExpired`]），按 `DeadlineExceeded`；其余原样。
+fn standard_code(status: &tonic::Status) -> Code {
+    if status.code() == Code::Cancelled && status.message() == tonic::TimeoutExpired(()).to_string() { Code::DeadlineExceeded } else { status.code() }
 }
 
 impl fmt::Debug for Host {
@@ -263,11 +265,6 @@ pub(crate) fn callback_failure(rpc: Rpc<'_>, code: Code, message: &str, context_
         }
         _ => failed(plugin, rpc.phase(), status_reason(code, message)),
     }
-}
-
-/// 上下文的取消归因：截止令牌触发为超时，否则为取消（RFC-0003 规则 1）。
-fn cancellation(ctx: &Context) -> Error {
-    ctx.cancellation().unwrap_or_else(|| Error::cancelled(ERROR_CODE_CANCELLED, MESSAGE_CANCELLED))
 }
 
 /// 插件的权限：清单声明的与宿主授予的，两边都有才放行。
@@ -390,5 +387,14 @@ mod tests {
             assert_eq!(serde_json::to_value(error.details()).unwrap(), case["details"], "{case}");
         }
         assert_eq!(status_reason(Code::Ok, "x"), "OK: x");
+    }
+
+    /// tonic 按截止时间在本端中止调用时以 `Cancelled` 报 `Timeout expired`：先换成 `DeadlineExceeded`（`invocation.md` §5）。
+    #[test]
+    fn the_library_timeout_is_a_deadline() {
+        assert_eq!(standard_code(&tonic::Status::cancelled(tonic::TimeoutExpired(()).to_string())), Code::DeadlineExceeded);
+        assert_eq!(standard_code(&tonic::Status::cancelled("Timeout expired")), Code::DeadlineExceeded);
+        assert_eq!(standard_code(&tonic::Status::cancelled("the stream was reset")), Code::Cancelled);
+        assert_eq!(standard_code(&tonic::Status::unavailable("Timeout expired")), Code::Unavailable);
     }
 }

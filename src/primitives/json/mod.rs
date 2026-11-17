@@ -36,6 +36,8 @@ use std::fmt::{self, Write as _};
 use serde::de::DeserializeOwned;
 use serde_path_to_error::Segment;
 
+#[cfg(feature = "plugin")]
+pub(crate) use reader::Number;
 pub(crate) use reader::{Node, parse};
 pub(crate) use ser::to_vec_strict;
 pub use ser::{Model, to_value};

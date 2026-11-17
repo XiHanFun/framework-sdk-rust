@@ -38,7 +38,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::BoxFuture;
-use crate::invocation::{Context, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START};
+use crate::invocation::{Context, ERROR_CODE_CANCELLED, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START, MESSAGE_DEADLINE_EXCEEDED};
 use crate::pipeline::{self, APP_OWNER, Middleware, Next, Pipeline, Placement, Step};
 use crate::primitives::json::{self, Node};
 use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, PipelineStage, Result, Stability};
@@ -637,7 +637,8 @@ impl Middleware for ObserveStep {
 }
 
 /// Resilience 阶段的内置步骤：进入时按时钟核对截止时间，已到即以 `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_before_start`
-/// 结束，后面的中间件与处理器不执行；进入时不核对取消，途中的超时与取消按上下文的截止令牌归因（RFC-0003 第 1 条）。
+/// 结束，后面的中间件与处理器不执行；进入时不核对取消，途中的超时与取消按上下文的截止令牌归因（RFC-0003 第 1 条）：下游把取消写成
+/// `KERNEL_CANCELLED_001` 的结果、而截止令牌已触发时，改报 `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_exceeded`。
 struct DeadlineStep;
 
 impl Middleware for DeadlineStep {
@@ -650,7 +651,14 @@ impl Middleware for DeadlineStep {
             if ctx.is_expired(SystemTime::now()) {
                 return Err(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START));
             }
-            next.run(ctx).await
+            match next.run(ctx).await {
+                // 下游只知道取消发生了，不知道是哪个令牌触发的（如插件回调把 gRPC 的 Cancelled 映射成取消）：截止令牌已触发即超时，
+                // 调用方同时取消也一样（RFC-0003 规则 1，ADR-0092、ADR-0236）
+                Err(error) if error.code() == ERROR_CODE_CANCELLED && ctx.cancellation().is_some_and(|fired| fired.code() == ERROR_CODE_DEADLINE_EXCEEDED) => {
+                    Err(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_EXCEEDED))
+                }
+                outcome => outcome,
+            }
         })
     }
 }

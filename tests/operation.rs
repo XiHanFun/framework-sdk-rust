@@ -709,6 +709,60 @@ fn cancellation_only_notifies_through_the_token() {
     assert_eq!(*after.lock().unwrap(), 3, "the middleware ran to the end every time");
 }
 
+/// 下游把取消写成 `KERNEL_CANCELLED_001` 的结果时，截止时间中间件按截止令牌归因（RFC-0003 规则 1，ADR-0236）：截止令牌已触发即
+/// `KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_exceeded`，只有调用方取消时仍是取消。
+#[test]
+fn a_cancelled_result_after_the_deadline_is_a_timeout() {
+    use xihan_framework::invocation::{CancellationToken, ERROR_CODE_CANCELLED, MESSAGE_CANCELLED, MESSAGE_DEADLINE_EXCEEDED};
+
+    let registry = Registry::new();
+    registry
+        .add(
+            Contract::new("waits.cancelled"),
+            operation::handler_fn(|ctx: &Context, _request: CreateOrder| {
+                Box::pin(async move {
+                    ctx.done().await;
+                    // 只知道取消发生了：写成取消，不看是哪个令牌
+                    Err::<(), _>(Error::cancelled(ERROR_CODE_CANCELLED, MESSAGE_CANCELLED))
+                })
+            }),
+        )
+        .unwrap();
+    let invoker = Invoker::new(Arc::new(registry), &Builder::new()).unwrap();
+    let timeout = std::time::Duration::from_millis(20);
+
+    let timed = Context::builder().timeout(timeout).build();
+    let error = common::block_on(invoker.invoke(&timed, Request::new("waits.cancelled", "{}"))).unwrap_err();
+    common::assert_kernel_error(&error, MESSAGE_DEADLINE_EXCEEDED);
+
+    // 截止令牌已触发时调用方同时取消也是超时
+    let token = CancellationToken::new();
+    let both = Context::builder().cancellation(&token).timeout(timeout).build();
+    let canceller = {
+        let token = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout * 3);
+            token.cancel();
+        })
+    };
+    let error = common::block_on(invoker.invoke(&both, Request::new("waits.cancelled", "{}"))).unwrap_err();
+    common::assert_kernel_error(&error, MESSAGE_DEADLINE_EXCEEDED);
+    canceller.join().unwrap();
+
+    let token = CancellationToken::new();
+    let cancelled = Context::builder().cancellation(&token).build();
+    let canceller = {
+        let token = token.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(timeout);
+            token.cancel();
+        })
+    };
+    let error = common::block_on(invoker.invoke(&cancelled, Request::new("waits.cancelled", "{}"))).unwrap_err();
+    common::assert_kernel_error(&error, MESSAGE_CANCELLED);
+    canceller.join().unwrap();
+}
+
 /// 中间件在 handle 阶段之后看到编码之前的响应对象，XGI 调用与类型化调用一样（.NET 的 FindOperationResponse，RFC-0011 规则 3、10）；
 /// 类型化调用的响应不经编码，原样交回调用方。
 #[test]

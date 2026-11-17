@@ -9,7 +9,7 @@ use super::time::{UtcTime, effective_deadline, format_deadline};
 use super::types::{Envelope, Health};
 use super::v1;
 use crate::invocation::{CancellationToken, Context};
-use crate::primitives::json::{self, MAX_DEPTH};
+use crate::primitives::json::{self, MAX_DEPTH, Node, Number};
 use crate::primitives::{Details, Error, is_baggage_key_registered, is_error_code, is_message_key};
 
 /// 错误 → 协议的 `Error`（`invocation.md` §3「写出」）：`code`、`message_key` 原样；带消息键的错误 `text` 留空，由宿主按目录翻译成
@@ -46,8 +46,8 @@ pub(crate) fn status_of(outcome: &crate::primitives::Result<()>) -> v1::Status {
     }
 }
 
-/// 宿主回来的 `Status` → 结果（`invocation.md` §3「读入」）；`ok` 为假却没有 `error` 时是 `phase` 的失败：
-/// `PLUGINS_UNEXPECTED_001` + `plugins.process.failed`（`reason` 为 `the host reported a failure without an error`）。
+/// 宿主回来的 `Status` → 结果（`invocation.md` §3「读入」）；`ok` 为假却没有 `error`、或整个 `status` 缺失时是 `phase`（操作 ID 或
+/// `publish`）的失败：`PLUGINS_UNEXPECTED_001` + `plugins.process.failed`（`reason` 为 `the host reported a failure without an error`）。
 pub(crate) fn result_of(status: Option<&v1::Status>, plugin: &str, phase: &str) -> crate::primitives::Result<()> {
     match status {
         Some(status) if status.ok => Ok(()),
@@ -58,10 +58,10 @@ pub(crate) fn result_of(status: Option<&v1::Status>, plugin: &str, phase: &str) 
 
 /// 协议的 `Error` → 错误（`invocation.md` §3「读入」，与参考实现 `PluginErrorMapper.FromProto` 同一规则）：
 ///
-/// - `code` 不合错误码文法时整个错误换成 `PLUGINS_UNEXPECTED_001` + `plugins.process.failed`（`phase` 为 `invoke`，`reason` 为
-///   `invalid error code '<code>'`）；
-/// - `message_key` 合消息键文法的按键还原，否则是自由文本错误，文案取 `text`，`text` 为空时取 `code`；
-/// - `details` 为空、通不过共同的 JSON 读取检查或不是对象时当作没有；
+/// - `code` 不合错误码文法时整个错误换成 `PLUGINS_UNEXPECTED_001` + `plugins.process.failed`（`phase` 一律为 `invoke`，不论是哪个
+///   RPC；`reason` 为 `invalid error code '<code>'`），原来的 `inner` 丢掉；
+/// - `message_key` 合消息键文法的按键还原、不取 `text`，否则是自由文本错误，文案取 `text`，`text` 为空时取 `code`；
+/// - `details` 按 [`read_details`] 读；
 /// - `inner` 同此，最多还原 [`MAX_DEPTH`] 层。
 pub(crate) fn from_proto_error(error: &v1::Error, plugin: &str) -> Error {
     decode_error(error, plugin, 1)
@@ -71,11 +71,11 @@ fn decode_error(error: &v1::Error, plugin: &str, depth: usize) -> Error {
     if !is_error_code(&error.code) {
         return failed(plugin, PHASE_INVOKE, format!("invalid error code '{}'", error.code));
     }
-    let details = (!error.details.is_empty()).then(|| json::from_str::<Details>(&error.details).ok()).flatten();
+    let details = read_details(&error.details);
     let keyed = is_message_key(&error.message_key).then(|| Error::try_new(error.code.as_str(), error.message_key.as_str()).ok()).flatten();
     let mut decoded = match keyed {
-        // 宿主写的文案（合规的宿主对带键的错误不写）留作本地的已解析文案；再写给宿主时带键的错误不写 text
-        Some(keyed) => keyed.with_text(error.text.as_str()),
+        // 带键的错误不取 text：文案由读者按目录与参数渲染（RFC-0010）
+        Some(keyed) => keyed,
         // 码已核对过、文案非空，构造不会失败；文案为空时用错误码作文案：自由文本错误必须有文案
         None => Error::try_literal(error.code.as_str(), if error.text.is_empty() { error.code.as_str() } else { error.text.as_str() })
             .unwrap_or_else(|_| failed(plugin, PHASE_INVOKE, format!("invalid error code '{}'", error.code))),
@@ -86,6 +86,27 @@ fn decode_error(error: &v1::Error, plugin: &str, depth: usize) -> Error {
     match &error.inner {
         Some(inner) if depth < MAX_DEPTH => decoded.with_inner(decode_error(inner, plugin, depth + 1)),
         _ => decoded,
+    }
+}
+
+/// 读 `Error.details` 的 JSON 文本（`invocation.md` §3）：为空、只有空白、是空对象 `{}`、通不过共同的 JSON 读取检查、不是对象，或任何一层
+/// 有读成双精度会溢出（±∞）的数时为 `None`，即没有细节；下溢的数读成 0，超出 64 位的整数读成双精度（值模型，RFC-0010）。
+fn read_details(text: &str) -> Option<Details> {
+    // 只有空白的文本在共同读取检查里是语法错误
+    let node = json::parse(text.as_bytes()).ok()?;
+    match &node {
+        Node::Object(members) if !members.is_empty() && !overflows(&node) => json::decode::<Details>(&node).ok(),
+        _ => None,
+    }
+}
+
+/// 值树里有没有读成双精度会溢出的数：值模型把它读成无穷，`serde_json::Value` 装不下（会变成 `null`），所以整份细节当作没有。
+fn overflows(node: &Node) -> bool {
+    match node {
+        Node::Number(Number::Float(value), _) => value.is_infinite(),
+        Node::Array(items) => items.iter().any(overflows),
+        Node::Object(members) => members.iter().any(|(_, value)| overflows(value)),
+        _ => false,
     }
 }
 
@@ -169,7 +190,7 @@ pub(crate) fn proto_health(health: &Health) -> v1::HealthResponse {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::*;
     use crate::plugin::time::parse_deadline;
@@ -221,6 +242,56 @@ mod tests {
         // ok 为假却没有 error
         let missing = result_of(Some(&v1::Status { ok: false, error: None }), "xihan.acme.echo", "orders.create").unwrap_err();
         assert_eq!(details(&missing), json!({"id": "xihan.acme.echo", "phase": "orders.create", "reason": "the host reported a failure without an error"}));
+    }
+
+    /// 向量里的线上 Error（`details` 是 JSON 文本，`inner` 递归）。
+    fn proto(value: &Value) -> v1::Error {
+        let field = |name: &str| value[name].as_str().unwrap_or_default().to_owned();
+        v1::Error {
+            code: field("code"),
+            message_key: field("message_key"),
+            text: field("text"),
+            details: field("details"),
+            inner: value.get("inner").filter(|inner| !inner.is_null()).map(|inner| Box::new(proto(inner))),
+        }
+    }
+
+    /// 读入后的错误写成向量 `expected` 的形态：`key`、`text`、`details`、`inner` 没有时为 `null`。
+    fn expected(error: &Error) -> Value {
+        json!({
+            "code": error.code(),
+            "key": error.message_key(),
+            "text": error.text(),
+            "details": error.details(),
+            "inner": error.inner().map(expected),
+        })
+    }
+
+    /// 回放向量 `plugin/error-reading.json`：`cases` 全部，`statusWithoutError` 里插件读宿主的（`reader` 为 `plugin`）。
+    #[test]
+    fn errors_from_the_host_follow_the_vectors() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/spec/conformance/vectors/plugin/error-reading.json");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}; run `git submodule update --init`"));
+        let vectors: Value = serde_json::from_str(&text).unwrap();
+        let plugin = vectors["pluginId"].as_str().unwrap();
+        for case in vectors["cases"].as_array().unwrap() {
+            let decoded = from_proto_error(&proto(&case["error"]), plugin);
+            assert_eq!(expected(&decoded), case["expected"], "{}", case["name"]);
+        }
+        let mut replayed = 0;
+        for case in vectors["statusWithoutError"].as_array().unwrap().iter().filter(|case| case["reader"] == "plugin") {
+            let phase = match case["rpc"].as_str().unwrap() {
+                "invoke" => case["operation"].as_str().unwrap(),
+                _ => crate::plugin::messages::PHASE_PUBLISH,
+            };
+            // ok 为假却没有 error 与整个 status 缺失相同
+            for status in [Some(&v1::Status { ok: false, error: None }), None] {
+                let error = result_of(status, plugin, phase).unwrap_err();
+                assert_eq!(expected(&error), case["expected"], "{case}");
+            }
+            replayed += 1;
+        }
+        assert_eq!(replayed, 2);
     }
 
     #[test]

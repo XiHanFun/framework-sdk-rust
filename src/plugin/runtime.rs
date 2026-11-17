@@ -783,8 +783,8 @@ impl Runtime {
         }
     }
 
-    /// 当前健康（`lifecycle.md` §7.4）：只有 `Ready` 与 `Degraded` 期间求健康回调，报的 `Ready`、`Degraded`、`Failed` 照办，其他状态
-    /// 不改变状态；其余状态报本地状态与失败原因，没有健康项、不调回调。
+    /// 当前健康（`lifecycle.md` §7.4）：只有 `Ready` 与 `Degraded` 期间求健康回调，报的 `Ready`、`Degraded`、`Failed` 照办（回调 panic
+    /// 按 `Degraded`），其他状态不改变状态；其余状态报本地状态与失败原因，没有健康项、不调回调。
     pub(crate) fn health(&self) -> Health {
         let snapshot = self.snapshot();
         if !snapshot.state.is_serving() {
@@ -793,10 +793,7 @@ impl Runtime {
         let Some(reported) = self.ask_health() else {
             return Health { state: snapshot.state, items: Vec::new(), error: snapshot.error };
         };
-        // 钩子 panic 时这一次报 Degraded，状态不变：只有回调报的状态改变状态
-        if reported.panicked {
-            return Health { state: LifecycleState::Degraded, items: Vec::new(), error: reported.error };
-        }
+        // 钩子 panic 按回调报了 Degraded 处理（lifecycle.md §7.4）：状态同样迁到 Degraded，之后的结果照常决定状态
         if matches!(reported.state, LifecycleState::Ready | LifecycleState::Degraded | LifecycleState::Failed) && reported.state != snapshot.state {
             // 迁移不合法（状态已经变了，如刚进入 Draining）时不改
             self.transition(reported.state, reported.error.clone());
@@ -815,7 +812,7 @@ impl Runtime {
                 let text = panic_reason(payload.as_ref());
                 self.logger.log(Level::Error, "a lifecycle hook panicked", &[("phase", Value::from(PHASE_HEALTH)), ("panic", Value::from(text))]);
                 let error = failed(&self.manifest.id, PHASE_HEALTH, REASON_PANIC);
-                return Some(Reported { state: LifecycleState::Degraded, items: Vec::new(), error: Some(error), panicked: true });
+                return Some(Reported { state: LifecycleState::Degraded, items: Vec::new(), error: Some(error) });
             }
         };
         let declared = self.manifest.health();
@@ -827,16 +824,15 @@ impl Runtime {
             }
             kept
         });
-        Some(Reported { state: reported.state, items, error: reported.error, panicked: false })
+        Some(Reported { state: reported.state, items, error: reported.error })
     }
 }
 
-/// 健康回调的一次结果，健康项已按清单过滤。
+/// 健康回调的一次结果，健康项已按清单过滤；回调 panic 时是 `Degraded` 与 `plugins.process.failed`。
 struct Reported {
     state: LifecycleState,
     items: Vec<super::types::HealthItem>,
     error: Option<Error>,
-    panicked: bool,
 }
 
 /// panic 内容的文本（只写进 stderr 日志）：`&str`、`String` 或 [`FrameworkError`]，其余写成固定的说明。

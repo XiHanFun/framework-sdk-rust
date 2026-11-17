@@ -370,6 +370,8 @@ struct Done {
 struct Relay {
     operation: String,
     tenant: Option<String>,
+    /// 在另造的上下文里回调：`deadline` 是 50 毫秒后到期、等它到期再回调，`cancel` 是已被取消的，`short` 是 300 毫秒后到期、立即回调。
+    abandon: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -469,7 +471,21 @@ fn orders_plugin(recorder: &Arc<Recorder>, log: &Buffer) -> Plugin {
             operation::handler_fn(|ctx: &Context, request: Relay| {
                 Box::pin(async move {
                     let host = plugin::host(ctx).expect("the runtime puts the host client into every call");
-                    let payload = host.invoke(&with_tenant(ctx, request.tenant), &request.operation, "{}").await?;
+                    let callback = match request.abandon.as_deref() {
+                        Some("deadline") => {
+                            let expired = Context::builder().timeout(Duration::from_millis(50)).build();
+                            expired.done().await;
+                            expired
+                        }
+                        Some("cancel") => {
+                            let token = xihan_framework::invocation::CancellationToken::new();
+                            token.cancel();
+                            Context::builder().cancellation(&token).build()
+                        }
+                        Some("short") => Context::builder().timeout(Duration::from_millis(300)).build(),
+                        _ => with_tenant(ctx, request.tenant),
+                    };
+                    let payload = host.invoke(&callback, &request.operation, "{}").await?;
                     Ok(Relayed { payload: String::from_utf8(payload).unwrap() })
                 })
             }),
@@ -1042,21 +1058,24 @@ async fn health_reports_follow_the_hook_while_serving() {
 
     // 每次 Health 求一次回调；没声明的健康项丢掉，同名只告警一次
     let before = calls();
-    let ready = health(&mut client).await;
+    let reported = health(&mut client).await;
     assert_eq!(calls(), before + 1);
-    assert_eq!(ready.state, LifecycleState::Ready.value());
-    let items: Vec<(&str, i32, &str)> = ready.items.iter().map(|item| (item.name.as_str(), item.status, item.description.as_str())).collect();
+    assert_eq!(reported.state, LifecycleState::Ready.value());
+    let items: Vec<(&str, i32, &str)> = reported.items.iter().map(|item| (item.name.as_str(), item.status, item.description.as_str())).collect();
     assert_eq!(items, [("main", 1, "all good")]);
     health(&mut client).await;
     assert_eq!(log.lines().iter().filter(|line| line["item"] == "ghost" && line["level"] == "warning").count(), 1);
 
-    // 回调 panic：这一次的结果是 Degraded、没有健康项，状态不变
+    // 回调 panic：这一次的结果是 Degraded、没有健康项，状态与回调报了 Degraded 一样迁到 Degraded；之后的结果照常决定状态
     *recorder.health.lock().unwrap() = HealthMode::Panic;
     let panicked = health(&mut client).await;
     assert_eq!((panicked.state, panicked.items.len()), (LifecycleState::Degraded.value(), 0));
     let error = panicked.error.unwrap();
     assert_eq!((error.code.as_str(), error.message_key.as_str(), error.text.as_str()), ("PLUGINS_UNEXPECTED_001", "plugins.process.failed", ""));
     assert_eq!(serde_json::from_str::<Value>(&error.details).unwrap(), json!({"id": ID, "phase": "health", "reason": "panic"}));
+    assert_eq!(running.state(), LifecycleState::Degraded);
+    *recorder.health.lock().unwrap() = HealthMode::Report(ready());
+    assert_eq!(health(&mut client).await.state, LifecycleState::Ready.value());
     assert_eq!(running.state(), LifecycleState::Ready);
 
     // 回调报的 Degraded、Ready 照办；Failed 之后不再回来，也不再调回调
@@ -1442,6 +1461,10 @@ impl HostRpc for FakeHostService {
             })),
             "host.badcode" => failed(Some(v1::Error { code: "bad".to_owned(), message_key: "orders.conflict".to_owned(), ..Default::default() })),
             "host.noerror" => failed(None),
+            "host.slow" => {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                Ok(Response::new(v1::InvokeResponse { status: Some(v1::Status { ok: true, error: None }), payload: b"{}".to_vec() }))
+            }
             _ => Err(Status::unimplemented("no such operation")),
         }
     }
@@ -1599,6 +1622,43 @@ async fn callbacks_without_a_supported_endpoint_fail_without_sending() {
 }
 
 #[tokio::test]
+async fn callbacks_check_the_endpoint_first_and_do_not_send_abandoned_calls() {
+    // 先看回调端点：没有可用端点时即使权限也没授予，也报 plugins.host.unavailable（invocation.md §5）
+    let (recorder, log) = (Arc::new(Recorder::default()), Buffer::default());
+    let running = orders_plugin(&recorder, &log).start(Launch::new(TOKEN)).await.unwrap();
+    let mut client = connect(running.endpoint()).await;
+    open(&mut client, &[]).await;
+    let relayed = invoke(&mut client, "orders.relay", r#"{"operation":"host.echo"}"#, None).await;
+    assert_eq!(keyed(relayed.status.as_ref()).1, "plugins.host.unavailable");
+    stop(&mut client, running).await;
+
+    let host = Arc::new(FakeHost::default());
+    let address = fake_host(&host).await;
+    // 再看权限与租户，最后才看上下文的截止时间与取消
+    let (recorder, log) = (Arc::new(Recorder::default()), Buffer::default());
+    let running = orders_plugin(&recorder, &log).start(launch_with(&address)).await.unwrap();
+    let mut client = connect(running.endpoint()).await;
+    open(&mut client, &[plugin::PERMISSION_MESSAGING]).await;
+    let denied = invoke(&mut client, "orders.relay", r#"{"operation":"host.echo","abandon":"cancel"}"#, None).await;
+    assert_eq!(keyed(denied.status.as_ref()).1, "plugins.callback.denied");
+    stop(&mut client, running).await;
+
+    // 上下文的截止时间已过按 DeadlineExceeded、已被取消按「Cancelled，取消信号已触发」，都不发请求
+    let (recorder, log) = (Arc::new(Recorder::default()), Buffer::default());
+    let (running, mut client) = serving(&recorder, &log, launch_with(&address)).await;
+    let expired = invoke(&mut client, "orders.relay", r#"{"operation":"host.echo","abandon":"deadline"}"#, None).await;
+    assert_eq!(keyed(expired.status.as_ref()), ("KERNEL_TIMEOUT_001".to_owned(), "kernel.invocation.deadline_exceeded".to_owned(), Value::Null));
+    let cancelled = invoke(&mut client, "orders.relay", r#"{"operation":"host.echo","abandon":"cancel"}"#, None).await;
+    assert_eq!(keyed(cancelled.status.as_ref()), ("KERNEL_CANCELLED_001".to_owned(), "kernel.invocation.cancelled".to_owned(), Value::Null));
+    assert!(host.invokes.lock().unwrap().is_empty(), "abandoned callbacks are not sent");
+    // 发出之后到了截止时间：tonic 以 Cancelled 报的 Timeout expired 按 DeadlineExceeded
+    let late = invoke(&mut client, "orders.relay", r#"{"operation":"host.slow","abandon":"short"}"#, None).await;
+    assert_eq!(keyed(late.status.as_ref()), ("KERNEL_TIMEOUT_001".to_owned(), "kernel.invocation.deadline_exceeded".to_owned(), Value::Null));
+    assert_eq!(host.invokes.lock().unwrap().len(), 1);
+    stop(&mut client, running).await;
+}
+
+#[tokio::test]
 async fn callbacks_to_an_unreachable_host_are_unavailable() {
     let (recorder, log) = (Arc::new(Recorder::default()), Buffer::default());
     // 绑定后立即关掉的端口：连上去一定失败，按 Unavailable 映射
@@ -1709,9 +1769,12 @@ async fn cancelled_calls_signal_the_token() {
     let mut request = Request::new(v1::InvokeRequest { operation: "orders.slow".to_owned(), payload: br#"{"millis":10000}"#.to_vec(), metadata: None });
     request.set_timeout(Duration::from_millis(200));
     let started = Instant::now();
-    // 客户端与 tonic 服务端各按 grpc-timeout 计时，先到的一方结束调用
-    let code = client.invoke(request).await.unwrap_err().code();
-    assert!(matches!(code, Code::DeadlineExceeded | Code::Cancelled), "{code:?}");
+    // 客户端、tonic 服务端与插件的截止令牌各按 grpc-timeout 计时，先到的一方结束调用：插件的令牌先到时处理器照常返回自己的结果，
+    // 调用以它结束（RFC-0003 规则 1）
+    match client.invoke(request).await {
+        Err(status) => assert!(matches!(status.code(), Code::DeadlineExceeded | Code::Cancelled), "{status:?}"),
+        Ok(response) => assert_eq!(payload(&response.into_inner()), json!({"cancelled": true})),
+    }
     // 停止等的是处理器真正结束：令牌触发后它很快返回，Stop 不必等满 10 秒
     stop(&mut client, running).await;
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());

@@ -395,8 +395,9 @@ pub trait Hooks: Send + Sync + 'static {
     /// 健康回调（`lifecycle.md` §7.4）；`None` 表示没有健康回调：`Start` 之后直接进入 `Ready`，健康按运行时自己的状态上报、没有健康项。
     ///
     /// 在 `Start` 成功之后求一次，之后只在 `Ready` 与 `Degraded` 期间调用：每次 `Health`，以及 `WatchHealth` 每 10 秒一次。报的
-    /// `Ready`、`Degraded` 或 `Failed` 照办（`Failed` 之后不再回来），其他状态不改变状态；健康项名不在清单 `contributes.health` 里的丢掉。
-    /// panic 时这一次的结果是 `Degraded`、没有健康项，状态不变。它要快、不阻塞。
+    /// `Ready`、`Degraded` 或 `Failed` 照办（`Failed` 之后不再回来），其他状态不改变状态（`Start` 时按 `Ready`）；健康项名不在清单
+    /// `contributes.health` 里的丢掉。panic 与报了 `Degraded` 一样：这一次的结果是 `Degraded`（`plugins.process.failed`，`phase` 为
+    /// `health`）、没有健康项，状态迁到 `Degraded`，之后的结果照常决定状态。它要快、不阻塞。
     fn health(&self) -> Option<Health> {
         None
     }
