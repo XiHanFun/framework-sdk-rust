@@ -118,9 +118,20 @@ impl MessageCatalog {
     }
 }
 
-/// 运行时自己的消息目录：它产生的 `plugins.*` 错误在 10 种区域的文案，名字是 SDK 名，握手时附在插件的目录之后，
-/// 让宿主不依赖自带的目录也能翻译它们。
-pub(crate) fn runtime_catalog() -> MessageCatalog {
+/// 运行时自己的消息目录：它与宿主共用的 `plugins.*` 消息键（`invocation.md` §8）在 10 种区域的文案，同参考实现，目录名是 SDK 名。
+///
+/// 宿主有这些键的目录，运行时不随握手发送它（`handshake.md` §3 第 6 条），错误交给宿主时只带键与参数、`text` 留空，由宿主按调用方的
+/// 区域翻译。它供本地渲染：en-US 已经并进 SDK 自带的模板；要按别的区域渲染，把它的 [`MessageCatalog::to_catalog`] 与插件自己的目录
+/// 一起交给 [`set_default_messages`](crate::primitives::set_default_messages)。
+///
+/// ```
+/// use xihan_framework::plugin::{self, MESSAGE_UNAVAILABLE};
+///
+/// let catalog = plugin::runtime_catalog();
+/// assert_eq!(catalog.locales().count(), plugin::LOCALES.len());
+/// assert!(catalog.templates("zh-CN").any(|(key, _)| key == MESSAGE_UNAVAILABLE));
+/// ```
+pub fn runtime_catalog() -> MessageCatalog {
     const FILES: [(&str, &str); 10] = [
         ("en-US", include_str!("localization/en-US.json")),
         ("zh-CN", include_str!("localization/zh-CN.json")),
@@ -143,7 +154,7 @@ mod tests {
     use crate::plugin::BUILTIN_TEMPLATES;
     use crate::primitives::placeholders;
 
-    /// 10 种区域的文件键相同、占位符相同，en-US 与自带的模板逐字相同。
+    /// 10 种区域的文件键相同、占位符相同，en-US 与自带的模板逐字相同；键、参数与 en-US 模板同向量 `plugin/plugin-messages.json`。
     #[test]
     fn runtime_catalog_covers_every_locale() {
         let catalog = runtime_catalog();
@@ -152,6 +163,21 @@ mod tests {
         let mut builtin = BUILTIN_TEMPLATES.to_vec();
         builtin.sort_unstable();
         assert_eq!(english, builtin);
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/spec/conformance/vectors/plugin/plugin-messages.json");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}; run `git submodule update --init`"));
+        let vectors: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let mut expected: Vec<(&str, &str)> =
+            vectors["messages"].as_array().unwrap().iter().map(|message| (message["key"].as_str().unwrap(), message["template"].as_str().unwrap())).collect();
+        expected.sort_unstable();
+        assert_eq!(english, expected, "the runtime keys and en-US templates are those of plugin-messages.json, nothing more");
+        for message in vectors["messages"].as_array().unwrap() {
+            let mut arguments: Vec<&str> = message["arguments"].as_array().unwrap().iter().map(|argument| argument.as_str().unwrap()).collect();
+            let mut used = placeholders(message["template"].as_str().unwrap());
+            arguments.sort_unstable();
+            used.sort_unstable();
+            assert_eq!(used, arguments, "{}", message["key"]);
+        }
         for locale in LOCALES {
             let templates: Vec<(&str, &str)> = catalog.templates(locale).collect();
             assert_eq!(templates.len(), english.len(), "{locale}");

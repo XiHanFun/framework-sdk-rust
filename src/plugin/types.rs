@@ -307,31 +307,50 @@ pub struct Binding {
     pub value: String,
 }
 
-/// `Configure` 下发的内容（`lifecycle.md` §2）。
+/// `Configure` 下发的内容（`lifecycle.md` §2、§7.2）。
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct Configuration {
-    /// 清单 `contributes.config.section` 节的 JSON 对象文本；没有声明配置节时为 `{}`。配置源经宿主展开后再序列化
-    /// （`lifecycle.md` §2），规范没有规定叶子的类型，.NET 参考实现把标量都写成字符串：数字与布尔成员先按字符串读。
+    /// 清单 `contributes.config.section` 节的 JSON 对象文本，原样交给作者；`configuration` 为空时是 `{}`，不是对象的配置节在调用钩子
+    /// 之前就以 `plugins.process.failed` 拒绝。宿主把 `IConfiguration` 的叶子一律写成 JSON 字符串（`lifecycle.md` §2），类型化读取用
+    /// [`Configuration::decode`]。
     pub section: String,
-    /// 宿主授予的权限，等于清单 `permissions`。
+    /// 宿主授予的权限，等于清单 `permissions`；回调前的权限核对以它为准。
     pub granted_permissions: Vec<String>,
     /// 只含清单声明的绑定。
     pub bindings: Vec<Binding>,
     /// 宿主为插件创建的可写工作目录（宿主停止时不删除）。
     pub work_directory: PathBuf,
-    pub(crate) host: Option<Arc<Host>>,
+    pub(crate) host: Arc<Host>,
 }
 
 impl Configuration {
-    /// 按共同的 JSON 读取检查把配置节读成 `T`；失败时 [`ReadError::path`] 是出错的位置。
+    /// 把配置节读成 `T`（`lifecycle.md` §7.2 的类型化读取）：成员名按 ASCII 不区分大小写对上字段（与 `IConfiguration` 一致，完全相同的
+    /// 优先）；字符串叶子读成数字时按 JSON 数字的文法（`"8080"`、`"-1.5e3"`，不带空白），读成布尔时只认 `true`、`false`（ASCII 不区分
+    /// 大小写）；其余照目标类型的常规读法（同 [`json::from_str`]，数字按值模型，对象位置只收对象）。失败时 [`ReadError::path`] 是出错的位置。
+    ///
+    /// ```
+    /// # use serde::Deserialize;
+    /// # use xihan_framework::plugin::Configuration;
+    /// #[derive(Deserialize)]
+    /// struct Settings {
+    ///     port: u16,
+    ///     verbose: bool,
+    ///     name: String,
+    /// }
+    /// # fn read(configuration: &Configuration) {
+    /// // 宿主写来的配置节：{"Port":"8080","VERBOSE":"True","name":"echo"}
+    /// let settings: Settings = configuration.decode().unwrap();
+    /// # }
+    /// ```
     pub fn decode<T: DeserializeOwned>(&self) -> std::result::Result<T, ReadError> {
-        json::from_str(&self.section)
+        json::decode_lenient(&json::parse(self.section.as_bytes())?)
     }
 
-    /// 宿主回调的客户端：插件在调用之外（后台任务）回调宿主时用它；宿主没有下发回调端点时为 `None`。
-    pub fn host(&self) -> Option<Arc<Host>> {
-        self.host.clone()
+    /// 宿主回调的客户端：插件在调用之外（后台任务）回调宿主时用它。没有可用的回调端点时同样有客户端，回调以
+    /// `plugins.host.unavailable` 失败（`handshake.md` §4）。
+    pub fn host(&self) -> Arc<Host> {
+        Arc::clone(&self.host)
     }
 }
 
@@ -347,31 +366,37 @@ impl fmt::Debug for Configuration {
     }
 }
 
-/// 插件作者接入生命周期的钩子（`lifecycle.md` §2、§4、§5）；方法都有什么都不做的缺省实现。
+/// 插件作者接入生命周期的钩子（`lifecycle.md` §7）；方法都有什么都不做的缺省实现。
 ///
-/// 返回的 `Err` 原样放进应答的 `Status.error`；钩子 panic 时是 `PLUGINS_UNEXPECTED_001` + `plugins.process.failed`。
-/// `configure` 或 `start` 失败即插件进入 `Failed`。
+/// 返回的 `Err` 原样放进应答的 `Status.error`；钩子 panic 时是 `PLUGINS_UNEXPECTED_001` + `plugins.process.failed`，`phase` 是
+/// `configure`、`start`、`stop` 或 `health`，`reason` 是 `panic`（`lifecycle.md` §7.6：Rust 没有异常，panic 的内容可能含路径、
+/// 连接串，只写进 stderr 日志）。
 pub trait Hooks: Send + Sync + 'static {
-    /// `Configure` 时调用：读配置节、记下绑定与工作目录。
+    /// `Configure` 时调用：读配置节、记下绑定与工作目录。配置节不是 JSON 对象时不调用；失败或 panic 即插件进入 `Failed`。
     fn configure<'a>(&'a self, configuration: &'a Configuration) -> BoxFuture<'a, Result<()>> {
         let _ = configuration;
         Box::pin(async { Ok(()) })
     }
 
-    /// `Start` 时调用；返回 `Ok` 后插件就绪、接受调用。
+    /// `Start` 时调用；返回 `Ok` 后插件进入 `Started`，再按 [`Hooks::health`] 进入 `Ready`、`Degraded` 或 `Failed`，然后才应答
+    /// （`lifecycle.md` §7.3）。失败或 panic 即插件进入 `Failed`。
     fn start(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async { Ok(()) })
     }
 
-    /// 停止时调用：在途调用已经完成（或宽限已过），在这里释放资源；`reason` 是 `shutdown` / `unload` / `restart`，
-    /// stdin 关闭或收到 SIGTERM 时是 `exit`；`grace` 是剩下的宽限。
+    /// 停止时调用，进程里最多一次，只在 [`Hooks::start`] 成功过之后（`lifecycle.md` §7.5）：在途调用已经结束（或宽限已过、它们的
+    /// 取消令牌已触发），在这里释放资源。`reason` 是宿主 `Stop` 的原因（`shutdown` / `unload` / `restart`），stdin 关闭或收到 SIGTERM
+    /// 时是 `shutdown`；`grace` 是剩下的宽限。失败与 panic 都只写进 `StopResponse.status`，进程照常以退出码 0 退出。
     fn stop<'a>(&'a self, reason: &'a str, grace: Duration) -> BoxFuture<'a, Result<()>> {
         let _ = (reason, grace);
         Box::pin(async { Ok(()) })
     }
 
-    /// 当前健康；`None` 表示按运行时自己的状态上报、没有健康项。`Health` 与 `WatchHealth` 调用它，`WatchHealth` 每秒重新取一次，
-    /// 变化时推送，所以它要快、不阻塞。
+    /// 健康回调（`lifecycle.md` §7.4）；`None` 表示没有健康回调：`Start` 之后直接进入 `Ready`，健康按运行时自己的状态上报、没有健康项。
+    ///
+    /// 在 `Start` 成功之后求一次，之后只在 `Ready` 与 `Degraded` 期间调用：每次 `Health`，以及 `WatchHealth` 每 10 秒一次。报的
+    /// `Ready`、`Degraded` 或 `Failed` 照办（`Failed` 之后不再回来），其他状态不改变状态；健康项名不在清单 `contributes.health` 里的丢掉。
+    /// panic 时这一次的结果是 `Degraded`、没有健康项，状态不变。它要快、不阻塞。
     fn health(&self) -> Option<Health> {
         None
     }

@@ -9,7 +9,22 @@ use std::process::Command;
 use serde::Deserialize;
 
 /// 运行器的全部用例（`spec/conformance/README.md` 的用例表）。
-const CASES: [&str; 8] = ["handshake", "refusal", "session", "lifecycle", "unknown-operation", "declared-operations", "event", "stdin"];
+const CASES: [&str; 14] = [
+    "handshake",
+    "refusal",
+    "session",
+    "lifecycle",
+    "order",
+    "unknown-operation",
+    "declared-operations",
+    "unavailable",
+    "event",
+    "unsubscribed",
+    "stream",
+    "configuration",
+    "stop-early",
+    "stdin",
+];
 
 /// 运行器 `--json` 输出的一项。
 #[derive(Debug, Deserialize)]

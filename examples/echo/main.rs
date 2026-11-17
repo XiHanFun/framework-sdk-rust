@@ -143,7 +143,7 @@ fn create(echo: &Echo, ctx: &Context, request: CreateRequest) -> Result<CreateRe
     })
 }
 
-/// 经宿主回调调用另一个操作，把宿主的响应原样返回；宿主没有下发回调端点时失败。
+/// 经宿主回调调用另一个操作，把宿主的响应原样返回；宿主没有给出能连的回调端点时以 `plugins.host.unavailable` 失败。
 async fn relay(ctx: &Context, request: RelayRequest) -> Result<Json> {
     let host = plugin::host(ctx).ok_or_else(|| Error::unavailable("ECHO_UNAVAILABLE_001", "echo.host.unavailable"))?;
     let payload = request.payload.map(|payload| payload.as_str().as_bytes().to_vec()).unwrap_or_default();

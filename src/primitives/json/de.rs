@@ -189,7 +189,7 @@ impl<'de> MapAccess<'de> for Members<'de> {
 }
 
 /// 成员名：交给访问者的是字符串；整数与布尔类型的键（如 `BTreeMap<i32, _>`）从名字的文本解析。
-struct Key<'de>(&'de str);
+pub(super) struct Key<'de>(pub(super) &'de str);
 
 macro_rules! parsed_key {
     ($($method:ident => $visit:ident: $type:ty),* $(,)?) => {

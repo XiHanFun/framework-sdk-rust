@@ -24,7 +24,8 @@ pub enum Network {
     Unix,
     /// 回环 TCP `tcp`：只绑定 `127.0.0.1`，同机的其他用户连得上，隔离只靠会话令牌。
     Tcp,
-    /// Windows 命名管道 `npipe`：只接受本机连接；只在 Windows 上可用。
+    /// Windows 命名管道 `npipe`：拒绝远程客户端，用系统缺省的安全描述符（其他本机用户只能以只读打开、发不出请求），与回环 TCP
+    /// 一样隔离靠会话令牌（`handshake.md` §4）；只在 Windows 上可用。
     NamedPipe,
 }
 
@@ -58,6 +59,18 @@ impl Network {
             Self::Tcp
         }
     }
+
+    /// 本平台上运行时能监听也能连接的网络，按回调时的偏好无关的固定顺序：Unix 上是 `unix` 与 `tcp`，Windows 上是 `npipe` 与 `tcp`，
+    /// 其他平台只有 `tcp`。回调端点从 `XIHAN_PLUGIN_HOST_ADDRESS` 里按宿主的顺序取第一个 network 在这里的项（`handshake.md` §4）。
+    pub const fn supported() -> &'static [Self] {
+        if cfg!(unix) {
+            &[Self::Unix, Self::Tcp]
+        } else if cfg!(windows) {
+            &[Self::NamedPipe, Self::Tcp]
+        } else {
+            &[Self::Tcp]
+        }
+    }
 }
 
 impl fmt::Display for Network {
@@ -79,13 +92,14 @@ impl Endpoint {
         Self { network, address: address.into() }
     }
 
-    /// 解析 `<network> <address>`（环境变量 `XIHAN_PLUGIN_HOST_ADDRESS` 与握手行去掉版本之后的部分）：文法
-    /// `^(unix|tcp|npipe) (\S+)$`，`tcp` 的地址只能是回环地址 `127.0.0.1:<port>` 或 `[::1]:<port>`；不合法时为 `None`。
+    /// 解析一个 `<network> <address>`（握手行去掉版本之后的部分，`XIHAN_PLUGIN_HOST_ADDRESS` 的一项，`handshake.md` §2）：
+    /// `network` 是 `unix`、`tcp` 或 `npipe`，与地址之间恰好一个空格；地址是一个或多个空白之外的字符（空白见 [`is_whitespace`]，
+    /// 非 ASCII 字母与 `;` 都可以出现）；`tcp` 的地址只能是回环地址加端口，写法固定：`127.0.0.0/8` 的四段点分十进制（不带前导零）或
+    /// `[::1]`，端口 `1`–`65535`（不带正负号与前导零）。不合法时为 `None`。
     pub fn parse(text: &str) -> Option<Self> {
         let (network, address) = text.split_once(' ')?;
         let network = Network::parse(network)?;
-        // \S 只排除 ASCII 空白：空格、制表、换行、换页、回车
-        if address.is_empty() || address.bytes().any(|byte| matches!(byte, b' ' | b'\t' | b'\n' | b'\x0C' | b'\r')) {
+        if address.is_empty() || address.chars().any(is_whitespace) {
             return None;
         }
         if network == Network::Tcp && !is_loopback(address) {
@@ -117,16 +131,58 @@ impl fmt::Display for Endpoint {
     }
 }
 
-/// 解析握手行（`handshake.md` §2，向量 `plugin/handshake-lines.json`）：`^xihan-plugin/1 (unix|tcp|npipe) (\S+)$`，
-/// `tcp` 只接受回环地址；不合法时为 `None`。
+/// 解析去掉行尾之后的握手行（`handshake.md` §2，向量 `plugin/handshake-lines.json`）：`xihan-plugin/1 <network> <address>`，
+/// 前缀之后同 [`Endpoint::parse`]；不合法时为 `None`。
 pub fn parse_handshake_line(line: &str) -> Option<Endpoint> {
     Endpoint::parse(line.strip_prefix(HANDSHAKE_LINE_VERSION)?.strip_prefix(' ')?)
 }
 
-/// 回环地址 `127.0.0.1:<port>` 或 `[::1]:<port>`，端口是十进制数字；主机名（含 `localhost`）不算。
+/// 解析宿主回调端点的列表 `XIHAN_PLUGIN_HOST_ADDRESS`（`handshake.md` §4，向量 `plugin/host-addresses.json`）：一个或多个
+/// `<network> <address>`，按宿主的偏好排序、以 `;` 分隔，每项同 [`Endpoint::parse`]、地址不含 `;`。任何一项不合法（含空项、
+/// 首尾的 `;`）整个值就不合法，空串也不合法；不合法时为 `None`。
+pub fn parse_host_addresses(value: &str) -> Option<Vec<Endpoint>> {
+    // 按 ; 切开之后地址里自然没有 ;，空项在 Endpoint::parse 里不合法
+    value.split(';').map(Endpoint::parse).collect()
+}
+
+/// 按 `handshake.md` §4 选回调端点：值合法时按顺序取第一个 network 在 `supported` 里的项；值不合法（变量缺失按空串传入）或没有
+/// 能连的项时为 `None`，插件照常服务，回调以 `plugins.host.unavailable` 失败、不发请求。运行时用 [`Network::supported`]。
+pub fn select_host_endpoint(value: &str, supported: &[Network]) -> Option<Endpoint> {
+    parse_host_addresses(value)?.into_iter().find(|endpoint| supported.contains(&endpoint.network))
+}
+
+/// 握手行与回调端点所说的空白（`handshake.md` §2，与 .NET 正则的 `\s` 相同）：U+0009–U+000D、U+0020、U+0085、U+00A0、U+1680、
+/// U+2000–U+200A、U+2028、U+2029、U+202F、U+205F、U+3000；其余字符（含 U+200B 这样的零宽字符）都不是空白。
+///
+/// 集合按规范逐个写出，不用 [`char::is_whitespace`]：后者跟着 Unicode 的版本走，规范的集合是固定的。
+pub fn is_whitespace(c: char) -> bool {
+    matches!(c, '\u{09}'..='\u{0D}' | '\u{20}' | '\u{85}' | '\u{A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}' | '\u{3000}')
+}
+
+/// `tcp` 端点的地址是不是回环地址加端口（`handshake.md` §2）：主机是 `127.0.0.0/8` 的四段点分十进制（每段 `0`–`255`、不带前导零）
+/// 或 `[::1]`，端口是 `1`–`65535` 的十进制（不带正负号与前导零）。主机名（含 `localhost`）、`127.1`、`0177.0.0.1`、
+/// `2130706433` 这些操作系统也接受的写法一律不算。
 fn is_loopback(address: &str) -> bool {
-    let port = address.strip_prefix("127.0.0.1:").or_else(|| address.strip_prefix("[::1]:"));
-    port.is_some_and(|port| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+    let Some((host, port)) = address.rsplit_once(':') else {
+        return false;
+    };
+    if decimal(port, 65_535).is_none_or(|port| port == 0) {
+        return false;
+    }
+    if host == "[::1]" {
+        return true;
+    }
+    let mut segments = host.split('.');
+    segments.next() == Some("127") && (0..3).all(|_| segments.next().and_then(|segment| decimal(segment, 255)).is_some()) && segments.next().is_none()
+}
+
+/// 读不带正负号与前导零的十进制数（`0` 本身可以），只认 ASCII 数字，不超过 `limit`；不合写法时为 `None`。
+fn decimal(text: &str, limit: u32) -> Option<u32> {
+    if text.is_empty() || (text.len() > 1 && text.starts_with('0')) {
+        return None;
+    }
+    // 逐位累加并比较上限，过长的数字不会溢出
+    text.bytes().try_fold(0u32, |value, byte| byte.is_ascii_digit().then(|| value * 10 + u32::from(byte - b'0')).filter(|value| *value <= limit))
 }
 
 /// 一条本机连接：服务端接受的，或回调宿主时建立的。
@@ -210,7 +266,8 @@ pub(crate) struct Listener {
 /// 接受失败（文件描述符用尽等）之后等一会儿再接受，不让失败的循环占满 CPU。
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
-/// 按网络类型监听：Unix 域套接字放进新建的私有目录，TCP 只绑定 `127.0.0.1` 的随机端口，命名管道用随机名字、只接受本机连接。
+/// 按网络类型监听：Unix 域套接字放进新建的私有目录，TCP 只绑定 `127.0.0.1` 的随机端口，命名管道用随机名字、拒绝远程客户端。
+/// 生成的地址都不含空白（`handshake.md` §2）。
 pub(crate) async fn listen(network: Network) -> io::Result<Listener> {
     // 有界通道：服务端来不及取的连接在通道里排队，排满时接受循环等它，不在内存里堆积
     let (sender, incoming) = mpsc::channel(16);
@@ -241,10 +298,16 @@ pub(crate) async fn listen(network: Network) -> io::Result<Listener> {
 async fn listen_unix(sender: mpsc::Sender<io::Result<Io>>, incoming: mpsc::Receiver<io::Result<Io>>) -> io::Result<Listener> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 
+    // 握手行的地址不能含空白（handshake.md §2），也要是 UTF-8 才能原样写出：临时目录的路径不满足时改用 /tmp
+    let temp = std::env::temp_dir();
+    let base = match temp.to_str() {
+        Some(text) if !text.chars().any(is_whitespace) => temp,
+        _ => PathBuf::from("/tmp"),
+    };
     // 私有目录（handshake.md §4）：名字随机、权限 0700、只新建不复用；已经存在的可能是别人抢先建的、指向别处的链接，换个名字重来
     let mut attempts = 0;
     let directory = loop {
-        let candidate = std::env::temp_dir().join(format!("xihan-plugin-{}", random_suffix()));
+        let candidate = base.join(format!("xihan-plugin-{}", random_suffix()));
         match std::fs::DirBuilder::new().mode(0o700).create(&candidate) {
             Ok(()) => break candidate,
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempts < 8 => attempts += 1,
@@ -290,7 +353,8 @@ fn listen_pipe(sender: mpsc::Sender<io::Result<Io>>, incoming: mpsc::Receiver<io
     use tokio::net::windows::named_pipe::ServerOptions;
 
     // first_pipe_instance：同名管道已经存在（可能是别人抢先建的）就失败，换个名字重来，不接到别人的管道上；
-    // reject_remote_clients：只接受本机连接（handshake.md §4）
+    // reject_remote_clients：拒绝远程客户端（handshake.md §4）。访问控制表要 unsafe 才设得了，本 crate 禁用 unsafe，
+    // 所以用系统缺省的安全描述符：其他本机用户只能以只读打开、发不出请求，与回环 TCP 一样隔离靠会话令牌（§4 允许的做法）
     let mut attempts = 0;
     let (name, mut server) = loop {
         let name = format!(r"\\.\pipe\xihan-plugin-{}", random_suffix());
@@ -414,9 +478,14 @@ mod tests {
         assert_eq!((endpoint.network(), endpoint.address()), (Network::Unix, "/run/xihan/host-1f3a.sock"));
         assert_eq!(endpoint.to_string(), "unix /run/xihan/host-1f3a.sock");
         assert_eq!(endpoint.handshake_line(), "xihan-plugin/1 unix /run/xihan/host-1f3a.sock");
-        for text in ["tcp 127.0.0.1:", "tcp 127.0.0.1:x", "tcp [::1]", "unix  /a", "unix /a b", "UNIX /a", "unix", "unix ", "unix /a\t"] {
+        for text in
+            ["tcp 127.0.0.1:", "tcp 127.0.0.1:x", "tcp [::1]", "unix  /a", "unix /a b", "UNIX /a", "unix", "unix ", "unix /a\t", "tcp 127.0.0.1:99999999999"]
+        {
             assert_eq!(Endpoint::parse(text), None, "{text:?}");
         }
         assert_eq!(Network::platform_default().as_str(), if cfg!(windows) { "npipe" } else { "unix" });
+        assert!(Network::supported().contains(&Network::platform_default()) && Network::supported().ends_with(&[Network::Tcp]));
+        // 规范的空白集合是固定的：U+200B、U+180E 不是空白
+        assert!(is_whitespace('\u{3000}') && is_whitespace('\u{0B}') && !is_whitespace('\u{200B}') && !is_whitespace('\u{180E}'));
     }
 }

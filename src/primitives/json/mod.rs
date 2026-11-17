@@ -25,6 +25,8 @@
 //! ```
 
 mod de;
+#[cfg(feature = "plugin")]
+mod lenient;
 mod reader;
 mod ser;
 mod value;
@@ -102,6 +104,13 @@ pub fn from_str<T: DeserializeOwned>(text: &str) -> Result<T, ReadError> {
 /// 从已读出的值树按 serde 读成 `T`，失败时带出错位置的路径。
 pub(crate) fn decode<T: DeserializeOwned>(node: &Node) -> Result<T, ReadError> {
     serde_path_to_error::deserialize(node).map_err(|error| ReadError::Mismatch { path: path_text(error.path()), message: error.into_inner().to_string() })
+}
+
+/// 同 [`decode`]，按配置节放宽的读法（`plugin/lifecycle.md` §7.2）：成员名不区分 ASCII 大小写，字符串叶子可以读成数字与布尔。
+#[cfg(feature = "plugin")]
+pub(crate) fn decode_lenient<T: DeserializeOwned>(node: &Node) -> Result<T, ReadError> {
+    serde_path_to_error::deserialize(lenient::Lenient(node))
+        .map_err(|error| ReadError::Mismatch { path: path_text(error.path()), message: error.into_inner().to_string() })
 }
 
 /// 成员名里需要写成 `['名字']` 的字符（RFC-0011 规则 2，照 System.Text.Json 的实测）。
