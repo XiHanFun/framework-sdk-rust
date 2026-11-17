@@ -35,6 +35,11 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 #[doc = include_str!("../README.md")]
 struct ReadmeDoctests;
 
+/// 中文版 README 里的 Rust 示例同样作为文档测试编译运行，保证两份 README 的示例都与 API 一致。
+#[cfg(doctest)]
+#[doc = include_str!("../README_cn.md")]
+struct ReadmeCnDoctests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
