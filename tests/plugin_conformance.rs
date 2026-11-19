@@ -1,7 +1,8 @@
 //! 进程外插件的黑盒一致性（RFC-0017「一致性」、`spec/conformance/README.md`）：构建示例 echo，把它与清单放进临时目录，
 //! 用规范子模块里的运行器 `xihan-conformance plugin` 跑全部用例，断言每个用例都通过、没有跳过。
 //!
-//! 运行器从 `spec/conformance` 以 `go run` 运行，版本就是锁定的规范；本机没有 Go 时测试跳过并打印原因。
+//! 运行器从 `spec/conformance` 以 `go run` 运行，版本就是锁定的规范；本机没有 Go 时测试失败，只有设了
+//! `XIHAN_CONFORMANCE_REQUIRED=0` 才打印原因并提前返回（Rust 测试没有运行期的跳过，这样返回会记为通过）。
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -43,10 +44,14 @@ fn echo_passes_the_black_box_runner() {
     assert!(conformance.join("go.mod").is_file(), "{} is missing; run `git submodule update --init`", conformance.display());
     match Command::new("go").arg("version").output() {
         Ok(output) if output.status.success() => {}
-        _ => {
-            eprintln!("skipped: Go is not on PATH; the black-box runner of the spec needs it (https://go.dev/dl/)");
+        // 缺 Go 默认失败，否则门禁会静默变绿；确实要跳过时显式设 XIHAN_CONFORMANCE_REQUIRED=0
+        _ if std::env::var("XIHAN_CONFORMANCE_REQUIRED").as_deref() == Ok("0") => {
+            eprintln!("skipped because XIHAN_CONFORMANCE_REQUIRED=0: Go is not on PATH; the black-box runner of the spec needs it (https://go.dev/dl/)");
             return;
         }
+        _ => panic!(
+            "Go is not on PATH; the black-box runner of the spec needs it: install Go (https://go.dev/dl/) or set XIHAN_CONFORMANCE_REQUIRED=0 to skip this test"
+        ),
     }
 
     let directory = plugin_directory(&build_echo(root));

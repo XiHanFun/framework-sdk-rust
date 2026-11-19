@@ -4,9 +4,9 @@ name: CI
 # 各一遍；插件运行时的黑盒一致性测试用 Go 跑规范子模块里的运行器；最低 Rust 版本；协议生成代码与 .proto 一致。
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
 
 permissions:
@@ -95,8 +95,13 @@ jobs:
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # 从 spec/plugin/plugin.proto 重新生成，与提交的 src/plugin/generated 不同即失败
+      # 从 spec/plugin/plugin.proto 重新生成，与提交的 src/plugin/generated 不同即失败；
+      # 按 git status 判空：git diff 只看已跟踪的文件，发现不了新增的生成文件
       - name: 重新生成并核对
         run: |
           cargo run --locked --manifest-path tools/protogen/Cargo.toml
-          git diff --exit-code -- src/plugin/generated
+          if [ -n "$(git status --porcelain -- src/plugin/generated)" ]; then
+            git status --porcelain -- src/plugin/generated
+            git diff -- src/plugin/generated
+            exit 1
+          fi
