@@ -1,9 +1,15 @@
-//! 一致性向量的全集：`spec/conformance/vectors` 下实际存在的每个向量文件，要么有本 SDK 的测试回放，要么显式豁免并写明理由。
+//! 按认领的一致性档核对向量（RFC-0024「一致性档」）：档表 `spec/conformance/profiles.json` 里本 SDK 认领的档要求的每个向量，
+//! 要么有本 SDK 的测试回放，要么列为缺口并写明理由；回放的向量在规范里都存在。
 //!
-//! 规范新增向量文件时这里失败，不会因为没有测试读它而静默通过；规范删掉列出的文件时同样失败。
+//! 规范在认领的档里新增向量时这里失败，不会因为没有测试读它而静默通过；回放认领的档以外的向量是允许的。
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+
+use serde::Deserialize;
+
+/// 本 SDK 认领的一致性档；档表里其他档的向量不归本 SDK。
+const CLAIMED_PROFILES: [&str; 2] = ["core", "plugin"];
 
 /// 本 SDK 的测试回放的向量文件（相对 `spec/conformance/vectors/`，以 `/` 分隔），行尾注释是回放它的测试。
 ///
@@ -30,42 +36,57 @@ const REPLAYED: [&str; 19] = [
     "primitives/wire-encoding.json",           // tests/primitives.rs
 ];
 
-/// 显式豁免的向量文件：文件与不回放的理由。
-const EXEMPTED: [(&str, &str); 3] = [
-    ("plugin/wasm-exports.json", "Wasm ABI exports are checked by hosts; this SDK has no Wasm plugin runtime."),
-    ("provider/caching-distributed.json", "This SDK does not provide the caching.distributed@1 remote provider."),
-    ("security/webauthn.json", "WebAuthn verification is host-side (RFC-0008); this SDK does not verify credentials."),
-];
+/// 缺口：认领的档要求、本 SDK 却没有回放的向量文件与不回放的理由。
+///
+/// RFC-0024「实现钉规范」第 3 条要求 README 的「状态」一节逐条写出同样的缺口；目前没有。
+const GAPS: [(&str, &str); 0] = [];
 
-/// 递归收集 `directory` 下的 `.json` 文件，路径相对 `root`、以 `/` 分隔。
-fn collect_json_files(root: &Path, directory: &Path, files: &mut BTreeSet<String>) {
-    let entries = std::fs::read_dir(directory).unwrap_or_else(|error| panic!("cannot list {}: {error}", directory.display()));
-    for entry in entries {
-        let path = entry.unwrap_or_else(|error| panic!("cannot list {}: {error}", directory.display())).path();
-        if path.is_dir() {
-            collect_json_files(root, &path, files);
-        } else if path.extension().is_some_and(|extension| extension == "json") {
-            // 按路径组成部分拼接，各平台都以 / 分隔，与常量里的写法相同
-            let relative = path.strip_prefix(root).expect("the file is under the vectors directory");
-            files.insert(relative.components().map(|component| component.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/"));
-        }
-    }
+/// 档表 `profiles.json`，只取用到的成员。
+#[derive(Deserialize)]
+struct ProfileTable {
+    /// 全部档。
+    profiles: Vec<Profile>,
+}
+
+/// 档表里的一个档。
+#[derive(Deserialize)]
+struct Profile {
+    /// 档名。
+    id: String,
+    /// 认领这个档必须回放的向量，相对 `conformance/vectors`。
+    vectors: Vec<String>,
 }
 
 #[test]
-fn every_vector_file_is_replayed_or_exempted() {
-    let root: PathBuf = [env!("CARGO_MANIFEST_DIR"), "spec", "conformance", "vectors"].iter().collect();
-    assert!(root.is_dir(), "{} is missing; run `git submodule update --init`", root.display());
-    let mut present = BTreeSet::new();
-    collect_json_files(&root, &root, &mut present);
+fn every_vector_of_the_claimed_profiles_is_replayed_or_a_gap() {
+    let conformance: PathBuf = [env!("CARGO_MANIFEST_DIR"), "spec", "conformance"].iter().collect();
+    let path = conformance.join("profiles.json");
+    let data = std::fs::read(&path).unwrap_or_else(|error| panic!("cannot read {}: {error}; run `git submodule update --init`", path.display()));
+    let table: ProfileTable = serde_json::from_slice(&data).unwrap_or_else(|error| panic!("cannot parse {}: {error}", path.display()));
 
+    let undefined: Vec<&str> = CLAIMED_PROFILES.into_iter().filter(|claimed| !table.profiles.iter().any(|profile| profile.id == *claimed)).collect();
+    assert!(undefined.is_empty(), "claimed profiles that the spec does not define: {}", undefined.join(", "));
+    // 一个向量可以属于多个档，认领的档要求的向量取并集
+    let required: BTreeSet<&str> = table
+        .profiles
+        .iter()
+        .filter(|profile| CLAIMED_PROFILES.contains(&profile.id.as_str()))
+        .flat_map(|profile| profile.vectors.iter().map(String::as_str))
+        .collect();
     let replayed: BTreeSet<&str> = REPLAYED.into_iter().collect();
-    let exempted: BTreeSet<&str> = EXEMPTED.into_iter().map(|(file, _)| file).collect();
-    let both: Vec<&str> = replayed.intersection(&exempted).copied().collect();
-    assert!(both.is_empty(), "vector files both replayed and exempted: {}", both.join(", "));
-    let listed: BTreeSet<&str> = replayed.union(&exempted).copied().collect();
-    let missing: Vec<&str> = listed.iter().copied().filter(|file| !present.contains(*file)).collect();
-    assert!(missing.is_empty(), "listed vector files that the spec does not have: {}", missing.join(", "));
-    let unlisted: Vec<&str> = present.iter().map(String::as_str).filter(|file| !listed.contains(file)).collect();
-    assert!(unlisted.is_empty(), "spec vector files neither replayed nor exempted: {}", unlisted.join(", "));
+    let gaps: BTreeSet<&str> = GAPS.into_iter().map(|(file, _)| file).collect();
+    let uncovered: Vec<&str> = required.iter().copied().filter(|file| !replayed.contains(file) && !gaps.contains(file)).collect();
+    assert!(uncovered.is_empty(), "vector files of the claimed profiles that are neither replayed nor listed as gaps: {}", uncovered.join(", "));
+    let outside: Vec<&str> = gaps.difference(&required).copied().collect();
+    assert!(outside.is_empty(), "gaps outside the claimed profiles: {}", outside.join(", "));
+    let replayed_gaps: Vec<&str> = gaps.intersection(&replayed).copied().collect();
+    assert!(replayed_gaps.is_empty(), "gaps that are replayed; remove them from gaps: {}", replayed_gaps.join(", "));
+    let vectors = conformance.join("vectors");
+    let missing: Vec<&str> = replayed.iter().copied().filter(|file| !vector_path(&vectors, file).is_file()).collect();
+    assert!(missing.is_empty(), "replayed vector files that the spec does not have: {}", missing.join(", "));
+}
+
+/// 以 `/` 分隔的向量路径在本平台上的位置。
+fn vector_path(vectors: &Path, relative: &str) -> PathBuf {
+    relative.split('/').fold(vectors.to_path_buf(), |path, part| path.join(part))
 }

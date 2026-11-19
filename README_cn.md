@@ -257,7 +257,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features plugin
 
 最低 Rust 版本 1.85（edition 2024 的要求），clippy 的 `incompatible_msrv` 按它核对标准库 API，依赖也按它解析（tonic 解析到 0.14.5）。`spec/`、`tests/` 与 `tools/` 不进 crate 包。
 
-插件运行时的一致性测试 `tests/plugin_conformance.rs` 要 Go（版本见 `spec/conformance/go.mod`）：它构建示例 echo，与清单一起放进临时目录，在 `spec/conformance` 用 `go run ./cmd/xihan-conformance plugin` 跑黑盒运行器的全部用例，断言都通过；没有 Go 时它失败，确实要跳过时设 `XIHAN_CONFORMANCE_REQUIRED=0`（这时打印原因并提前返回）。`tests/conformance_vectors.rs` 核对 `spec/conformance/vectors` 下的每个向量文件要么有测试回放、要么豁免并写明理由：规范新增向量文件时它失败，要么回放，要么写进豁免并给出理由。
+插件运行时的一致性测试 `tests/plugin_conformance.rs` 要 Go（版本见 `spec/conformance/go.mod`）：它构建示例 echo，与清单一起放进临时目录，在 `spec/conformance` 用 `go run ./cmd/xihan-conformance plugin` 跑黑盒运行器的全部用例，断言都通过；没有 Go 时它失败，确实要跳过时设 `XIHAN_CONFORMANCE_REQUIRED=0`（这时打印原因并提前返回）。`tests/conformance_vectors.rs` 按 `spec/conformance/profiles.json` 里本 SDK 认领的档核对向量（RFC-0024）：规范在认领的档里新增向量时它失败，要么回放，要么列为缺口并写理由。
 
 协议代码 `src/plugin/generated/xihan.plugin.v1.rs` 由 `spec/plugin/plugin.proto` 生成并提交，使用者不需要 protoc。规范子模块升级之后重新生成并一并提交（`.proto` 由纯 Rust 的 protox 编译，也不需要 protoc；CI 重新生成并核对与提交的一致）：
 
@@ -272,6 +272,14 @@ cargo run --manifest-path tools/protogen/Cargo.toml
 - 流式操作：操作契约（RFC-0011）还没有流式形态，插件不实现流式调用，`InvokeStream` 读第一帧之后一律拒绝（`invocation.md` §1）；
 - Wasm 插件 ABI（RFC-0018，`xihan_*` 导出、`xihan` 导入，WASI preview 1 reactor），样板在 XiHan.Framework 的 `samples/EchoWasmPlugin`；
 - 远程 Provider 的操作集（RFC-0019，首个是 `caching.distributed@1`）。
+
+一致性（RFC-0024）：
+
+- 钉的规范版本：提交 `386501f`（规范还没有打标签，首个标签计划是 `v1.0.0-rc.1`）。
+- 认领的档：`core` 与 `plugin`。
+- 缺口：无。
+
+在有钉在规范标签上的发布版之前，成熟度是 Experimental。
 
 ## 生态
 

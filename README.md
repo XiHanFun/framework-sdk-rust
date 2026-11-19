@@ -257,7 +257,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features plugin
 
 The minimum Rust version is 1.85 (required by edition 2024), and clippy's `incompatible_msrv` checks standard library APIs against it; dependencies are resolved against it too (tonic resolves to 0.14.5). `spec/`, `tests/` and `tools/` are not included in the crate package.
 
-The plugin runtime's conformance test `tests/plugin_conformance.rs` requires Go (version in `spec/conformance/go.mod`): it builds the echo example, puts it with its manifest into a temporary directory, runs every case of the black-box runner with `go run ./cmd/xihan-conformance plugin` in `spec/conformance`, and asserts that all pass; without Go it fails, and to skip it on purpose set `XIHAN_CONFORMANCE_REQUIRED=0` (it then prints the reason and returns early). `tests/conformance_vectors.rs` checks that every vector file in `spec/conformance/vectors` is either replayed by a test or exempted with a reason: when the spec adds a vector file it fails until the file is replayed or added to the exemptions with a reason.
+The plugin runtime's conformance test `tests/plugin_conformance.rs` requires Go (version in `spec/conformance/go.mod`): it builds the echo example, puts it with its manifest into a temporary directory, runs every case of the black-box runner with `go run ./cmd/xihan-conformance plugin` in `spec/conformance`, and asserts that all pass; without Go it fails, and to skip it on purpose set `XIHAN_CONFORMANCE_REQUIRED=0` (it then prints the reason and returns early). `tests/conformance_vectors.rs` checks the vectors against the profiles this SDK claims in `spec/conformance/profiles.json` (RFC-0024): when the spec adds a vector to a claimed profile it fails until the vector is replayed or listed as a gap with a reason.
 
 The protocol code `src/plugin/generated/xihan.plugin.v1.rs` is generated from `spec/plugin/plugin.proto` and committed, so users need no protoc. After upgrading the spec submodule, regenerate it and commit it along (the `.proto` is compiled by protox in pure Rust, so no protoc is needed here either; CI regenerates it and checks that it matches the committed code):
 
@@ -272,6 +272,14 @@ cargo run --manifest-path tools/protogen/Cargo.toml
 - streaming operations: operation contracts (RFC-0011) have no streaming form yet, plugins do not implement streaming calls, and `InvokeStream` refuses every stream after reading its first frame (`invocation.md` §1);
 - the Wasm plugin ABI (RFC-0018, `xihan_*` exports, `xihan` imports, WASI preview 1 reactor), with a template in XiHan.Framework's `samples/EchoWasmPlugin`;
 - operation sets for remote providers (RFC-0019, starting with `caching.distributed@1`).
+
+Conformance (RFC-0024):
+
+- Pinned spec version: commit `386501f` (the spec has no tags yet; the first is planned as `v1.0.0-rc.1`).
+- Claimed profiles: `core` and `plugin`.
+- Gaps: none.
+
+Until there is a release pinned to a spec tag, the maturity is Experimental.
 
 ## Ecosystem
 
