@@ -42,6 +42,12 @@ impl Deadline {
     pub(crate) fn has_fired(&self) -> bool {
         self.fired.is_cancelled()
     }
+
+    /// 测试用：立即触发截止令牌与上下文令牌，截止时间不变。
+    #[cfg(test)]
+    pub(crate) fn fire_now(&self, context: &CancellationToken) {
+        fire(&self.fired, context);
+    }
 }
 
 /// 先触发截止令牌、再触发上下文令牌：被上下文令牌唤醒的等待方读归因时一定已经看到截止令牌触发

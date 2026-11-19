@@ -29,7 +29,7 @@ use crate::primitives::{Error, Result};
 ///    `permissions` 里、也在 `Configure` 下发的 `granted_permissions` 里，否则 `PLUGINS_DENIED_002` + `plugins.callback.denied`；
 /// 3. 租户：上下文的 `xihan.tenant` 必须是宿主此刻交给本插件处理的某个调用或投递的租户（同一租户可以同时有多个），否则
 ///    `PLUGINS_DENIED_002` + `plugins.callback.tenant_denied`；宿主没有在处理本插件的调用时（调用已结束、后台回调）不能带租户；
-/// 4. 上下文的截止时间已过按 `DeadlineExceeded`（`KERNEL_TIMEOUT_001`），已被取消按「`Cancelled`，取消信号已触发」
+/// 4. 上下文的截止时间已到（截止令牌已触发，或按时钟已过）按 `DeadlineExceeded`（`KERNEL_TIMEOUT_001`），已被取消按「`Cancelled`，取消信号已触发」
 ///    （`KERNEL_CANCELLED_001`），与下面映射表的那一行相同；发出之后上下文取消时放弃这次调用，按同样的两行给出结果。
 ///
 /// 第 2、3 项与宿主的顺序相同、给出同样的错误；`Host.Publish` 的每一项都是整批的结果。信封的 `xihantenant` 扩展不在本地核对，由宿主
@@ -177,7 +177,7 @@ impl Host {
         if let Some(tenant) = ctx.tenant().filter(|tenant| !self.tenants.contains(tenant)) {
             return Err(tenant_denied(&self.plugin, tenant));
         }
-        // 注定超时或已被放弃的调用不发出；结果与映射表相应的一行相同
+        // 注定超时或已被放弃的调用不发出；结果与映射表相应的一行相同。截止令牌触发时上下文令牌也已触发，由 abandoned 归因
         if ctx.is_expired(SystemTime::now()) || ctx.is_cancelled() {
             return Err(self.abandoned(ctx, rpc));
         }
@@ -194,10 +194,12 @@ impl Host {
         request
     }
 
-    /// 上下文的截止时间已过或已被取消、回调不发出或被放弃时的结果（`invocation.md` §5）：截止时间已过按 `DeadlineExceeded`，否则按
-    /// 「`Cancelled`，取消信号已触发」。上下文的截止时间就是 gRPC 截止时间，到点时 gRPC 自己也以截止时间中止，两者给出同一行。
+    /// 上下文的截止时间已过或已被取消、回调不发出或被放弃时的结果（`invocation.md` §5）：截止令牌已触发或按时钟已过截止时间按
+    /// `DeadlineExceeded`，否则按「`Cancelled`，取消信号已触发」。上下文的截止时间就是 gRPC 截止时间，到点时 gRPC 自己也以截止时间
+    /// 中止，两者给出同一行。
     fn abandoned(&self, ctx: &Context, rpc: Rpc<'_>) -> Error {
-        let code = if ctx.is_expired(SystemTime::now()) { Code::DeadlineExceeded } else { Code::Cancelled };
+        // 先看截止令牌：它由定时器按单调时钟触发，墙上时钟可能还差一点才到截止时间，只按时钟判断会把截止时间当成调用方取消
+        let code = if ctx.deadline_fired() || ctx.is_expired(SystemTime::now()) { Code::DeadlineExceeded } else { Code::Cancelled };
         callback_failure(rpc, code, "", true, &self.plugin)
     }
 
@@ -340,9 +342,100 @@ impl Drop for TenantGuard {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::Value;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
+    use serde_json::Value;
+    use tokio::sync::Notify;
+
+    use super::super::endpoint::Network;
+    use super::super::v1::host_server::{Host as HostRpc, HostServer};
     use super::*;
+
+    /// 慢的回调服务：记下收到的请求数并通知，之后很久才应答，回调在应答之前就会被放弃。
+    #[derive(Default)]
+    struct SlowHost {
+        received: AtomicUsize,
+        arrived: Notify,
+    }
+
+    /// 回调服务的实现：包一层 `Arc` 让测试里还能读到计数。
+    struct SlowHostService(Arc<SlowHost>);
+
+    impl SlowHostService {
+        /// 记下一次请求并通知等待方，再睡到测试结束。
+        async fn arrive(&self) {
+            self.0.received.fetch_add(1, Ordering::SeqCst);
+            self.0.arrived.notify_one();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
+    }
+
+    #[tonic::async_trait]
+    impl HostRpc for SlowHostService {
+        async fn invoke(&self, _: tonic::Request<v1::InvokeRequest>) -> std::result::Result<tonic::Response<v1::InvokeResponse>, tonic::Status> {
+            self.arrive().await;
+            Ok(tonic::Response::new(v1::InvokeResponse::default()))
+        }
+
+        async fn publish(&self, _: tonic::Request<v1::PublishRequest>) -> std::result::Result<tonic::Response<v1::PublishResponse>, tonic::Status> {
+            self.arrive().await;
+            Ok(tonic::Response::new(v1::PublishResponse::default()))
+        }
+    }
+
+    /// 在回环 TCP 上起慢的回调服务，返回连它的宿主客户端（两种回调的权限都已声明并授予）。
+    async fn slow_host(host: &Arc<SlowHost>) -> Host {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let service = HostServer::new(SlowHostService(Arc::clone(host)));
+        tokio::spawn(tonic::transport::Server::builder().serve_with_incoming(service, tokio_stream::wrappers::TcpListenerStream::new(listener)));
+        let permissions = vec![PERMISSION_PIPELINE.to_owned(), PERMISSION_MESSAGING.to_owned()];
+        let grants = Arc::new(Grants::new(permissions.clone()));
+        grants.grant(permissions);
+        Host::new(Some(Endpoint::new(Network::Tcp, address.to_string())), "probe.plugin", "token", grants, Arc::default()).unwrap()
+    }
+
+    /// 错误的码与消息键。
+    fn keyed(error: &Error) -> (String, Option<String>) {
+        (error.code().to_owned(), error.message_key().map(str::to_owned))
+    }
+
+    /// 截止令牌由定时器按单调时钟触发，可能比墙上时钟先到截止时间（两钟漂移、校时）：发出前的核对与途中的放弃都按
+    /// `DeadlineExceeded`，归因先看截止令牌、不只看时钟（`invocation.md` §5）。
+    #[tokio::test]
+    async fn a_fired_deadline_is_a_deadline_before_the_clock_reaches_it() {
+        let slow = Arc::new(SlowHost::default());
+        let host = slow_host(&slow).await;
+        let timeout = (ERROR_CODE_DEADLINE_EXCEEDED.to_owned(), Some(MESSAGE_DEADLINE_EXCEEDED.to_owned()));
+        let envelopes = || vec![Envelope::new("orders.created", "e1", "probe", "created")];
+
+        // 发出前：截止令牌已触发而墙上时钟离截止时间还有一分钟，本地核对按截止时间已到拒绝、不发请求
+        let fired = Context::builder().timeout(Duration::from_secs(60)).build();
+        fired.fire_deadline_now();
+        assert!(fired.is_cancelled() && !fired.is_expired(SystemTime::now()));
+        assert_eq!(keyed(&host.invoke(&fired, "orders.get", Vec::new()).await.unwrap_err()), timeout);
+        let published = host.publish(&fired, envelopes()).await;
+        assert_eq!(published.iter().map(|result| keyed(result.as_ref().unwrap_err())).collect::<Vec<_>>(), vec![timeout.clone()]);
+        assert_eq!(slow.received.load(Ordering::SeqCst), 0, "nothing is sent");
+
+        // 途中：请求到了宿主之后截止令牌才触发，放弃这次回调同样按截止时间
+        let ctx = Context::builder().timeout(Duration::from_secs(60)).build();
+        let fire_on_arrival = async {
+            slow.arrived.notified().await;
+            ctx.fire_deadline_now();
+        };
+        let (invoked, ()) = tokio::join!(host.invoke(&ctx, "orders.get", Vec::new()), fire_on_arrival);
+        assert_eq!(keyed(&invoked.unwrap_err()), timeout);
+        let ctx = Context::builder().timeout(Duration::from_secs(60)).build();
+        let fire_on_arrival = async {
+            slow.arrived.notified().await;
+            ctx.fire_deadline_now();
+        };
+        let (published, ()) = tokio::join!(host.publish(&ctx, envelopes()), fire_on_arrival);
+        assert_eq!(published.iter().map(|result| keyed(result.as_ref().unwrap_err())).collect::<Vec<_>>(), vec![timeout]);
+        assert_eq!(slow.received.load(Ordering::SeqCst), 2, "both callbacks were sent");
+    }
 
     #[test]
     fn tenants_are_counted_per_call() {

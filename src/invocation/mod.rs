@@ -217,10 +217,23 @@ impl Context {
     /// 即使时钟已过截止时间，调用方的取消仍是取消。超时的消息键是 `kernel.invocation.deadline_exceeded`；调用开始时截止时间
     /// 已经过去的 `kernel.invocation.deadline_before_start` 由调用器在第一个中间件之前判断（RFC-0011 规则 10），不在这里。
     pub fn cancellation(&self) -> Option<Error> {
-        if self.deadline.as_ref().is_some_and(|deadline| deadline.has_fired()) {
+        if self.deadline_fired() {
             return Some(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_EXCEEDED));
         }
         self.token.is_cancelled().then(|| Error::cancelled(ERROR_CODE_CANCELLED, MESSAGE_CANCELLED))
+    }
+
+    /// 截止令牌是否已触发：只看定时器，不读时钟；没有截止时间时为假。
+    pub(crate) fn deadline_fired(&self) -> bool {
+        self.deadline.as_ref().is_some_and(|deadline| deadline.has_fired())
+    }
+
+    /// 测试用：让截止令牌立即触发，截止时间不变，造出「令牌已触发、墙上时钟还没到截止时间」的先后。
+    #[cfg(test)]
+    pub(crate) fn fire_deadline_now(&self) {
+        if let Some(deadline) = &self.deadline {
+            deadline.fire_now(&self.token);
+        }
     }
 }
 
@@ -346,5 +359,23 @@ impl ContextBuilder {
             baggage: Arc::new(self.baggage),
             items: Arc::new(Items::default()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 截止令牌由定时器按单调时钟触发，墙上时钟可能还没到截止时间：归因只看令牌，调用方随后取消也仍是超时。
+    #[test]
+    fn a_fired_deadline_token_is_a_timeout_before_the_clock_reaches_the_deadline() {
+        let caller = CancellationToken::new();
+        let ctx = Context::builder().cancellation(&caller).timeout(Duration::from_secs(60)).build();
+        assert!(!ctx.deadline_fired() && ctx.cancellation().is_none());
+        ctx.fire_deadline_now();
+        assert!(ctx.deadline_fired() && ctx.is_cancelled() && !ctx.is_expired(SystemTime::now()));
+        caller.cancel();
+        assert_eq!(ctx.cancellation().as_ref().map(Error::code), Some(ERROR_CODE_DEADLINE_EXCEEDED));
+        assert!(!Context::background().deadline_fired(), "a context without a deadline has no deadline token");
     }
 }
