@@ -189,7 +189,7 @@ let failed = serde_json::to_string(&WireResult(Err::<u32, _>(Error::literal("ORD
 assert_eq!(failed, r#"{"ok":false,"error":{"code":"ORDERS_CONFLICT_001","message":"stale"}}"#);
 ```
 
-读写按 RFC-0001「Result」与向量 `wire-encoding.json`：不带值的成功 `Result<()>` 只写 `{"ok":true}`，读入时带了 `value` 即拒绝；有值成功的 `value` 必填，只有值类型是 `Maybe<T>`（`Option<T>`）时可以是 `null`；`Error` 的 `code` 与非空的 `message` 必填，可选成员写成 `null` 不合法；Result 与 Error 只收 JSON 对象，未知成员忽略。`Maybe<T>` 有值为值本身、无值为 `null`；`TypedId` 编码为底层值。线上文本用 `primitives::json::from_slice` 读：它先过共同的 JSON 读取检查（RFC 8259、64 层、合法 Unicode、任何一层的重复成员，含值、细节与内部错误里面），数字按值模型（64 位范围内的整数原样往返，`-0` 是整数 0）；直接用 `serde_json::from_str` 读不到这些检查。值经 `json::Model` 写出：整数值的浮点仍写成浮点（`2.0`、`-0.0`、`1e+17`），非有限的浮点写成字符串 `NaN`、`Infinity`、`-Infinity`。
+读写按 RFC-0001「Result」与向量 `wire-encoding.json`：不带值的成功 `Result<()>` 只写 `{"ok":true}`，读入时带了 `value` 即拒绝；有值成功的 `value` 必填，只有值类型是 `Maybe<T>`（`Option<T>`）时可以是 `null`；`Error` 的 `code` 与 `message` 必填，`message` 不能为空或只有空白（RFC-0001「空白字符」写死的 25 个码位，按显式的表判断、不用 `char::is_whitespace`），可选成员写成 `null` 不合法；`Error::literal` 与 `Error::with_text` 同样把这样的文案当作参数非法：它们 panic，`try_literal` 与 `try_with_text` 返回 `PRIMITIVES_VALIDATION_001`；Result 与 Error 只收 JSON 对象，未知成员忽略。`Maybe<T>` 有值为值本身、无值为 `null`；`TypedId` 编码为底层值。线上文本用 `primitives::json::from_slice` 读：它先过共同的 JSON 读取检查（RFC 8259、64 层、合法 Unicode、任何一层的重复成员，含值、细节与内部错误里面），数字按值模型（64 位范围内的整数原样往返，`-0` 是整数 0）；直接用 `serde_json::from_str` 读不到这些检查。值经 `json::Model` 写出：整数值的浮点仍写成浮点（`2.0`、`-0.0`、`1e+17`），非有限的浮点写成字符串 `NaN`、`Infinity`、`-Infinity`。
 
 消息模板按 RFC-0010「模板」与向量 `message-templates.json`：`{name}` / `{0}`，`{{`、`}}` 转义；值的文本形式是字符串原样、布尔 `true` / `false`、`null` 为空串、浮点在 1e-4 ≤ |x| < 1e17 时写最短往返的十进制（`2.0` 写 `2`），范围之外写 `1E+17`、`9.9E-05`，负零写 `-0`，数组与对象写紧凑 JSON（成员按名字的 UTF-16 码元序，超过 64 层的容器写 `null`）。说明符只认 `^[DdFfNnXx][0-9]{0,2}$`：`D`、`X` / `x` 只用于整数（`X` 只用于非负整数），`F`、`N` 用于整数与浮点，正好一半时取偶、写出全部整数位；其余说明符（`E2`、`0.00`、`yyyy-MM-dd`、`D100`）与不适用的情形一律按无格式输出，宿主也一样。`format_message` 等按不变文化；`format_message_in` / `try_format_message_in` / `format_value_in` 按区域取小数点与分组符（规范的固定表：de-DE、es-ES、pt-BR 是 `,` 与 `.`，fr-FR 是 `,` 与 U+202F，ru-RU 是 `,` 与 U+00A0，其余区域同不变文化），`Catalog` 按请求的区域格式化。`Describe` 的参数按名字的序数顺序（UTF-16 码元），按不变文化。
 
@@ -275,7 +275,7 @@ cargo run --manifest-path tools/protogen/Cargo.toml
 
 一致性（RFC-0024）：
 
-- 钉的规范版本：提交 `386501f`（规范还没有打标签，首个标签计划是 `v1.0.0-rc.1`）。
+- 钉的规范版本：提交 `93d75d7`（规范还没有打标签，首个标签计划是 `v1.0.0-rc.1`）。
 - 认领的档：`core` 与 `plugin`。
 - 缺口：无。
 

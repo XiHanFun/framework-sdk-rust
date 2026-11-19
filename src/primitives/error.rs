@@ -5,6 +5,8 @@ use serde::de::{self, Error as _, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
+use crate::grammar::is_blank;
+
 use super::error_code::{
     ERROR_CODE_INVALID_ARGUMENT, KIND_CANCELLED, KIND_CONFLICT, KIND_DENIED, KIND_NOT_FOUND, KIND_TIMEOUT, KIND_UNAVAILABLE, KIND_UNEXPECTED, KIND_VALIDATION,
     error_code_domain, error_code_kind, is_error_code, validate_error_code,
@@ -61,7 +63,7 @@ impl Error {
     ///
     /// # Panics
     ///
-    /// 错误码不合文法或文案为空时 panic；来自不可信输入时用 [`Error::try_literal`]。
+    /// 错误码不合文法或文案为空、只有空白（RFC-0001「空白字符」）时 panic；来自不可信输入时用 [`Error::try_literal`]。
     #[track_caller]
     pub fn literal(code: impl Into<String>, text: impl Into<String>) -> Self {
         match Self::try_literal(code, text) {
@@ -70,12 +72,12 @@ impl Error {
         }
     }
 
-    /// 用已解析的文案创建错误；码不合法或文案为空时返回 `PRIMITIVES_VALIDATION_001`。
+    /// 用已解析的文案创建错误；码不合法或文案为空、只有空白（RFC-0001「空白字符」）时返回 `PRIMITIVES_VALIDATION_001`。
     pub fn try_literal(code: impl Into<String>, text: impl Into<String>) -> Result<Self, FrameworkError> {
         let (code, text) = (code.into(), text.into());
         validate_error_code(&code)?;
-        if text.is_empty() {
-            return Err(FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, "A literal error needs a text."));
+        if is_blank(&text) {
+            return Err(FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, "A literal error needs a text that is not empty or whitespace."));
         }
         Ok(Self { code, message_key: None, text: Some(text), details: None, inner: None })
     }
@@ -175,11 +177,27 @@ impl Error {
         self
     }
 
-    /// 填入已解析的文案；空文案表示没有文案。
-    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+    /// 填入已解析的文案。
+    ///
+    /// # Panics
+    ///
+    /// 文案为空或只有空白（RFC-0001「空白字符」）时 panic；来自不可信输入时用 [`Error::try_with_text`]。
+    #[track_caller]
+    pub fn with_text(self, text: impl Into<String>) -> Self {
+        match self.try_with_text(text) {
+            Ok(error) => error,
+            Err(error) => std::panic::panic_any(error),
+        }
+    }
+
+    /// 填入已解析的文案；文案为空或只有空白（RFC-0001「空白字符」）时返回 `PRIMITIVES_VALIDATION_001`。
+    pub fn try_with_text(mut self, text: impl Into<String>) -> Result<Self, FrameworkError> {
         let text = text.into();
-        self.text = (!text.is_empty()).then_some(text);
-        self
+        if is_blank(&text) {
+            return Err(FrameworkError::new(ERROR_CODE_INVALID_ARGUMENT, "The text of an error must not be empty or whitespace."));
+        }
+        self.text = Some(text);
+        Ok(self)
     }
 
     /// 错误码 `<DOMAIN>_<KIND>_<NNN>`。
@@ -311,8 +329,9 @@ impl<'de> Visitor<'de> for ErrorVisitor {
             return Err(A::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: The error code '{code}' must match <DOMAIN>_<KIND>_<NNN>.")));
         }
         let message = message.ok_or_else(|| A::Error::missing_field("message"))?;
-        if message.is_empty() {
-            return Err(A::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: The message of the error '{code}' must not be empty.")));
+        // 空串与只有空白都不合法（RFC-0001「Result」与「空白字符」），两端的空白原样保留
+        if is_blank(&message) {
+            return Err(A::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: The message of the error '{code}' must not be empty or whitespace.")));
         }
         if let Some(key) = message_key.as_deref().filter(|key| !is_message_key(key)) {
             return Err(A::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: The message key '{key}' must match <domain>.<segment>[.<segment>].")));
@@ -324,7 +343,7 @@ impl<'de> Visitor<'de> for ErrorVisitor {
 impl<'de> Deserialize<'de> for Error {
     /// 从线上编码还原：`message` 成为已解析文案，消息键原样保留、只用于再翻译。
     ///
-    /// `code` 与非空的 `message` 必填；`messageKey`、`details`、`inner` 写了就必须合文法、是对象、是 Error，
+    /// `code` 与 `message` 必填，`message` 不能为空或只有空白（RFC-0001「空白字符」）；`messageKey`、`details`、`inner` 写了就必须合文法、是对象、是 Error，
     /// 写成 `null` 不合法；未知成员忽略；不是 JSON 对象（含数组形式）即失败。
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_map(ErrorVisitor)

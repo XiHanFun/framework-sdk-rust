@@ -8,6 +8,7 @@ use super::messages::{PHASE_INVOKE, REASON_NO_ERROR, failed};
 use super::time::{UtcTime, effective_deadline, format_deadline};
 use super::types::{Envelope, Health};
 use super::v1;
+use crate::grammar::is_blank;
 use crate::invocation::{CancellationToken, Context};
 use crate::primitives::json::{self, MAX_DEPTH, Node, Number};
 use crate::primitives::{Details, Error, is_baggage_key_registered, is_error_code, is_message_key};
@@ -60,7 +61,8 @@ pub(crate) fn result_of(status: Option<&v1::Status>, plugin: &str, phase: &str) 
 ///
 /// - `code` 不合错误码文法时整个错误换成 `PLUGINS_UNEXPECTED_001` + `plugins.process.failed`（`phase` 一律为 `invoke`，不论是哪个
 ///   RPC；`reason` 为 `invalid error code '<code>'`），原来的 `inner` 丢掉；
-/// - `message_key` 合消息键文法的按键还原、不取 `text`，否则是自由文本错误，文案取 `text`，`text` 为空时取 `code`；
+/// - `message_key` 合消息键文法的按键还原、不取 `text`，否则是自由文本错误，文案取 `text`，`text` 为空或只有空白（RFC-0001
+///   「空白字符」）时取 `code`；
 /// - `details` 按 [`read_details`] 读；
 /// - `inner` 同此，最多还原 [`MAX_DEPTH`] 层。
 pub(crate) fn from_proto_error(error: &v1::Error, plugin: &str) -> Error {
@@ -76,8 +78,8 @@ fn decode_error(error: &v1::Error, plugin: &str, depth: usize) -> Error {
     let mut decoded = match keyed {
         // 带键的错误不取 text：文案由读者按目录与参数渲染（RFC-0010）
         Some(keyed) => keyed,
-        // 码已核对过、文案非空，构造不会失败；文案为空时用错误码作文案：自由文本错误必须有文案
-        None => Error::try_literal(error.code.as_str(), if error.text.is_empty() { error.code.as_str() } else { error.text.as_str() })
+        // 码已核对过、文案不只有空白，构造不会失败；文案为空或只有空白时用错误码作文案：自由文本错误的文案不能只有空白
+        None => Error::try_literal(error.code.as_str(), if is_blank(&error.text) { error.code.as_str() } else { error.text.as_str() })
             .unwrap_or_else(|_| failed(plugin, PHASE_INVOKE, format!("invalid error code '{}'", error.code))),
     };
     if let Some(details) = details {

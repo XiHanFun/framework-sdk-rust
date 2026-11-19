@@ -149,7 +149,9 @@ fn error_factories_check_the_kind() {
         assert!(common::panic_message(move || drop(Error::new(code, key))).starts_with(ERROR_CODE_INVALID_ARGUMENT));
         assert_eq!(Error::try_new(code, key).unwrap_err().code(), ERROR_CODE_INVALID_ARGUMENT);
     }
-    assert!(common::panic_message(|| drop(Error::literal("ORDERS_NOTFOUND_001", ""))).contains("A literal error needs a text."));
+    assert!(
+        common::panic_message(|| drop(Error::literal("ORDERS_NOTFOUND_001", ""))).contains("A literal error needs a text that is not empty or whitespace.")
+    );
     assert!(common::panic_message(|| drop(error.clone().with_code("bad"))).starts_with(ERROR_CODE_INVALID_ARGUMENT));
 
     for (factory, kind) in [
@@ -165,6 +167,37 @@ fn error_factories_check_the_kind() {
     }
     let renamed = error.with_code("ORDERS_CONFLICT_007");
     assert_eq!((renamed.code(), renamed.message_key()), ("ORDERS_CONFLICT_007", Some("orders.quantity.invalid")));
+}
+
+/// Literal 与 `with_text` 的自由文本不能为空或只有空白（RFC-0001「空白字符」的 25 个码位）：两者都报参数非法，`literal` 与 `with_text`
+/// panic，`try_literal` 与 `try_with_text` 返回 `PRIMITIVES_VALIDATION_001`；U+001C 与 U+FEFF 不是空白，照常接受。
+#[test]
+fn free_text_must_not_be_empty_or_whitespace() {
+    let _guard = default_messages();
+    let every_whitespace: String =
+        ['\u{09}', '\u{0A}', '\u{0B}', '\u{0C}', '\u{0D}', ' ', '\u{85}', '\u{A0}', '\u{1680}', '\u{2028}', '\u{2029}', '\u{202F}', '\u{205F}', '\u{3000}']
+            .into_iter()
+            .chain('\u{2000}'..='\u{200A}')
+            .collect();
+    assert_eq!(every_whitespace.chars().count(), 25);
+    let keyed = Error::validation("ORDERS_VALIDATION_001", "orders.quantity.invalid");
+    for text in ["", " ", "\u{A0}", every_whitespace.as_str(), "\u{85}"] {
+        let rejected = Error::try_literal("ORDERS_VALIDATION_001", text).expect_err("a blank literal text must be rejected");
+        assert_eq!(rejected.code(), ERROR_CODE_INVALID_ARGUMENT, "{text:?}");
+        let message = common::panic_message(move || drop(Error::literal("ORDERS_VALIDATION_001", text)));
+        assert!(message.contains("A literal error needs a text that is not empty or whitespace."), "{message}");
+        let rejected = keyed.clone().try_with_text(text).expect_err("a blank text must be rejected");
+        assert_eq!(rejected.code(), ERROR_CODE_INVALID_ARGUMENT, "{text:?}");
+        let error = keyed.clone();
+        let message = common::panic_message(move || drop(error.with_text(text)));
+        assert!(message.starts_with(ERROR_CODE_INVALID_ARGUMENT), "{message}");
+        assert!(message.contains("The text of an error must not be empty or whitespace."), "{message}");
+    }
+    for text in ["\u{1C}", "\u{FEFF}"] {
+        assert_eq!(Error::literal("ORDERS_VALIDATION_001", text).text(), Some(text));
+        assert_eq!(keyed.clone().with_text(text).text(), Some(text));
+        assert_eq!(keyed.clone().try_with_text(text).unwrap().text(), Some(text));
+    }
 }
 
 #[test]
@@ -412,6 +445,8 @@ fn framework_errors_convert_to_literal_errors() {
     let converted = error.to_error();
     assert_eq!((converted.code(), converted.text(), converted.message_key()), ("KERNEL_PIPELINE_001", Some("the constraints form a cycle."), None));
     assert_eq!(FrameworkError::new("bad", "x").to_error().code(), ERROR_CODE_INVALID_ARGUMENT);
+    // 说明只有空白时与空串一样用错误码作文案（RFC-0001「空白字符」）
+    assert_eq!(FrameworkError::new("KERNEL_PIPELINE_001", " \u{3000}").to_error().text(), Some("KERNEL_PIPELINE_001"));
     assert_eq!(primitives::SDK_NAME, "framework-sdk-rust");
     assert_eq!(primitives::SDK_VERSION, env!("CARGO_PKG_VERSION"));
     assert_eq!(BAGGAGE_TENANT, "xihan.tenant");

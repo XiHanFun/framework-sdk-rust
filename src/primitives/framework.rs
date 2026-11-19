@@ -1,6 +1,8 @@
 use std::error::Error as StdError;
 use std::fmt;
 
+use crate::grammar::is_blank;
+
 use super::error::Error;
 use super::error_code::{ERROR_CODE_INVALID_ARGUMENT, is_error_code};
 use super::messages::{DEFAULT_LOCALE, Details, MessageResolver, builtin_catalog, describe};
@@ -88,8 +90,8 @@ impl FrameworkError {
     /// 转成可上线的 [`Error`]：带已解析文案，有消息键时连同键与参数；错误码不合文法时用 `PRIMITIVES_VALIDATION_001`、不带键。
     pub fn to_error(&self) -> Error {
         let code = if is_error_code(&self.code) { self.code.as_str() } else { ERROR_CODE_INVALID_ARGUMENT };
-        // 说明为空时用错误码作文案，错误必须有文案
-        let text = if self.message.is_empty() { code } else { self.message.as_str() };
+        // 说明为空或只有空白时用错误码作文案，错误必须有文案且不能只有空白（RFC-0001「空白字符」）
+        let text = if is_blank(&self.message) { code } else { self.message.as_str() };
         let keyed = self.message_key.as_deref().filter(|_| code == self.code).and_then(|key| Error::try_new(code, key).ok());
         match keyed {
             Some(error) => error.with_details(self.details.clone().unwrap_or_default()).with_text(text),

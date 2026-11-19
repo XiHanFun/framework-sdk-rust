@@ -1,4 +1,4 @@
-//! 规范里各种文法的手写判定：都是 ASCII 文法，逐字节判断，不引入正则依赖。
+//! 规范里各种文法的手写判定：都是 ASCII 文法，逐字节判断，不引入正则依赖；规范的空白字符（[`is_whitespace`]）按字符判断。
 //!
 //! 每个函数的文档写出它对应的正则；非 ASCII 字节一律不属于任何字符类，所以多字节 UTF-8 文本总是不匹配。
 
@@ -66,6 +66,20 @@ pub(crate) fn positive(text: &str) -> Option<u32> {
         return None;
     }
     text.parse::<i32>().ok().and_then(|version| u32::try_from(version).ok())
+}
+
+/// 规范所说的空白（RFC-0001「空白字符」）：U+0009–U+000D、U+0020、U+0085、U+00A0、U+1680、U+2000–U+200A、U+2028、U+2029、
+/// U+202F、U+205F、U+3000，共 25 个码位；其余字符（含 U+001C–U+001F、U+200B、U+180E 与 U+FEFF）都不是空白。
+///
+/// 集合按规范逐个写出，不用 [`char::is_whitespace`]：后者跟着 Unicode 的版本走，规范的集合是固定的。
+/// Error 的文案、插件握手行与回调端点都用它。
+pub(crate) fn is_whitespace(c: char) -> bool {
+    matches!(c, '\u{09}'..='\u{0D}' | '\u{20}' | '\u{85}' | '\u{A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}' | '\u{3000}')
+}
+
+/// 文本是否为空或只有空白（RFC-0001「空白字符」）：Error 的文案不能是这样。
+pub(crate) fn is_blank(text: &str) -> bool {
+    text.chars().all(is_whitespace)
 }
 
 #[cfg(test)]

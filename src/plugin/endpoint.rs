@@ -151,12 +151,12 @@ pub fn select_host_endpoint(value: &str, supported: &[Network]) -> Option<Endpoi
     parse_host_addresses(value)?.into_iter().find(|endpoint| supported.contains(&endpoint.network))
 }
 
-/// 握手行与回调端点所说的空白（`handshake.md` §2，与 .NET 正则的 `\s` 相同）：U+0009–U+000D、U+0020、U+0085、U+00A0、U+1680、
-/// U+2000–U+200A、U+2028、U+2029、U+202F、U+205F、U+3000；其余字符（含 U+200B 这样的零宽字符）都不是空白。
+/// 握手行与回调端点所说的空白（`handshake.md` §2，即 RFC-0001「空白字符」，与 .NET 正则的 `\s` 相同）：U+0009–U+000D、U+0020、
+/// U+0085、U+00A0、U+1680、U+2000–U+200A、U+2028、U+2029、U+202F、U+205F、U+3000；其余字符（含 U+200B 这样的零宽字符）都不是空白。
 ///
-/// 集合按规范逐个写出，不用 [`char::is_whitespace`]：后者跟着 Unicode 的版本走，规范的集合是固定的。
+/// 集合按规范逐个写出，不用 [`char::is_whitespace`]：后者跟着 Unicode 的版本走，规范的集合是固定的。与 Error 的文案用同一个判断。
 pub fn is_whitespace(c: char) -> bool {
-    matches!(c, '\u{09}'..='\u{0D}' | '\u{20}' | '\u{85}' | '\u{A0}' | '\u{1680}' | '\u{2000}'..='\u{200A}' | '\u{2028}' | '\u{2029}' | '\u{202F}' | '\u{205F}' | '\u{3000}')
+    crate::grammar::is_whitespace(c)
 }
 
 /// `tcp` 端点的地址是不是回环地址加端口（`handshake.md` §2）：主机是 `127.0.0.0/8` 的四段点分十进制（每段 `0`–`255`、不带前导零）
