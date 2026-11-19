@@ -1,0 +1,93 @@
+name: 发布
+
+# 推送 v* 标签（如 v0.1.0-rc.1、v0.1.0）触发，guard 通过后发布到 crates.io。
+# GitHub Release 与 XiHan.Framework 一样，在标签推送之后手动建（version-release 技能）。
+#
+# guard 跑 scripts/release-check.sh，与打标签之前在本地跑的是同一份（version-release 技能）：
+# 标签只从 main 发，标签号等于 Cargo.toml 的 version，spec 子模块钉在规范标签上
+# （预发布可钉 rc，正式版只钉正式版标签，RFC-0024）。不通过就不发布。
+# 手动 Run workflow 时必须选中一个版本标签；选分支会被 guard 拦下。
+#
+# 认证走 crates.io 可信发布（OIDC），无长期令牌。
+# crates.io → crate xihan-framework → Settings → Trusted Publishing → GitHub：
+# 仓库所有者 XiHanFun、仓库 framework-sdk-rust、工作流文件 release.yml、环境留空。
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    name: 发版核对
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+
+    steps:
+      - name: 检出
+        uses: actions/checkout@v5
+        with:
+          # 要拿完整历史才能判断祖先关系；子模块不检出，脚本读树里记的指针
+          fetch-depth: 0
+
+      - name: 只接受版本标签
+        run: |
+          if [ "$GITHUB_REF_TYPE" != "tag" ]; then
+            echo "::error::发布只接受版本标签触发，收到 $GITHUB_REF_TYPE $GITHUB_REF_NAME"
+            exit 1
+          fi
+
+      - name: 核对标签、版本与规范标签
+        id: check
+        run: bash scripts/release-check.sh "$GITHUB_REF_NAME" "$GITHUB_SHA"
+
+  publish:
+    name: 发布到 crates.io
+    needs: guard
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # 颁发 GitHub OIDC 令牌，crates-io-auth-action 用它换取这一次发布的短期令牌
+
+    steps:
+      - name: 检出
+        # Cargo.toml 排除了 spec/，打包与发布前的校验构建都用不到子模块
+        uses: actions/checkout@v5
+
+      - name: 这个版本已在 crates.io 上（重跑）就跳过
+        id: published
+        env:
+          VERSION: ${{ needs.guard.outputs.version }}
+        run: |
+          # crates.io 的 API 要求带 User-Agent
+          status="$(curl -s -o /dev/null -w '%{http_code}' -A "framework-sdk-rust release workflow (https://github.com/XiHanFun/framework-sdk-rust)" \
+            "https://crates.io/api/v1/crates/xihan-framework/$VERSION")"
+          if [ "$status" = 200 ]; then
+            echo "xihan-framework $VERSION 已在 crates.io 上，跳过"
+            echo "done=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "done=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装 Rust
+        if: steps.published.outputs.done != 'true'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: crates.io 可信发布登录（OIDC 换短期令牌）
+        if: steps.published.outputs.done != 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: 发布
+        # cargo publish 先打包，再按打出的包做一次校验构建，失败就不上传
+        if: steps.published.outputs.done != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish

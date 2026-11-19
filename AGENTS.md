@@ -42,6 +42,8 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 ├─ Cargo.toml                          # crate 清单：版本、rust-version、feature plugin、依赖、lints、打包排除
 ├─ rustfmt.toml                        # 行宽 160
 ├─ .github/workflows/ci.yml            # 门禁
+├─ .github/workflows/release.yml       # 发布：推送 v* 标签触发，核对后发布到 crates.io
+├─ scripts/release-check.sh            # 发版核对：打标签之前与 release.yml 的 guard 都跑它
 ├─ spec/                               # 规范（XiHanFun/framework-spec 的 submodule）：RFC、术语表、清单 Schema、插件协议、一致性向量与运行器
 ├─ src/
 │  ├─ lib.rs                           # crate 入口、BoxFuture、两份 README 的文档测试
@@ -71,6 +73,7 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 | 测试 | `cargo test`，`cargo test --features plugin`（后者含黑盒运行器，要 Go） |
 | 最低 Rust 版本 | `cargo +1.85 build --lib`，同上加 `--features plugin`（要 rustup 装有 1.85） |
 | 黑盒运行器 | `cd spec/conformance && go run ./cmd/xihan-conformance plugin --dir <插件目录> --exclude <会崩溃的操作 ID> --sample '<操作 ID>=<请求 JSON>'` |
+| 发版核对 | `bash scripts/release-check.sh vX.Y.Z main`（打标签之前跑，联网取 `origin/main` 与规范的远端标签） |
 
 全部门禁按 `.github/workflows/ci.yml` 的顺序见 `.agents/skills/testing-release/SKILL.md`。
 
@@ -123,15 +126,16 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 
 - 版本真源是 `Cargo.toml` 的 `[package] version`；`primitives::SDK_VERSION` 取自它，`src/lib.rs` 的单元测试 `exposes_versions` 写着当前版本，改版本时一并改。
 - 注册表包名是 crates.io 的 `xihan-framework`；那里目前只有占名的版本。
-- 发布用用户自己的 crates.io 令牌执行 `cargo publish`，只在用户明确要求时执行；仓库没有发布工作流。
+- 发布由 `.github/workflows/release.yml` 在推送 `v*` 标签时执行：guard 跑 `scripts/release-check.sh`（标签在 `main` 上、标签号等于 `Cargo.toml` 的 `version`、规范钉在标签上），通过后以 crates.io 可信发布（OIDC）`cargo publish`；GitHub Release 与 XiHan.Framework 一样在标签推送后手动建。打标签之前先在本地跑同一份脚本；打标签与推送只在用户明确要求时执行，步骤见 `version-release` 技能。首次发布前要用户在 crates.io 配可信发布者。
 - 打包排除 `spec/`、`tests/`、`tools/`、Agent 的指令与技能（`AGENTS.md`、`CLAUDE.md`、`.agents/`、`.claude/`）和仓库配置文件（`Cargo.toml` 的 `exclude`）。
-- 仓库还没有版本标签与标签规则；规范（RFC-0024）要求发版时 `spec/` 正好在规范标签上，README 的「状态」写明钉的规范版本、认领的档与缺口。
+- 标签写成 `v<版本>`，还没有打过；规范（RFC-0024）要求发版时 `spec/` 正好在规范标签上，README 的「状态」写明钉的规范版本、认领的档与缺口。
 
 ## 分支
 
 - 日常提交在 `dev`。
 - `main` 只在用户明确说「推送并快进 main」时由 `dev` 快进（`git fetch . dev:main`，不是快进就停下查）。
 - CI（`.github/workflows/ci.yml`）在 `main` 与 `dev` 的 push、目标为这两个分支的 PR 上运行，也可以手动触发。
+- 发版工作流（`.github/workflows/release.yml`）只在推送 `v*` 标签、或手动运行时选中版本标签时运行，见「发布」与 `version-release` 技能。
 
 ## Git 与提交
 
