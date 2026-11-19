@@ -120,7 +120,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 在有钉在规范标签上的发布版之前，成熟度是 Experimental；尚未提供的部分见文档。
 
-- 钉的规范版本：`spec/` 子模块指向的提交（规范还没有打标签）。
+- 钉的规范版本：`spec/` 子模块指向的规范标签。
 - 认领的档（RFC-0024）：`core` 与 `plugin`。
 - 缺口：无。
 

@@ -122,7 +122,7 @@ The documentation site is in Chinese.
 
 Experimental until there is a release pinned to a spec tag; what is not provided yet is listed in the documentation.
 
-- Pinned spec version: the commit the `spec/` submodule points to (the spec has no tags yet).
+- Pinned spec version: the spec tag the `spec/` submodule points to.
 - Claimed profiles (RFC-0024): `core` and `plugin`.
 - Gaps: none.
 
