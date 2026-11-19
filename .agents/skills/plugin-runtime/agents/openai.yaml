@@ -1,0 +1,7 @@
+interface:
+  display_name: "Rust SDK 插件运行时"
+  short_description: "按插件协议实现与验证 feature plugin 的进程外插件运行时"
+  default_prompt: "使用 $xihan-sdk-rust-plugin-runtime 修改并用黑盒运行器验证插件运行时。"
+
+policy:
+  allow_implicit_invocation: true

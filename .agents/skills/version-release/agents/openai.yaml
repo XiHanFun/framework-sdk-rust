@@ -1,0 +1,7 @@
+interface:
+  display_name: "Rust SDK 版本发布"
+  short_description: "更新版本、核对规范标签与包内容，并在明确要求时发布到 crates.io"
+  default_prompt: "使用 $xihan-sdk-rust-version-release 准备并核对一次 Rust SDK 版本发布。"
+
+policy:
+  allow_implicit_invocation: true

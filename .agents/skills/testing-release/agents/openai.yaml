@@ -1,0 +1,7 @@
+interface:
+  display_name: "Rust SDK 测试与门禁"
+  short_description: "按 CI 运行 Rust SDK 的门禁、向量覆盖与黑盒运行器"
+  default_prompt: "使用 $xihan-sdk-rust-testing-release 跑全部门禁并报告结果。"
+
+policy:
+  allow_implicit_invocation: true

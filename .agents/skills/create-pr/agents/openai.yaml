@@ -1,0 +1,7 @@
+interface:
+  display_name: "Rust SDK 创建 PR"
+  short_description: "检查分支并按固定几段准备、创建 Rust SDK Pull Request"
+  default_prompt: "使用 $xihan-sdk-rust-create-pr 为当前分支准备并创建 Pull Request。"
+
+policy:
+  allow_implicit_invocation: true

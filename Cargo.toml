@@ -12,8 +12,8 @@ documentation = "https://docs.rs/xihan-framework"
 readme = "README.md"
 keywords = ["xihan", "framework", "plugin", "pipeline"]
 categories = ["development-tools"]
-# 规范 submodule、读取它的一致性测试与开发时的生成器不进 crate 包
-exclude = [".github/", ".gitattributes", ".gitignore", ".gitmodules", ".editorconfig", "/spec", "/tests", "/tools"]
+# 规范 submodule、读取它的一致性测试、开发时的生成器与 AI Agent 的仓库指令和技能不进 crate 包
+exclude = [".github/", ".gitattributes", ".gitignore", ".gitmodules", ".editorconfig", "/spec", "/tests", "/tools", "/.agents", "/.claude", "/AGENTS.md", "/CLAUDE.md"]
 
 [features]
 # 进程外插件运行时（RFC-0017，模块 plugin）；gRPC、protobuf 与异步运行时只在打开它时进依赖
