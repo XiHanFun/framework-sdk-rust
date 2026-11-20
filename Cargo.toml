@@ -1,6 +1,6 @@
 [package]
 name = "xihan-framework"
-version = "0.1.0"
+version = "0.2.0-rc.1"
 edition = "2024"
 # edition 2024 需要 1.85；clippy 的 incompatible_msrv 按这里核对标准库 API，依赖也按它解析到兼容的版本
 rust-version = "1.85"
