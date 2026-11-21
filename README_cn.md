@@ -42,10 +42,10 @@ XiHan Framework SDK for Rust 是 [XiHan Spec](https://github.com/XiHanFun/framew
 ## 安装
 
 ```bash
-cargo add xihan-framework
+cargo add xihan-framework@<版本>
 ```
 
-插件运行时在 cargo feature `plugin` 下（`--features plugin`）。本 crate 尚未发布到 crates.io：那里的版本只是名字占位。
+插件运行时在 cargo feature `plugin` 下（`--features plugin`）。目前只有预发布版，要写明版本号：`<版本>` 换成 [Releases](https://github.com/XiHanFun/framework-sdk-rust/releases) 里的版本（不带 `v`）；不写版本会装到 crates.io 上占名用的旧版本。
 
 ## 快速开始
 
@@ -118,7 +118,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 状态
 
-在有钉在规范标签上的发布版之前，成熟度是 Experimental；尚未提供的部分见文档。
+成熟度是 Experimental：已有钉在规范 rc 标签上的预发布版，到 Stable 还要钉在规范正式版标签上的发布版；尚未提供的部分见文档。
 
 - 钉的规范版本：`spec/` 子模块指向的规范标签。
 - 认领的档（RFC-0024）：`core` 与 `plugin`。

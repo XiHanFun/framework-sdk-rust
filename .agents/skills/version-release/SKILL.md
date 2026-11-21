@@ -8,8 +8,8 @@ description: 为 Rust SDK 准备版本、更新 Cargo.toml 的版本、核对规
 ## 事实
 
 - 版本真源是 `Cargo.toml` 的 `[package] version`；`primitives::SDK_VERSION` 取自 `CARGO_PKG_VERSION`，`src/lib.rs` 的单元测试 `exposes_versions` 写着当前版本。
-- 注册表是 crates.io，包名 `xihan-framework`；那里目前只有占名的版本，还没有发布过正式版本。
-- 标签写成 `v<版本>`（如 `v0.1.0`、`v0.1.0-rc.1`，与其他 SDK 相同），只从 `main` 打；推送 `v*` 标签由 `.github/workflows/release.yml` 发布。还没有打过标签。
+- 注册表是 crates.io，包名 `xihan-framework`；那里最早的 `0.0.1` 是占名用的，之后的版本由 `release.yml` 发布。目前只有预发布版，README 与文档页的安装命令带 `@<版本>` 占位，首个正式版发布后去掉。
+- 标签写成 `v<版本>`（如 `v0.1.0`、`v0.1.0-rc.1`，与其他 SDK 相同），只从 `main` 打；推送 `v*` 标签由 `.github/workflows/release.yml` 发布。
 - 打包排除 `spec/`、`tests/`、`tools/`、Agent 的指令与技能（`AGENTS.md`、`CLAUDE.md`、`.agents/`、`.claude/`）和仓库配置文件（`Cargo.toml` 的 `exclude`）。
 
 ## 与规范标签的关系（RFC-0024「实现钉规范」）

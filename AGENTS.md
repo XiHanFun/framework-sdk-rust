@@ -119,16 +119,16 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 
 - README 只放概览、安装、一个最小示例与链接；README.md（英文）与 README_cn.md（中文）同构，两份同步。
 - 详细文档在 XiHan.Framework 仓库的 `docs/sdks/rust.md`（站点 <https://framework.docs.xihanfun.com/sdks/rust>）。本地克隆在 `../XiHan.Framework`，是另一个仓库，单独提交；构建用 `pnpm --dir docs build`（在那个仓库根执行），VitePress 对站内死链会构建失败。
-- 文档正文不写版本号：包版本、依赖版本、规范提交哈希、测试数量都指向真源（`Cargo.toml`、`spec/` 子模块）；安装命令不带版本。
+- 文档正文不写版本号：包版本、依赖版本、规范提交哈希、测试数量都指向真源（`Cargo.toml`、`spec/` 子模块）；安装命令不写具体版本号，只有预发布版时写 `@<版本>` 占位并指向 Releases，首个正式版发布后去掉占位。
 - 改公开 API 或行为时同步 crate 文档、README（涉及最小示例时）与文档页的对应章节；破坏性改动写进文档页的「破坏性改动与迁移」。
 
 ## 发布
 
 - 版本真源是 `Cargo.toml` 的 `[package] version`；`primitives::SDK_VERSION` 取自它，`src/lib.rs` 的单元测试 `exposes_versions` 写着当前版本，改版本时一并改。
-- 注册表包名是 crates.io 的 `xihan-framework`；那里目前只有占名的版本。
+- 注册表包名是 crates.io 的 `xihan-framework`；那里最早的 `0.0.1` 是占名用的，不是本仓库发布的版本。
 - 发布由 `.github/workflows/release.yml` 在推送 `v*` 标签时执行：guard 跑 `scripts/release-check.sh`（标签在 `main` 上、标签号等于 `Cargo.toml` 的 `version`、规范钉在标签上），通过后以 crates.io 可信发布（OIDC）`cargo publish`；GitHub Release 与 XiHan.Framework 一样在标签推送后手动建。打标签之前先在本地跑同一份脚本；打标签与推送只在用户明确要求时执行，步骤见 `version-release` 技能。首次发布前要用户在 crates.io 配可信发布者。
 - 打包排除 `spec/`、`tests/`、`tools/`、Agent 的指令与技能（`AGENTS.md`、`CLAUDE.md`、`.agents/`、`.claude/`）和仓库配置文件（`Cargo.toml` 的 `exclude`）。
-- 标签写成 `v<版本>`，还没有打过；规范（RFC-0024）要求发版时 `spec/` 正好在规范标签上，README 的「状态」写明钉的规范版本、认领的档与缺口。
+- 标签写成 `v<版本>`；规范（RFC-0024）要求发版时 `spec/` 正好在规范标签上，README 的「状态」写明钉的规范版本、认领的档与缺口。
 
 ## 分支
 

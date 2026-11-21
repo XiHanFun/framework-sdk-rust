@@ -42,10 +42,10 @@ Without the `plugin` feature the crate depends on no async runtime.
 ## Installation
 
 ```bash
-cargo add xihan-framework
+cargo add xihan-framework@<version>
 ```
 
-The plugin runtime is behind the cargo feature `plugin` (`--features plugin`). The crate is not yet published to crates.io: the version there is only a name placeholder.
+The plugin runtime is behind the cargo feature `plugin` (`--features plugin`). Only prereleases are published so far, so write the version out: replace `<version>` with a version from [Releases](https://github.com/XiHanFun/framework-sdk-rust/releases) (without the `v`); without a version cargo picks the old release on crates.io that only reserves the name.
 
 ## Getting Started
 
@@ -120,7 +120,7 @@ The documentation site is in Chinese.
 
 ## Status
 
-Experimental until there is a release pinned to a spec tag; what is not provided yet is listed in the documentation.
+The maturity is Experimental: there is a prerelease pinned to a spec rc tag, and Stable also needs a release pinned to a formal spec tag; what is not provided yet is listed in the documentation.
 
 - Pinned spec version: the spec tag the `spec/` submodule points to.
 - Claimed profiles (RFC-0024): `core` and `plugin`.
