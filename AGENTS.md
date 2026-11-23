@@ -10,7 +10,7 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 
 | 技术 | 要求 | 用途 |
 | --- | --- | --- |
-| Rust | edition 2024，`Cargo.toml` 的 `rust-version` 是 1.85（edition 2024 的要求）；CI 用 stable 跑门禁、另以 1.85 构建库 | crate 源码 |
+| Rust | edition 2024，`Cargo.toml` 的 `rust-version` 是 1.85（edition 2024 的要求）；CI 用 stable 跑门禁、另以 1.85 编译库、测试与示例 | crate 源码 |
 | serde（`derive`）、serde_json（`raw_value`）、serde_path_to_error、getrandom | 以 `Cargo.toml` 为准 | 线上编码、XGI 载荷与清单读写、载荷错误的 JSON 路径、追踪 ID 与端点名的随机数 |
 | tonic、tonic-prost、prost、tokio、tokio-stream、hyper-util | 只在 feature `plugin`；依赖按 `rust-version` 解析到兼容的版本（见 `Cargo.toml` 的注释） | 插件运行时的 gRPC 服务端、回调客户端与异步运行时 |
 | protox、tonic-prost-build、prost-build | 版本钉死在 `tools/protogen/Cargo.toml`，它的锁文件提交 | 从 `spec/plugin/plugin.proto` 生成协议代码，不需要 protoc |
@@ -71,7 +71,7 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 | 静态检查 | `cargo clippy --all-targets -- -D warnings`，`cargo clippy --all-targets --features plugin -- -D warnings` |
 | 文档 | `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`，同上加 `--features plugin` |
 | 测试 | `cargo test`，`cargo test --features plugin`（后者含黑盒运行器，要 Go） |
-| 最低 Rust 版本 | `cargo +1.85 build --lib`，同上加 `--features plugin`（要 rustup 装有 1.85） |
+| 最低 Rust 版本 | `cargo +1.85 test --no-run`，同上加 `--features plugin`（编译库、测试与示例，不运行；要 rustup 装有 1.85） |
 | 黑盒运行器 | `cd spec/conformance && go run ./cmd/xihan-conformance plugin --dir <插件目录> --exclude <会崩溃的操作 ID> --sample '<操作 ID>=<请求 JSON>'` |
 | 发版核对 | `bash scripts/release-check.sh vX.Y.Z main`（打标签之前跑，联网取 `origin/main` 与规范的远端标签） |
 

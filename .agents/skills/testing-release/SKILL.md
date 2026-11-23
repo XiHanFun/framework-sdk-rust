@@ -20,14 +20,14 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --features plugin
 cargo test
 cargo test --features plugin
-cargo +1.85 build --lib
-cargo +1.85 build --lib --features plugin
+cargo +1.85 test --no-run
+cargo +1.85 test --no-run --features plugin
 cargo run --locked --manifest-path tools/protogen/Cargo.toml
 git status --porcelain -- src/plugin/generated
 ```
 
 - 最后一行应当没有输出：生成物与提交的一致。
-- `cargo +1.85` 要 rustup 装有 1.85 工具链；CI 的 `msrv` 作业只构建库，不跑测试。
+- `cargo +1.85` 要 rustup 装有 1.85 工具链；CI 的 `msrv` 作业编译库、全部测试与示例（`--no-run`），不运行，也不检出规范 submodule：测试在运行时才读 `spec/`。
 - 两种 feature 组合（默认与 `--features plugin`）都要过；`cargo test --features plugin` 含黑盒运行器，要 Go。
 - 先跑受影响的测试（`cargo test --test <名字>`、`cargo test --features plugin --test plugin`），再跑全部。
 

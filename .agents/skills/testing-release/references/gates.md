@@ -10,7 +10,7 @@
 | | | `RUSTDOCFLAGS=-D warnings` 下 `cargo doc --no-deps` 与 `--features plugin` 各一遍 | 修断掉的文档链接与文档注释 |
 | | | `cargo test`，`cargo test --features plugin` | 先单独跑失败的测试目标定位 |
 | | | 只在 ubuntu-latest：`cargo publish --dry-run`（打包并构建包里的内容，不上传） | 看 `Cargo.toml` 的 `exclude` 是不是排掉了构建要用的文件；本地加 `--allow-dirty` 复现 |
-| `msrv` | ubuntu-latest | Rust 1.85 下 `cargo build --lib` 与 `--features plugin` | 换用 1.85 有的标准库 API；依赖按 `rust-version` 解析，不手钉更高要求的版本 |
+| `msrv` | ubuntu-latest | Rust 1.85 下 `cargo test --no-run` 与 `--features plugin`：编译库、全部测试与示例，不运行 | 换用 1.85 有的标准库 API 与语法（测试与示例里的也算）；依赖按 `rust-version` 解析，不手钉更高要求的版本 |
 | `protocol` | ubuntu-latest | `cargo run --locked --manifest-path tools/protogen/Cargo.toml`，再按 `git status --porcelain -- src/plugin/generated` 判空 | 重新生成并提交生成物，不手改 |
 
 触发：`main` 与 `dev` 的 push、目标为这两个分支的 PR、手动 `workflow_dispatch`；同一引用的新运行取消旧运行。

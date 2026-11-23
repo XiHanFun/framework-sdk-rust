@@ -91,11 +91,12 @@ jobs:
       - name: 缓存 cargo 产物
         uses: Swatinem/rust-cache@v2
 
-      # 只构建库：测试读 spec/，在上面的作业里跑；依赖按 rust-version 解析到兼容的版本（tonic 到 0.14.5）
-      - name: 构建
+      # 编译库、全部测试与示例，不运行：测试在运行时才读 spec/（这里不检出 submodule），在上面的作业里跑；
+      # 依赖按 rust-version 解析到兼容的版本（tonic 到 0.14.5）
+      - name: 编译库、测试与示例
         run: |
-          cargo build --lib
-          cargo build --lib --features plugin
+          cargo test --no-run
+          cargo test --no-run --features plugin
 
   protocol:
     name: 协议生成代码
