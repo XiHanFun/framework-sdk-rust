@@ -23,8 +23,9 @@ pub struct CancellationToken {
 
 struct Node {
     id: u64,
-    // 子令牌持有父令牌：父令牌活得至少和子令牌一样久，丢弃子令牌时才能去父令牌里注销
-    parent: Option<Arc<Node>>,
+    // 子令牌持有父令牌：父令牌活得至少和子令牌一样久，丢弃子令牌时才能去父令牌里注销；
+    // 派生上下文时一个令牌可以同时跟随两个（原上下文的令牌与另给的令牌），所以是两个位置
+    parents: [Option<Arc<Node>>; 2],
     cancelled: AtomicBool,
     state: Mutex<State>,
 }
@@ -37,8 +38,8 @@ struct State {
 }
 
 impl Node {
-    fn new(parent: Option<Arc<Node>>) -> Arc<Self> {
-        Arc::new(Self { id: NEXT_NODE.fetch_add(1, Ordering::Relaxed), parent, cancelled: AtomicBool::new(false), state: Mutex::default() })
+    fn new(parents: [Option<Arc<Node>>; 2]) -> Arc<Self> {
+        Arc::new(Self { id: NEXT_NODE.fetch_add(1, Ordering::Relaxed), parents, cancelled: AtomicBool::new(false), state: Mutex::default() })
     }
 
     /// 锁里只有对两个表的整体增删，panic 不会留下半改的状态，所以中毒时照常使用
@@ -53,7 +54,7 @@ impl Node {
 
 impl Drop for Node {
     fn drop(&mut self) {
-        if let Some(parent) = &self.parent {
+        for parent in self.parents.iter().flatten() {
             parent.lock().children.remove(&self.id);
         }
     }
@@ -62,22 +63,35 @@ impl Drop for Node {
 impl CancellationToken {
     /// 创建未取消的令牌。
     pub fn new() -> Self {
-        Self { node: Node::new(None) }
+        Self { node: Node::new([None, None]) }
     }
 
     /// 派生子令牌：本令牌取消时子令牌随之取消；本令牌已取消时子令牌一出生就是取消的。
     pub fn child_token(&self) -> Self {
-        let child = Node::new(Some(Arc::clone(&self.node)));
-        let registered = {
-            let mut state = self.node.lock();
+        Self::following([Some(self), None])
+    }
+
+    /// 派生同时跟随两个令牌的子令牌：本令牌或 `other` 任何一个取消，它都随之取消，取消它不影响这两个；其中一个已取消时它一出生
+    /// 就是取消的。派生上下文（[`Context::with_cancellation`](super::Context::with_cancellation)）用。
+    pub(crate) fn linked_token(&self, other: &Self) -> Self {
+        Self::following([Some(self), Some(other)])
+    }
+
+    /// 建一个跟随这些父令牌的子令牌，逐个登记到父令牌里。
+    fn following(parents: [Option<&Self>; 2]) -> Self {
+        let child = Node::new(parents.map(|parent| parent.map(|parent| Arc::clone(&parent.node))));
+        let mut born_cancelled = false;
+        for parent in parents.into_iter().flatten() {
+            let mut state = parent.node.lock();
             // 在父令牌的锁里判断：cancel 也在这把锁里置位并取走子令牌，二者不会交错，子令牌不会漏掉取消
-            let registered = !self.node.is_cancelled();
-            if registered {
+            if parent.node.is_cancelled() {
+                born_cancelled = true;
+            } else {
                 state.children.insert(child.id, Arc::downgrade(&child));
             }
-            registered
-        };
-        if !registered {
+        }
+        if born_cancelled {
+            // 子令牌还没有交出去，没有等待方与自己的子令牌；另一个父令牌此时取消它也只是置同一个位
             child.cancelled.store(true, Ordering::Release);
         }
         Self { node: child }
@@ -238,6 +252,34 @@ mod tests {
         assert_eq!(counter.0.load(Ordering::SeqCst), 1);
         assert_eq!(Pin::new(&mut waiting).poll(&mut context), Poll::Ready(()));
         assert_eq!(parent.registered_waiters(), 0);
+    }
+
+    /// 跟随两个父令牌的令牌：任何一个取消它都取消，丢弃时从两个父令牌里都注销，登记的条目不随派生次数增长。
+    #[test]
+    fn linked_tokens_follow_both_parents_and_unregister() {
+        let (left, right) = (CancellationToken::new(), CancellationToken::new());
+        let linked = left.linked_token(&right);
+        assert_eq!((left.registered_children(), right.registered_children()), (1, 1));
+        linked.cancel();
+        assert!(!left.is_cancelled() && !right.is_cancelled(), "cancelling the linked token reaches neither parent");
+        drop(linked);
+        assert_eq!((left.registered_children(), right.registered_children()), (0, 0));
+
+        let linked = left.linked_token(&right);
+        let child = linked.child_token();
+        right.cancel();
+        assert!(linked.is_cancelled() && child.is_cancelled() && !left.is_cancelled());
+        drop((linked, child));
+        assert_eq!(left.registered_children(), 0);
+
+        let born = left.linked_token(&right);
+        assert!(born.is_cancelled(), "born cancelled when one of the parents already is");
+        drop(born);
+        assert_eq!(left.registered_children(), 0);
+        let live = left.linked_token(&CancellationToken::new());
+        let same = left.linked_token(&left);
+        left.cancel();
+        assert!(live.is_cancelled() && same.is_cancelled());
     }
 
     #[test]

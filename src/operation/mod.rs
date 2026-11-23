@@ -680,7 +680,9 @@ impl Middleware for DeadlineStep {
             match next.run(ctx).await {
                 // 下游只知道取消发生了，不知道是哪个令牌触发的（如插件回调把 gRPC 的 Cancelled 映射成取消）：截止令牌已触发即超时，
                 // 调用方同时取消也一样（RFC-0003 规则 1，ADR-0092、ADR-0236）
-                Err(error) if error.code() == ERROR_CODE_CANCELLED && ctx.cancellation().is_some_and(|fired| fired.code() == ERROR_CODE_DEADLINE_EXCEEDED) => {
+                Err(error)
+                    if error.code() == ERROR_CODE_CANCELLED && ctx.cancellation_error().is_some_and(|fired| fired.code() == ERROR_CODE_DEADLINE_EXCEEDED) =>
+                {
                     Err(invocation::deadline_exceeded())
                 }
                 outcome => outcome,
@@ -785,7 +787,7 @@ impl Invoker {
     /// 载荷先过共同的 JSON 读取检查，再按请求类型的 `Deserialize` 解码；必填、可选与接受 `null` 的成员怎么声明见 [`nullable`]。
     ///
     /// 取消与截止时间只经上下文的令牌通知（RFC-0003 规则 1）：调用器与内置步骤不中止中间件或处理器，不丢弃它们的 future；令牌触发之后
-    /// 处理器照常返回结果的，调用以那个结果结束，处理器把取消写成结果（如 `Err(ctx.cancellation()?)`）时按触发的令牌归因。
+    /// 处理器照常返回结果的，调用以那个结果结束，处理器把取消写成结果（如 `Err(ctx.cancellation_error()?)`）时按触发的令牌归因。
     // 返回类型写明 Send：签名即承诺 future 可以跨线程（gRPC 服务端要求），实现改动不会悄悄破坏这一点
     #[allow(clippy::manual_async_fn)]
     pub fn invoke<'a>(&'a self, ctx: &'a Context, request: Request) -> impl Future<Output = Result<Vec<u8>>> + Send + 'a {

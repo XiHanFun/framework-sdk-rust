@@ -15,11 +15,18 @@ pub(crate) struct Deadline {
     fired: CancellationToken,
     // 丢弃即从定时器里撤下条目，条目数以仍然存活的截止时间为上限
     _registration: Option<Registration>,
+    // 派生上下文收紧截止时间时，原上下文的截止时间：它仍然有效，它的令牌触发同样是超时
+    outer: Option<Arc<Deadline>>,
 }
 
 impl Deadline {
     /// 登记截止时间：已经过去的立即触发；远到 `Instant` 表示不了的不起定时器，等同于调用期间不会到期（ADR-0203）。
     pub(crate) fn start(at: SystemTime, context: &CancellationToken) -> Arc<Self> {
+        Self::start_within(at, context, None)
+    }
+
+    /// 同 [`Deadline::start`]，`outer` 是被它收紧的外层截止时间（派生上下文用）：外层的截止令牌触发时，这一个同样算已触发。
+    pub(crate) fn start_within(at: SystemTime, context: &CancellationToken, outer: Option<Arc<Deadline>>) -> Arc<Self> {
         let fired = CancellationToken::new();
         let registration = match at.duration_since(SystemTime::now()) {
             Ok(remaining) if remaining > Duration::ZERO => {
@@ -30,7 +37,7 @@ impl Deadline {
                 None
             }
         };
-        Arc::new(Self { at, fired, _registration: registration })
+        Arc::new(Self { at, fired, _registration: registration, outer })
     }
 
     /// 绝对截止时间。
@@ -38,9 +45,17 @@ impl Deadline {
         self.at
     }
 
-    /// 截止令牌是否已触发。
+    /// 截止令牌是否已触发：自己的，或外层任何一个的。
     pub(crate) fn has_fired(&self) -> bool {
-        self.fired.is_cancelled()
+        // 外层的截止时间通常更晚，但两个定时器各按登记时的单调时钟换算，外层的令牌可能先到；沿着链看，层数就是收紧的次数
+        let mut current = Some(self);
+        while let Some(deadline) = current {
+            if deadline.fired.is_cancelled() {
+                return true;
+            }
+            current = deadline.outer.as_deref();
+        }
+        false
     }
 
     /// 测试用：立即触发截止令牌与上下文令牌，截止时间不变。

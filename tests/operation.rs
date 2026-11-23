@@ -707,7 +707,7 @@ fn cancellation_only_notifies_through_the_token() {
             operation::handler_fn(|ctx: &Context, _request: CreateOrder| {
                 Box::pin(async move {
                     ctx.done().await;
-                    Err::<(), _>(ctx.cancellation().expect("the token fired"))
+                    Err::<(), _>(ctx.cancellation_error().expect("the token fired"))
                 })
             }),
         )

@@ -10,7 +10,7 @@
 //!
 //! let ctx = Context::builder().timeout(Duration::from_secs(2)).baggage(BAGGAGE_TENANT, "t1").build();
 //! assert_eq!(ctx.tenant(), Some("t1"));
-//! assert!(ctx.has_deadline() && ctx.cancellation().is_none());
+//! assert!(ctx.has_deadline() && ctx.cancellation_error().is_none());
 //! ```
 
 mod cancellation;
@@ -46,8 +46,9 @@ pub const MESSAGE_CANCELLED: &str = "kernel.invocation.cancelled";
 
 /// 一次调用的上下文。
 ///
-/// 克隆与派生（[`Context::with_baggage`]）共享取消令牌、截止时间与对象袋，Baggage 按值复制：派生上下文加的键
-/// 不会漏回原上下文。上下文是 `Send + Sync` 的，可以在异步任务之间借用。
+/// 克隆共享全部状态。派生的上下文与原上下文共享追踪与对象袋，原上下文取消（调用方取消或到达截止时间）时它随之取消，它自己多出来
+/// 的部分不回传给原上下文：[`Context::with_baggage`] 多一个 Baggage 键值（Baggage 按值复制），[`Context::with_cancellation`] 还跟随
+/// 另一个令牌，[`Context::with_deadline`] 与 [`Context::with_timeout`] 收紧截止时间。上下文是 `Send + Sync` 的，可以在异步任务之间借用。
 #[derive(Clone)]
 pub struct Context {
     token: CancellationToken,
@@ -86,7 +87,7 @@ impl Context {
 
     /// 判断在 `now` 时是否已过截止时间；没有截止时间时总是假。
     ///
-    /// 只用于展示与日志：超时与取消的归因看 [`Context::cancellation`]，它只认截止令牌，不另看时钟。
+    /// 只用于展示与日志：超时与取消的归因看 [`Context::cancellation_error`]，它只认截止令牌，不另看时钟。
     pub fn is_expired(&self, now: SystemTime) -> bool {
         self.deadline().is_some_and(|deadline| now >= deadline)
     }
@@ -139,6 +140,44 @@ impl Context {
         let mut baggage = BTreeMap::clone(&self.baggage);
         baggage.insert(key, value);
         Self { baggage: Arc::new(baggage), ..self.clone() }
+    }
+
+    /// 派生一个还跟随 `token` 的上下文：原上下文取消或 `token` 取消时它随之取消，它的取消不回传给原上下文。
+    ///
+    /// 追踪、Baggage、截止时间与对象袋与原上下文共享。`token` 的取消按调用方取消归因（`KERNEL_CANCELLED_001`）；原上下文的截止时间
+    /// 到了仍是超时。给下游一个可以单独放弃的上下文时用它，如并发发出几个调用、拿到第一个结果就取消其余的。
+    #[must_use]
+    pub fn with_cancellation(&self, token: &CancellationToken) -> Self {
+        Self { token: self.token.linked_token(token), ..self.clone() }
+    }
+
+    /// 派生一个截止时间不晚于 `at` 的上下文：截止时间只能收紧，原上下文已有不晚于 `at` 的截止时间时什么都不变。
+    ///
+    /// 收紧后的截止时间到达时只有派生的上下文取消，报 `KERNEL_TIMEOUT_001`（已经过去的立即触发）；原上下文不受影响，它取消或到达
+    /// 自己的截止时间时派生的上下文随之取消。追踪、Baggage 与对象袋与原上下文共享。
+    ///
+    /// # Panics
+    ///
+    /// 进程里第一次登记截止时间而定时器线程无法启动时 panic，同 [`ContextBuilder::build`]。
+    #[must_use]
+    pub fn with_deadline(&self, at: SystemTime) -> Self {
+        // 只能收紧：放宽了下游就会活过调用方给的时限
+        if self.deadline().is_some_and(|current| current <= at) {
+            return self.clone();
+        }
+        // 派生的令牌是原令牌的子令牌：新的截止时间只触发它，原上下文的取消照常传下来
+        let token = self.token.child_token();
+        let deadline = Deadline::start_within(at, &token, self.deadline.clone());
+        Self { token, deadline: Some(deadline), ..self.clone() }
+    }
+
+    /// 以相对时间收紧截止时间，同 [`Context::with_deadline`]；超出 `SystemTime` 能表示的范围时什么都不变。
+    #[must_use]
+    pub fn with_timeout(&self, timeout: Duration) -> Self {
+        match SystemTime::now().checked_add(timeout) {
+            Some(at) => self.with_deadline(at),
+            None => self.clone(),
+        }
     }
 
     /// 派生一个只保留已登记键的上下文：进程外的载体只写已登记的键（RFC-0003 规则 3）。
@@ -195,7 +234,7 @@ impl Context {
 
     /// 上下文的取消令牌：调用方取消（[`ContextBuilder::cancellation`]）或到达截止时间时触发。
     ///
-    /// 传给需要令牌的 API；判断是超时还是取消用 [`Context::cancellation`]。
+    /// 传给需要令牌的 API；判断是超时还是取消用 [`Context::cancellation_error`]。
     pub fn cancellation_token(&self) -> &CancellationToken {
         &self.token
     }
@@ -216,11 +255,19 @@ impl Context {
     /// 归因只看令牌（RFC-0003 规则 1、RFC-0004）：截止令牌已触发即超时，不论调用方是否也已取消；截止令牌没有触发时，
     /// 即使时钟已过截止时间，调用方的取消仍是取消。超时的消息键是 `kernel.invocation.deadline_exceeded`；调用开始时截止时间
     /// 已经过去的 `kernel.invocation.deadline_before_start` 由调用器在第一个中间件之前判断（RFC-0011 规则 10），不在这里。
-    pub fn cancellation(&self) -> Option<Error> {
+    pub fn cancellation_error(&self) -> Option<Error> {
         if self.deadline_fired() {
             return Some(deadline_exceeded());
         }
         self.token.is_cancelled().then(cancelled)
+    }
+
+    /// [`Context::cancellation_error`] 的旧名。
+    ///
+    /// 与设置调用方令牌的 [`ContextBuilder::cancellation`] 同名而不是一回事，所以改了名字。
+    #[deprecated(since = "0.2.0", note = "use `cancellation_error`; `ContextBuilder::cancellation` sets the caller's token and is a different thing")]
+    pub fn cancellation(&self) -> Option<Error> {
+        self.cancellation_error()
     }
 
     /// 截止令牌是否已触发：只看定时器，不读时钟；没有截止时间时为假。
@@ -383,11 +430,31 @@ mod tests {
     fn a_fired_deadline_token_is_a_timeout_before_the_clock_reaches_the_deadline() {
         let caller = CancellationToken::new();
         let ctx = Context::builder().cancellation(&caller).timeout(Duration::from_secs(60)).build();
-        assert!(!ctx.deadline_fired() && ctx.cancellation().is_none());
+        assert!(!ctx.deadline_fired() && ctx.cancellation_error().is_none());
         ctx.fire_deadline_now();
         assert!(ctx.deadline_fired() && ctx.is_cancelled() && !ctx.is_expired(SystemTime::now()));
         caller.cancel();
-        assert_eq!(ctx.cancellation().as_ref().map(Error::code), Some(ERROR_CODE_DEADLINE_EXCEEDED));
+        assert_eq!(ctx.cancellation_error().as_ref().map(Error::code), Some(ERROR_CODE_DEADLINE_EXCEEDED));
         assert!(!Context::background().deadline_fired(), "a context without a deadline has no deadline token");
+    }
+
+    /// 收紧过截止时间的派生上下文记着外层的截止时间：外层的截止令牌先触发（两个定时器各自换算单调时钟，先后不保证）时，
+    /// 派生的上下文随之取消，归因仍是超时，不是调用方取消。
+    #[test]
+    fn an_outer_deadline_that_fires_first_is_a_timeout_for_the_tightened_context() {
+        let outer = Context::builder().timeout(Duration::from_secs(60)).build();
+        let inner = outer.with_timeout(Duration::from_secs(30));
+        let innermost = inner.with_timeout(Duration::from_secs(10));
+        assert!(!innermost.deadline_fired() && innermost.cancellation_error().is_none());
+        outer.fire_deadline_now();
+        for derived in [&inner, &innermost] {
+            assert!(derived.is_cancelled() && derived.deadline_fired());
+            assert_eq!(derived.cancellation_error().as_ref().map(Error::code), Some(ERROR_CODE_DEADLINE_EXCEEDED));
+        }
+        // 反过来，收紧出来的截止时间触发时外层不受影响
+        let outer = Context::builder().timeout(Duration::from_secs(60)).build();
+        let inner = outer.with_timeout(Duration::from_secs(30));
+        inner.fire_deadline_now();
+        assert!(inner.deadline_fired() && !outer.deadline_fired() && !outer.is_cancelled());
     }
 }

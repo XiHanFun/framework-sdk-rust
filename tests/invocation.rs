@@ -27,7 +27,7 @@ fn eventually(condition: impl Fn() -> bool) -> bool {
 }
 
 fn code(ctx: &Context) -> Option<String> {
-    ctx.cancellation().map(|error| error.code().to_owned())
+    ctx.cancellation_error().map(|error| error.code().to_owned())
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn deadline_cancels_and_translates() {
     assert!(remaining <= Duration::from_millis(20), "remaining {remaining:?}");
     assert_eq!(code(&ctx), None);
     common::block_on(ctx.done());
-    let error = ctx.cancellation().unwrap();
+    let error = ctx.cancellation_error().unwrap();
     assert_eq!((error.code(), error.message_key(), error.kind()), (ERROR_CODE_DEADLINE_EXCEEDED, Some(MESSAGE_DEADLINE_EXCEEDED), "TIMEOUT"));
     assert!(ctx.is_cancelled() && ctx.cancellation_token().is_cancelled());
     assert!(ctx.is_expired(SystemTime::now()));
@@ -72,7 +72,7 @@ fn deadline_cancels_and_translates() {
     let cancelled = Context::builder().cancellation(&caller).build();
     caller.cancel();
     common::block_on(cancelled.done());
-    let error = cancelled.cancellation().unwrap();
+    let error = cancelled.cancellation_error().unwrap();
     assert_eq!((error.code(), error.message_key(), error.kind()), (ERROR_CODE_CANCELLED, Some(MESSAGE_CANCELLED), "CANCELLED"));
     assert_eq!(code(&Context::background()), None, "no error without cancellation");
     assert_eq!(Context::background().deadline(), None);
@@ -173,16 +173,16 @@ fn contexts_are_send_and_sync() {
 fn cancellation_errors_follow_kernel_messages() {
     let ctx = Context::builder().timeout(Duration::from_millis(5)).build();
     common::block_on(ctx.done());
-    common::assert_kernel_error(&ctx.cancellation().unwrap(), MESSAGE_DEADLINE_EXCEEDED);
+    common::assert_kernel_error(&ctx.cancellation_error().unwrap(), MESSAGE_DEADLINE_EXCEEDED);
 
     // 构建上下文时不判断「开始前已过」：截止时间已过的上下文立即超时，键仍是 deadline_exceeded；before_start 由调用器判断
     let late = Context::builder().deadline(SystemTime::now() - Duration::from_millis(1)).build();
-    common::assert_kernel_error(&late.cancellation().unwrap(), MESSAGE_DEADLINE_EXCEEDED);
+    common::assert_kernel_error(&late.cancellation_error().unwrap(), MESSAGE_DEADLINE_EXCEEDED);
 
     let caller = CancellationToken::new();
     let cancelled = Context::builder().cancellation(&caller).build();
     caller.cancel();
-    common::assert_kernel_error(&cancelled.cancellation().unwrap(), MESSAGE_CANCELLED);
+    common::assert_kernel_error(&cancelled.cancellation_error().unwrap(), MESSAGE_CANCELLED);
 }
 
 /// Baggage 的值约束（conventions/baggage-keys.md，ADR-0235）：构建上下文按外部输入丢弃不合的成员，程序内逐项派生给已登记键不合的值即 panic；幂等键与未登记的键不按这条处理。
@@ -287,4 +287,83 @@ fn trace_context_follows_the_vectors() {
     let root = Context::background();
     assert_eq!((root.trace().sampled(), root.trace().is_sampled()), (None, true));
     assert!(root.trace_parent().ends_with("-01"));
+}
+
+/// 派生上下文（RFC-0003）：`with_cancellation` 还跟随另一个令牌，`with_deadline` / `with_timeout` 只能收紧截止时间；追踪、Baggage
+/// 与对象袋与原上下文共享，派生上下文的取消与截止时间不回传给原上下文。
+#[test]
+fn derived_contexts_follow_more_tokens_and_tighter_deadlines() {
+    let caller = CancellationToken::new();
+    let ctx = Context::builder().cancellation(&caller).baggage(BAGGAGE_TENANT, "t1").build();
+    ctx.insert_item(Attempt(1));
+
+    // 还跟随另一个令牌：它取消时派生的上下文取消，按调用方取消归因，原上下文不受影响
+    let extra = CancellationToken::new();
+    let derived = ctx.with_cancellation(&extra);
+    assert_eq!((derived.trace_id(), derived.span_id(), derived.tenant()), (ctx.trace_id(), ctx.span_id(), Some("t1")));
+    assert_eq!(derived.item::<Attempt>().as_deref(), Some(&Attempt(1)), "the items are shared");
+    assert_eq!(code(&derived), None);
+    extra.cancel();
+    common::block_on(derived.done());
+    assert_eq!(code(&derived).as_deref(), Some(ERROR_CODE_CANCELLED));
+    assert!(!ctx.is_cancelled() && !caller.is_cancelled(), "cancelling a derived context does not reach the original");
+    assert!(ctx.with_cancellation(&extra).is_cancelled(), "a context derived with a cancelled token is born cancelled");
+    let follower = ctx.with_cancellation(&CancellationToken::new());
+
+    // 截止时间：原来没有的加上，原上下文仍然没有
+    let timed = ctx.with_timeout(Duration::from_secs(60));
+    let at = timed.deadline().expect("the derived context has a deadline");
+    assert!(!ctx.has_deadline() && !timed.is_cancelled());
+    assert_eq!((timed.trace_id(), timed.tenant(), timed.item::<Attempt>().as_deref()), (ctx.trace_id(), Some("t1"), Some(&Attempt(1))));
+    // 只能收紧：更晚的截止时间、表示不了的超时都不改变它
+    assert_eq!(timed.with_deadline(at + Duration::from_secs(60)).deadline(), Some(at), "a later deadline does not loosen it");
+    assert_eq!(timed.with_deadline(at).deadline(), Some(at));
+    assert_eq!(timed.with_timeout(Duration::MAX).deadline(), Some(at));
+    assert!(!ctx.with_timeout(Duration::MAX).has_deadline(), "a timeout beyond SystemTime means no deadline");
+    let tighter = timed.with_deadline(at - Duration::from_secs(30));
+    assert_eq!((tighter.deadline(), timed.deadline()), (Some(at - Duration::from_secs(30)), Some(at)));
+    assert!(tighter.remaining_time(SystemTime::now()).unwrap() <= Duration::from_secs(30));
+
+    // 已经过去的截止时间立即触发，只触发派生的上下文
+    let expired = timed.with_deadline(SystemTime::now() - Duration::from_secs(1));
+    assert_eq!(code(&expired).as_deref(), Some(ERROR_CODE_DEADLINE_EXCEEDED));
+    assert!(!timed.is_cancelled() && !ctx.is_cancelled());
+    // 收紧后的截止时间到了：派生的上下文超时，原上下文照常
+    let short = timed.with_timeout(Duration::from_millis(20));
+    common::block_on(short.done());
+    assert_eq!(code(&short).as_deref(), Some(ERROR_CODE_DEADLINE_EXCEEDED));
+    assert!(!timed.is_cancelled() && !ctx.is_cancelled());
+
+    // 原上下文取消时派生的都随之取消：截止令牌没有触发的按调用方取消归因，已经超时的仍是超时
+    caller.cancel();
+    assert!(follower.is_cancelled() && timed.is_cancelled() && tighter.is_cancelled());
+    for cancelled in [&follower, &timed, &tighter] {
+        assert_eq!(code(cancelled).as_deref(), Some(ERROR_CODE_CANCELLED));
+    }
+    assert_eq!(code(&short).as_deref(), Some(ERROR_CODE_DEADLINE_EXCEEDED));
+}
+
+/// 原上下文的截止时间到了，派生的上下文同样是超时：归因看的是它继承的截止令牌，不因为多跟随了一个令牌就算作取消。
+#[test]
+fn an_inherited_deadline_is_a_timeout_for_the_derived_context() {
+    let extra = CancellationToken::new();
+    let outer = Context::builder().timeout(Duration::from_millis(20)).build();
+    let derived = outer.with_cancellation(&extra);
+    assert_eq!(derived.deadline(), outer.deadline());
+    common::block_on(derived.done());
+    assert_eq!(code(&derived).as_deref(), Some(ERROR_CODE_DEADLINE_EXCEEDED));
+    extra.cancel();
+    assert_eq!(code(&derived).as_deref(), Some(ERROR_CODE_DEADLINE_EXCEEDED), "a later cancellation does not change it");
+}
+
+/// 访问器的旧名 `Context::cancellation` 弃用但仍可用，与 `cancellation_error` 给出同一个结果。
+#[test]
+#[allow(deprecated)]
+fn the_old_name_of_the_accessor_still_works() {
+    let caller = CancellationToken::new();
+    let ctx = Context::builder().cancellation(&caller).build();
+    assert_eq!((ctx.cancellation(), ctx.cancellation_error()), (None, None));
+    caller.cancel();
+    assert_eq!(ctx.cancellation(), ctx.cancellation_error());
+    assert_eq!(ctx.cancellation().as_ref().map(xihan_framework::primitives::Error::code), Some(ERROR_CODE_CANCELLED));
 }
