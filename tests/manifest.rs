@@ -489,3 +489,13 @@ fn manifests_follow_the_vectors() {
         assert_eq!(error.to_error().message(), error.message(), "{}", case.name);
     }
 }
+
+/// 清单的三个枚举按名字编码：名字就是清单里的小写名，`name` 与 `as_str` 是同一个访问器，`FromStr` 与 serde 只认这些名字。
+#[test]
+fn manifest_enums_are_encoded_by_name() {
+    common::assert_named(Kind::ALL, &["capability", "provider", "plugin", "host", "protocol"], Kind::name, Kind::as_str);
+    common::assert_named(Role::ALL, &["provider", "default"], Role::name, Role::as_str);
+    common::assert_named(Isolation::ALL, &["in-process", "wasm", "out-of-process"], Isolation::name, Isolation::as_str);
+    assert_eq!("Plugin".parse::<Kind>().unwrap_err().to_string(), "PRIMITIVES_VALIDATION_001: 'Plugin' is not a manifest kind.");
+    assert_eq!((Kind::parse("host"), Isolation::parse("in_process"), Role::default()), (Some(Kind::Host), None, Role::Provider));
+}

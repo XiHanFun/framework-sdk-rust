@@ -22,7 +22,7 @@ use super::types::{Binding, Configuration, Event, EventHandler, Health, Subscrip
 use super::v1::plugin_server::Plugin;
 use super::{PROTOCOL_VERSIONS, SDK_LANGUAGE, negotiate, v1};
 use crate::invocation::{CancellationToken, Context};
-use crate::operation::{self, ERROR_CODE_UNEXPECTED, MESSAGE_UNHANDLED_PANIC};
+use crate::operation;
 use crate::primitives::json::{self, Node};
 use crate::primitives::{Error, LifecycleState, SDK_NAME, SDK_VERSION};
 
@@ -414,5 +414,5 @@ fn local(runtime: &Runtime, last: &Health) -> Health {
 fn unhandled(runtime: &Runtime, error: tokio::task::JoinError, message: &str) -> Error {
     let reason = if error.is_panic() { panic_reason(error.into_panic().as_ref()) } else { "the task was cancelled".to_owned() };
     runtime.logger.log(Level::Error, message, &[("reason", Value::from(reason))]);
-    Error::unexpected(ERROR_CODE_UNEXPECTED, MESSAGE_UNHANDLED_PANIC)
+    operation::unhandled()
 }

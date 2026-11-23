@@ -19,7 +19,9 @@ use super::catalog::MessageCatalog;
 use super::endpoint::{self, Endpoint, Network, select_host_endpoint};
 use super::host::{Grants, Host, Tenants};
 use super::log::{Level, Logger};
-use super::messages::{ERROR_CODE_UNAVAILABLE, PHASE_HEALTH, PHASE_STOP, REASON_PANIC, failed, unavailable};
+use super::messages::{
+    ERROR_CODE_HANDSHAKE_MISMATCH, ERROR_CODE_INVALID_SOURCE, ERROR_CODE_UNAVAILABLE, PHASE_HEALTH, PHASE_STOP, REASON_PANIC, failed, unavailable,
+};
 use super::service::PluginService;
 use super::session::SessionGuard;
 use super::types::{EventHandler, Health, Hooks, NoHooks, Subscription, is_topic};
@@ -30,12 +32,7 @@ use crate::invocation::CancellationToken;
 use crate::manifest::{self, Isolation, Kind, Manifest};
 use crate::operation::{Invoker, Registry};
 use crate::pipeline;
-use crate::primitives::{ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, LifecycleState, SDK_NAME, SPEC_VERSION};
-
-/// 发现时被拒的错误码（RFC-0017「错误码」）：清单不是进程外插件、写了 `contributes.pipeline`。
-const ERROR_CODE_INVALID_PLUGIN: &str = "PLUGINS_VALIDATION_001";
-/// 握手响应与清单不一致的错误码：原语层版本不符、声明的操作不在清单里、订阅重复或不合法。
-const ERROR_CODE_MISMATCH: &str = "PLUGINS_VALIDATION_004";
+use crate::primitives::{ERROR_CODE_INVALID_ARGUMENT, ERROR_CODE_INVALID_CATALOG, Error, FrameworkError, LifecycleState, SDK_NAME, SPEC_VERSION};
 
 /// `grace_seconds` 为 0 时等在途调用的宽限（`lifecycle.md` §7.5）。
 pub(crate) const DEFAULT_STOP_GRACE: Duration = Duration::from_secs(5);
@@ -51,12 +48,14 @@ const SHUTDOWN_LIMIT: Duration = Duration::from_secs(2);
 /// 构建方法不核对，[`Plugin::start`]（[`Plugin::serve`] 里调用）在监听与写握手行之前一次核对（`handshake.md` §1），不合的在 stderr
 /// 记一条 `error` 日志、不监听，返回 [`FrameworkError`]：
 ///
-/// - 清单读不出（`KERNEL_CAPABILITY_006`），不是 `kind: plugin`、`isolation: out-of-process` 或写了 `contributes.pipeline`
-///   （进程外插件不能贡献中间件，RFC-0017「范围」）为 `PLUGINS_VALIDATION_001`；
+/// - 清单读不出（`KERNEL_CAPABILITY_006`，[`manifest::ERROR_CODE_INVALID_MANIFEST`]），不是 `kind: plugin`、`isolation: out-of-process`
+///   或写了 `contributes.pipeline`（进程外插件不能贡献中间件，RFC-0017「范围」）为 `PLUGINS_VALIDATION_001`
+///   （[`ERROR_CODE_INVALID_SOURCE`]）；
 /// - 清单的 `primitives` 不是本 SDK 实现的原语层大版本、登记的操作不在清单 `contributes.operations` 里、订阅的主题不合文法或
-///   （主题，类型）对重复为 `PLUGINS_VALIDATION_004`（`handshake.md` §3，宿主会以同一个码拒绝握手）；
-/// - 消息目录不合法或没有 `en-US`、目录名重复或用了运行时自己的目录名（SDK 名）为 `LOCALIZATION_VALIDATION_002`；
-/// - 管道排序失败为 `KERNEL_PIPELINE_00x`，环境变量缺失或不合法为 `PRIMITIVES_VALIDATION_001`。
+///   （主题，类型）对重复为 `PLUGINS_VALIDATION_004`（[`ERROR_CODE_HANDSHAKE_MISMATCH`]；`handshake.md` §3，宿主会以同一个码拒绝握手）；
+/// - 消息目录不合法或没有 `en-US`、目录名重复或用了运行时自己的目录名（SDK 名）为 `LOCALIZATION_VALIDATION_002`
+///   （[`ERROR_CODE_INVALID_CATALOG`]）；
+/// - 管道排序失败为 `KERNEL_PIPELINE_00x`，环境变量缺失或不合法为 `PRIMITIVES_VALIDATION_001`（[`ERROR_CODE_INVALID_ARGUMENT`]）。
 ///
 /// 健康项不在这里核对：它们由 [`Hooks::health`] 动态报出，不在清单 `contributes.health` 里的名字在上报时丢掉（`lifecycle.md` §7.4）。
 pub struct Plugin {
@@ -104,42 +103,49 @@ impl Plugin {
     }
 
     /// 插件服务的操作；每个 ID 都要在清单 `contributes.operations` 里。缺省是空的登记表。
+    #[must_use]
     pub fn with_operations(mut self, registry: Arc<Registry>) -> Self {
         self.registry = registry;
         self
     }
 
     /// 插件进程里的管道：`Invoke` 经它与调用器的内置步骤执行。缺省是空的构建器。
+    #[must_use]
     pub fn with_pipeline(mut self, builder: pipeline::Builder) -> Self {
         self.pipeline = builder;
         self
     }
 
     /// 加一个事件订阅与它的处理器；握手按加入的顺序声明，一次投递匹配多个订阅时也按这个顺序依次执行（`invocation.md` §4）。
+    #[must_use]
     pub fn with_subscription(mut self, subscription: Subscription, handler: impl EventHandler) -> Self {
         self.subscriptions.push((subscription, Arc::new(handler)));
         self
     }
 
     /// 加一个随握手交给宿主的消息目录。运行时自己的消息键宿主已经有，不随握手发送（`handshake.md` §3 第 6 条）。
+    #[must_use]
     pub fn with_catalog(mut self, catalog: MessageCatalog) -> Self {
         self.catalogs.push(catalog);
         self
     }
 
     /// 生命周期钩子。
+    #[must_use]
     pub fn with_hooks(mut self, hooks: impl Hooks) -> Self {
         self.hooks = Arc::new(hooks);
         self
     }
 
     /// 监听的网络类型；缺省 [`Network::platform_default`]。本平台不支持的网络在 [`Plugin::start`] 时失败。
+    #[must_use]
     pub fn with_network(mut self, network: Network) -> Self {
         self.network = network;
         self
     }
 
     /// 运行时的日志；缺省写 stderr（`invocation.md` §6），每行带 `plugin`（清单 ID）。
+    #[must_use]
     pub fn with_logger(mut self, logger: Logger) -> Self {
         self.logger = Some(logger);
         self
@@ -273,40 +279,46 @@ fn validate(
 ) -> Result<(), FrameworkError> {
     let id = &manifest.id;
     if manifest.kind != Kind::Plugin || manifest.isolation != Some(Isolation::OutOfProcess) {
-        return Err(FrameworkError::new(ERROR_CODE_INVALID_PLUGIN, format!("The manifest '{id}' must describe a plugin with the isolation 'out-of-process'.")));
+        return Err(FrameworkError::new(ERROR_CODE_INVALID_SOURCE, format!("The manifest '{id}' must describe a plugin with the isolation 'out-of-process'.")));
     }
     if !manifest.contributes.pipeline.is_empty() {
         return Err(FrameworkError::new(
-            ERROR_CODE_INVALID_PLUGIN,
+            ERROR_CODE_INVALID_SOURCE,
             format!("The plugin '{id}' must not declare 'contributes.pipeline': only wasm plugins can contribute middleware."),
         ));
     }
     // 握手写的是清单的 primitives，宿主要求它与自己的相同；本 SDK 只实现一个原语层大版本
     if positive(SPEC_VERSION) != Some(manifest.primitives) {
         return Err(FrameworkError::new(
-            ERROR_CODE_MISMATCH,
+            ERROR_CODE_HANDSHAKE_MISMATCH,
             format!("The manifest '{id}' declares the primitives version {}, but this SDK implements version {SPEC_VERSION}.", manifest.primitives),
         ));
     }
     // 登记表里的 ID 不会重复，所以这里只核对都在清单里
     if let Some(descriptor) = registry.list().into_iter().find(|descriptor| !manifest.operations().iter().any(|declared| declared == descriptor.id())) {
         return Err(FrameworkError::new(
-            ERROR_CODE_MISMATCH,
+            ERROR_CODE_HANDSHAKE_MISMATCH,
             format!("The operation '{}' is not declared in 'contributes.operations' of '{id}'.", descriptor.id()),
         ));
     }
     let mut declared = HashSet::new();
     for (subscription, _) in subscriptions {
         if !is_topic(&subscription.topic) {
-            return Err(FrameworkError::new(ERROR_CODE_MISMATCH, format!("The subscription topic '{}' of '{id}' is not a valid topic.", subscription.topic)));
+            return Err(FrameworkError::new(
+                ERROR_CODE_HANDSHAKE_MISMATCH,
+                format!("The subscription topic '{}' of '{id}' is not a valid topic.", subscription.topic),
+            ));
         }
         if subscription.message_type.as_deref() == Some("") {
-            return Err(FrameworkError::new(ERROR_CODE_MISMATCH, format!("The subscription '{}' of '{id}' has an empty message type.", subscription.topic)));
+            return Err(FrameworkError::new(
+                ERROR_CODE_HANDSHAKE_MISMATCH,
+                format!("The subscription '{}' of '{id}' has an empty message type.", subscription.topic),
+            ));
         }
         // 按（主题，类型）对去重而不看方式：同一对不能以两种方式各声明一次（handshake.md §3 第 5 条）
         if !declared.insert((subscription.topic.as_str(), subscription.message_type.as_deref())) {
             return Err(FrameworkError::new(
-                ERROR_CODE_MISMATCH,
+                ERROR_CODE_HANDSHAKE_MISMATCH,
                 format!(
                     "The subscription '{}' with the message type '{}' is declared more than once by '{id}'.",
                     subscription.topic,
@@ -321,13 +333,13 @@ fn validate(
         // 运行时自己的消息键宿主已经有，用 SDK 名的目录会把它们随握手再发一份（handshake.md §3 第 6 条）
         if catalog.name() == SDK_NAME {
             return Err(FrameworkError::new(
-                "LOCALIZATION_VALIDATION_002",
+                ERROR_CODE_INVALID_CATALOG,
                 format!("The message catalog name '{SDK_NAME}' of '{id}' is reserved for the runtime's own messages, which the host already has."),
             ));
         }
         if !names.insert(catalog.name()) {
             return Err(FrameworkError::new(
-                "LOCALIZATION_VALIDATION_002",
+                ERROR_CODE_INVALID_CATALOG,
                 format!("The message catalog name '{}' of '{id}' is used more than once.", catalog.name()),
             ));
         }

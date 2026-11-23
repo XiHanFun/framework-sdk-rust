@@ -29,7 +29,7 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 3. 检查当前分支、`git status` 和最近提交；保留用户已有改动。
 4. 读相关规范章节，只读与任务相关的部分：原语 `spec/rfcs/0001-primitives.md`、清单 `spec/rfcs/0002-manifest.md` 与 `spec/manifest/manifest.schema.json`、调用上下文 `spec/rfcs/0003-invocation-context.md`、管道 `spec/rfcs/0004-pipeline-stages.md`、消息模板 `spec/rfcs/0010-localization.md`、操作 `spec/rfcs/0011-operations.md`、插件 `spec/rfcs/0017-plugin-protocol.md` 与 `spec/plugin/`、版本与一致性档 `spec/rfcs/0024-versions-and-profiles.md`、命名 `spec/conventions/`；向量在 `spec/conformance/vectors/`，档表是 `spec/conformance/profiles.json`。
 5. 读目标模块（`src/<模块>/`）的模块文档与实现，以及对应的测试（`tests/<模块>.rs`、模块内的 `#[cfg(test)]`）。
-6. 先找已有实现：文法判定在 `src/grammar.rs`，JSON 读取检查与值模型在 `src/primitives/json/`，向量读取与执行器在 `tests/common/`，不重复建设。
+6. 先找已有实现：文法判定共用的部分（字节类、`word` / `all` / `kebab` 的组合、操作 ID、接口版本、空白字符表）在 `src/grammar.rs`，各领域的文法在各自的模块里用它们拼出来：错误码 `src/primitives/error_code.rs`、消息键与区域名 `src/primitives/messages.rs`、Baggage 键 `src/primitives/baggage.rs`、清单的各个字段 `src/manifest/shape.rs`、traceparent `src/invocation/trace.rs`、主题 `src/plugin/types.rs`、端点 `src/plugin/endpoint.rs`、截止时间 `src/plugin/time.rs`；JSON 读取检查与值模型在 `src/primitives/json/`，向量读取与执行器在 `tests/common/`，不重复建设。
 
 ## 目录结构
 
@@ -47,7 +47,7 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 ├─ spec/                               # 规范（XiHanFun/framework-spec 的 submodule）：RFC、术语表、清单 Schema、插件协议、一致性向量与运行器
 ├─ src/
 │  ├─ lib.rs                           # crate 入口、BoxFuture、两份 README 的文档测试
-│  ├─ grammar.rs                       # 规范文法的手写逐字节判定与空白字符表
+│  ├─ grammar.rs                       # 文法判定共用的字节类、组合与空白字符表；各领域的文法在各自的模块里
 │  ├─ primitives/                      # 原语层（RFC-0001、RFC-0010）；json/ 是共同的 JSON 读取检查、值模型与 serde 读写
 │  ├─ manifest/                        # 清单（RFC-0002）
 │  ├─ invocation/                      # 调用上下文：取消令牌、截止时间定时器、W3C 追踪、Baggage（RFC-0003）
@@ -101,7 +101,7 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 - 文案只引用消息键：错误带消息键与参数（`Error::validation(code, key).with_detail(…)`），自由文本错误（`Error::literal`）只在没有登记键时用；与宿主共用的内核与插件消息的英文模板逐字同向量 `kernel-messages.json`、`plugin-messages.json`，插件运行时 10 种区域的文案在 `src/plugin/localization/<区域>.json`。panic 消息、日志与测试断言用英文。
 - 取消与截止时间只经 `invocation::Context` 的令牌传递；超时与取消只按截止令牌归因（`KERNEL_TIMEOUT_001` / `KERNEL_CANCELLED_001`）；调用器与内置步骤不中止处理器、不丢弃它的 future。
 - 异步：中间件、处理器与管道终点返回 `BoxFuture`；feature `plugin` 之外的模块不依赖任何异步运行时，插件专用的依赖设为 `optional` 并挂在 feature `plugin` 下。
-- 文法：规范里的正则都是手写的逐字节判定（`src/grammar.rs`），整串匹配，不引入正则库；空白按 RFC-0001「空白字符」的 25 个码位（`grammar::is_whitespace`），不用 `char::is_whitespace`。
+- 文法：规范里的正则都是手写的逐字节判定，整串匹配，不引入正则库；共用的字节类与组合在 `src/grammar.rs`，各领域的文法写在各自的模块里（见「开始前必须做」第 6 条），新的文法先看能不能用已有的组合拼出来。空白按 RFC-0001「空白字符」的 25 个码位（实现是 `grammar::is_whitespace`，公开为 `primitives::is_whitespace` 与 `primitives::is_blank`），不用 `char::is_whitespace`。
 - JSON：线上文本用 `primitives::json::from_slice` 读，先过共同的 JSON 读取检查，不直接用 `serde_json::from_str` 读外部输入；任意 JSON 的成员用 `json::Json` 原样保留数字。
 - 容量有界：登记表容量 10000（`operation::CAPACITY`），Baggage 值、消息键都有长度上限；不建无界集合。
 - 没有开发依赖：测试用 `tests/common` 自写的最小执行器运行 future，借 `serde_json` 的 `RawValue` 按原文取向量；新增依赖要有明确收益并写进 `Cargo.toml` 的注释。
@@ -127,7 +127,7 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 - 版本真源是 `Cargo.toml` 的 `[package] version`；`primitives::SDK_VERSION` 取自它，`src/lib.rs` 的单元测试 `exposes_versions` 写着当前版本，改版本时一并改。
 - 注册表包名是 crates.io 的 `xihan-framework`；那里最早的 `0.0.1` 是占名用的，不是本仓库发布的版本。
 - 发布由 `.github/workflows/release.yml` 在推送 `v*` 标签时执行：guard 跑 `scripts/release-check.sh`（标签在 `main` 上、标签号等于 `Cargo.toml` 的 `version`、规范钉在标签上），通过后以 crates.io 可信发布（OIDC）`cargo publish`；GitHub Release 与 XiHan.Framework 一样在标签推送后手动建。打标签之前先在本地跑同一份脚本；打标签与推送只在用户明确要求时执行，步骤见 `version-release` 技能。首次发布前要用户在 crates.io 配可信发布者。
-- 打包排除 `spec/`、`tests/`、`tools/`、Agent 的指令与技能（`AGENTS.md`、`CLAUDE.md`、`.agents/`、`.claude/`）和仓库配置文件（`Cargo.toml` 的 `exclude`）。
+- 打包排除 `spec/`、`tests/`、`tools/`、`scripts/`、Agent 的指令与技能（`AGENTS.md`、`CLAUDE.md`、`.agents/`、`.claude/`）和仓库配置文件（`Cargo.toml` 的 `exclude`）。
 - 标签写成 `v<版本>`；规范（RFC-0024）要求发版时 `spec/` 正好在规范标签上，README 的「状态」写明钉的规范版本、认领的档与缺口。
 
 ## 分支

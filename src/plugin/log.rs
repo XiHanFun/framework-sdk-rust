@@ -7,42 +7,26 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use serde_json::Value;
 
-use crate::primitives::json;
+use crate::primitives::{json, named_enum};
 
-/// 日志级别，名字是宿主认的小写名（`invocation.md` §6）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Level {
-    /// `trace`。
-    Trace,
-    /// `debug`。
-    Debug,
-    /// `information`。
-    Information,
-    /// `warning`。
-    Warning,
-    /// `error`。
-    Error,
-    /// `critical`。
-    Critical,
-}
-
-impl Level {
-    /// 写进日志行的名字。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Trace => "trace",
-            Self::Debug => "debug",
-            Self::Information => "information",
-            Self::Warning => "warning",
-            Self::Error => "error",
-            Self::Critical => "critical",
-        }
-    }
-}
-
-impl fmt::Display for Level {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+named_enum! {
+    /// 日志级别，名字是宿主认的、写进日志行的小写名（`invocation.md` §6），按严重程度从低到高排序。
+    ///
+    /// 协议以后可以增加级别，所以是 `#[non_exhaustive]`：本 crate 之外的 `match` 要带通配分支。
+    #[non_exhaustive]
+    pub enum Level ("log level") {
+        /// `trace`。
+        Trace = 0 => "trace",
+        /// `debug`。
+        Debug = 1 => "debug",
+        /// `information`。
+        Information = 2 => "information",
+        /// `warning`。
+        Warning = 3 => "warning",
+        /// `error`。
+        Error = 4 => "error",
+        /// `critical`。
+        Critical = 5 => "critical",
     }
 }
 

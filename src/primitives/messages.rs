@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock, PoisonError, RwLock};
 
 use serde_json::Value;
 
-use super::framework::invalid_argument;
+use super::framework::{FrameworkError, invalid_argument};
 use super::json;
 use crate::grammar::{digit, lower, lower_digit, word};
 
@@ -21,6 +21,30 @@ pub const DEFAULT_LOCALE: &str = "en-US";
 
 /// 区域名的最大长度（RFC-0010 `LocaleName.MaxLength`）。
 const LOCALE_MAX_LENGTH: usize = 35;
+
+/// 消息目录不合法（JSON、键或区域名错误）的错误码（`conventions/error-codes.md`，.NET 的 `LocalizationErrors.InvalidCatalog`）。
+pub const ERROR_CODE_INVALID_CATALOG: &str = "LOCALIZATION_VALIDATION_002";
+
+/// 内置的 10 种区域名只写在这一处：把它们作为字面量交给 `$callback!`，由它拼出 [`LOCALES`]，插件运行时也用它按区域取随 crate
+/// 编译进来的文案文件，两处不会各写一份而对不上。
+macro_rules! builtin_locales {
+    ($callback:ident) => {
+        $callback!("en-US", "zh-CN", "zh-TW", "ja-JP", "ko-KR", "de-DE", "es-ES", "fr-FR", "pt-BR", "ru-RU")
+    };
+}
+
+#[cfg(feature = "plugin")]
+pub(crate) use builtin_locales;
+
+/// 把区域名的字面量列成数组。
+macro_rules! locale_names {
+    ($($name:literal),+) => {
+        [$($name),+]
+    };
+}
+
+/// 内置的 10 种区域（RFC-0010），[`DEFAULT_LOCALE`]（`en-US`）在前，也是回退区域；SDK 自带的文案都有这 10 种。
+pub const LOCALES: [&str; 10] = builtin_locales!(locale_names);
 
 /// 判断消息键是否合法。
 ///
@@ -445,7 +469,8 @@ fn read_defaults<T>(read: impl FnOnce(&DefaultMessages) -> T) -> T {
 ///
 /// # Panics
 ///
-/// `locale` 不合区域名文法 `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`（最长 35 个字符，RFC-0010）时 panic。
+/// `locale` 不合区域名文法 `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`（最长 35 个字符，RFC-0010）时 panic（编程错误）；来自外部的区域名
+/// （环境变量、请求头、Baggage 的 `xihan.locale`）先用 [`is_locale_name`] 判断。
 pub fn set_default_messages(resolver: Option<Arc<dyn MessageResolver>>, locale: Option<&str>) {
     if let Some(locale) = locale {
         if !is_locale_name(locale) {
@@ -520,8 +545,11 @@ pub(crate) fn resolve_with_builtin(key: &str, arguments: &Details) -> Option<Str
     resolve_message(key, arguments).or_else(|| builtin_catalog().resolve(key, DEFAULT_LOCALE, arguments))
 }
 
-/// 区域名文法 `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`，最长 35 个字符。
-pub(crate) fn is_locale_name(locale: &str) -> bool {
+/// 判断区域名是否合法（RFC-0010 `LocaleName`）：文法 `^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})*$`，最长 35 个字符，如 `en-US`、`zh-Hant-TW`。
+///
+/// 只核对写法，不查这种区域是否存在；[`set_default_messages`] 对不合文法的区域名 panic，消息目录里的归目录不合法
+/// （[`ERROR_CODE_INVALID_CATALOG`]）。
+pub fn is_locale_name(locale: &str) -> bool {
     let mut parts = locale.split('-');
     locale.len() <= LOCALE_MAX_LENGTH
         && parts.next().is_some_and(|language| (2..=3).contains(&language.len()) && language.bytes().all(|byte| byte.is_ascii_alphabetic()))
@@ -543,7 +571,70 @@ impl Catalog {
         Self::default()
     }
 
-    /// 放入一条模板，返回同一区域同一键原来的模板。
+    /// 从每种区域一份的 JSON 文本读取：每份是「消息键 → 模板」的对象，先过共同的 JSON 读取检查（重复的键不合法）。同一区域给了
+    /// 几份时键取并集，同名的以后一份为准；没有键的一份不产生区域。
+    ///
+    /// 文本不是这样的对象、键不合消息键文法（[`is_message_key`]）或区域名不合法（[`is_locale_name`]）时返回
+    /// `LOCALIZATION_VALIDATION_002`（[`ERROR_CODE_INVALID_CATALOG`]）。不要求有 [`DEFAULT_LOCALE`]：没有它只是没有可回退的模板。
+    ///
+    /// ```
+    /// use xihan_framework::primitives::{Catalog, Details, MessageResolver};
+    ///
+    /// let catalog = Catalog::from_json([
+    ///     ("en-US", r#"{"orders.empty":"There are no orders."}"#),
+    ///     ("zh-CN", r#"{"orders.empty":"没有订单。"}"#),
+    /// ])
+    /// .unwrap();
+    /// assert_eq!(catalog.resolve("orders.empty", "zh-CN", &Details::new()).as_deref(), Some("没有订单。"));
+    /// assert_eq!(catalog.resolve("orders.empty", "fr-FR", &Details::new()).as_deref(), Some("There are no orders."));
+    /// ```
+    pub fn from_json<I, L, T>(files: I) -> Result<Self, FrameworkError>
+    where
+        I: IntoIterator<Item = (L, T)>,
+        L: Into<String>,
+        T: AsRef<str>,
+    {
+        let catalog = Self::read(files, CATALOG_LABEL)?;
+        catalog.check(CATALOG_LABEL)?;
+        Ok(catalog)
+    }
+
+    /// 读每种区域一份的 JSON 文本，不核对区域名与键（由 [`Catalog::check`] 核对）；`label` 是错误说明里对这份目录的称呼，
+    /// 如 `message catalog 'echo'`。
+    pub(crate) fn read<I, L, T>(files: I, label: &str) -> Result<Self, FrameworkError>
+    where
+        I: IntoIterator<Item = (L, T)>,
+        L: Into<String>,
+        T: AsRef<str>,
+    {
+        let mut catalog = Self::new();
+        for (locale, text) in files {
+            let locale = locale.into();
+            let templates: BTreeMap<String, String> = json::from_str(text.as_ref()).map_err(|error| {
+                FrameworkError::new(ERROR_CODE_INVALID_CATALOG, format!("The '{locale}' templates of the {label} are not a JSON object of strings: {error}."))
+            })?;
+            // 逐条放入：没有键的一份不产生空的区域
+            for (key, template) in templates {
+                catalog.insert(locale.clone(), key, template);
+            }
+        }
+        Ok(catalog)
+    }
+
+    /// 核对区域名与消息键合文法，按区域名、键的顺序报第一处；`label` 同 [`Catalog::read`]。
+    pub(crate) fn check(&self, label: &str) -> Result<(), FrameworkError> {
+        for (locale, templates) in &self.locales {
+            if !is_locale_name(locale) {
+                return Err(FrameworkError::new(ERROR_CODE_INVALID_CATALOG, format!("The {label} has an invalid locale name '{locale}'.")));
+            }
+            if let Some(key) = templates.keys().find(|key| !is_message_key(key)) {
+                return Err(FrameworkError::new(ERROR_CODE_INVALID_CATALOG, format!("The {label} has an invalid message key '{key}' in '{locale}'.")));
+            }
+        }
+        Ok(())
+    }
+
+    /// 放入一条模板，返回同一区域同一键原来的模板；不核对区域名与键。
     pub fn insert(&mut self, locale: impl Into<String>, key: impl Into<String>, template: impl Into<String>) -> Option<String> {
         self.locales.entry(locale.into()).or_default().insert(key.into(), template.into())
     }
@@ -554,9 +645,23 @@ impl Catalog {
         self
     }
 
+    /// 并入另一份目录的全部模板：区域与键取并集，同一区域同一键以 `other` 的为准。
+    ///
+    /// 把几份目录合成一份交给 [`set_default_messages`] 时用，如插件自己的目录与运行时的目录。
+    pub fn extend(&mut self, other: Catalog) {
+        for (locale, templates) in other.locales {
+            self.locales.entry(locale).or_default().extend(templates);
+        }
+    }
+
     /// 取一条模板，不回退。
     pub fn template(&self, locale: &str, key: &str) -> Option<&str> {
         self.locales.get(locale)?.get(key).map(String::as_str)
+    }
+
+    /// 按键排序列出一种区域的模板，不回退；没有这种区域时为空。
+    pub fn templates(&self, locale: &str) -> impl Iterator<Item = (&str, &str)> {
+        self.locales.get(locale).into_iter().flatten().map(|(key, template)| (key.as_str(), template.as_str()))
     }
 
     /// 按名字排序列出目录里的区域。
@@ -564,6 +669,9 @@ impl Catalog {
         self.locales.keys().map(String::as_str)
     }
 }
+
+/// 没有名字的目录在错误说明里的称呼。
+const CATALOG_LABEL: &str = "message catalog";
 
 impl MessageResolver for Catalog {
     fn resolve(&self, key: &str, locale: &str, arguments: &Details) -> Option<String> {

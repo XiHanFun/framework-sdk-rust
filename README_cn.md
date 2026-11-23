@@ -123,6 +123,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
 - 钉的规范版本：`spec/` 子模块指向的规范标签。
 - 认领的档（RFC-0024）：`core` 与 `plugin`。
 - 缺口：无。
+- 范围外：流式操作、Wasm 插件与远程 Provider 尚未提供，它们不在认领的档里。
 
 ## 生态
 

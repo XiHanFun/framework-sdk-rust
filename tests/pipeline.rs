@@ -383,3 +383,11 @@ fn ordering_follows_the_vectors() {
         }
     }
 }
+
+/// 阶段内位置按名字编码，名字同规范与 .NET 的 `Placement`；`Beginning` 排在 `End` 之前（排序规则第 2 条）。
+#[test]
+fn placements_are_encoded_by_name() {
+    common::assert_named(Placement::ALL, &["Beginning", "End"], Placement::name, Placement::as_str);
+    assert!(Placement::Beginning < Placement::End);
+    assert_eq!("end".parse::<Placement>().unwrap_err().to_string(), "PRIMITIVES_VALIDATION_001: 'end' is not a placement.");
+}

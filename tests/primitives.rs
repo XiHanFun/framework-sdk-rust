@@ -8,8 +8,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde::Deserialize;
 use serde_json::json;
 use xihan_framework::primitives::{
-    self, BAGGAGE_CORRELATION, BAGGAGE_TENANT, Catalog, Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, LifecycleState, PipelineStage,
-    REGISTERED_BAGGAGE_KEYS, Result, Stability, TypedId, WireResult, json,
+    self, BAGGAGE_CORRELATION, BAGGAGE_TENANT, Catalog, Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, LifecycleState, MessageResolver,
+    PipelineStage, REGISTERED_BAGGAGE_KEYS, Result, Stability, TypedId, WireResult, json,
 };
 
 /// 改进程默认消息设置的测试串行执行，读 `Error::message` 的测试也排在它们之间
@@ -223,6 +223,87 @@ fn error_messages_resolve_through_the_default_catalog() {
     assert_eq!(primitives::format_message("{missing}", &Details::new()), "{missing}", "missing placeholders stay");
 }
 
+/// 目录的读取与合并（RFC-0010）：`Catalog::from_json` 每种区域一份「消息键 → 模板」的 JSON，先过共同的读取检查；不是这样的对象、
+/// 键重复、区域名或消息键不合文法都是 `LOCALIZATION_VALIDATION_002`。`extend` 并入另一份目录，同一区域同一键以并入的为准。
+#[test]
+fn catalogs_are_read_from_json_and_merged() {
+    let english = r#"{"orders.missing":"Order {id} was not found.","orders.empty":"No orders."}"#;
+    let base = Catalog::from_json([("en-US", english), ("zh-CN", r#"{"orders.missing":"订单 {id} 不存在。"}"#)]).unwrap();
+    assert_eq!(base.locales().collect::<Vec<_>>(), ["en-US", "zh-CN"]);
+    assert_eq!(base.templates("en-US").collect::<Vec<_>>(), [("orders.empty", "No orders."), ("orders.missing", "Order {id} was not found.")]);
+    assert_eq!(base.templates("fr-FR").count(), 0, "a locale the catalog does not have is empty");
+    let by_hand = Catalog::new().with("en-US", "orders.missing", "Order {id} was not found.").with("en-US", "orders.empty", "No orders.").with(
+        "zh-CN",
+        "orders.missing",
+        "订单 {id} 不存在。",
+    );
+    assert_eq!(base, by_hand);
+
+    for (name, files) in [
+        ("not an object", vec![("en-US", "[]")]),
+        ("a template that is not a string", vec![("en-US", r#"{"orders.missing":1}"#)]),
+        ("a duplicate key", vec![("en-US", r#"{"orders.missing":"a","orders.missing":"b"}"#)]),
+        ("not JSON", vec![("en-US", "{")]),
+        ("an invalid locale name", vec![("en_US", r#"{"orders.missing":"a"}"#)]),
+        ("an invalid message key", vec![("en-US", r#"{"Orders.missing":"a"}"#)]),
+        ("an invalid file after a valid one", vec![("en-US", english), ("zh-CN", "null")]),
+    ] {
+        let error = Catalog::from_json(files).unwrap_err();
+        assert_eq!(error.code(), primitives::ERROR_CODE_INVALID_CATALOG, "{name}: {error}");
+    }
+    // 原语层的目录不要求有 en-US：那是握手交给宿主的目录的要求（plugin::MessageCatalog）
+    assert_eq!(Catalog::from_json([("zh-CN", r#"{"orders.missing":"订单"}"#)]).unwrap().locales().collect::<Vec<_>>(), ["zh-CN"]);
+    // 同一区域给了两份：键取并集，同名的以后一份为准
+    let twice = Catalog::from_json([("en-US", english), ("en-US", r#"{"orders.empty":"Nothing."}"#)]).unwrap();
+    assert_eq!((twice.template("en-US", "orders.empty"), twice.template("en-US", "orders.missing").is_some()), (Some("Nothing."), true));
+
+    let mut merged = base.clone();
+    merged.extend(Catalog::new().with("zh-CN", "orders.missing", "没有订单 {id}。").with("ja-JP", "orders.empty", "注文はありません。"));
+    assert_eq!(merged.template("zh-CN", "orders.missing"), Some("没有订单 {id}。"), "the merged-in template wins");
+    assert_eq!(merged.template("en-US", "orders.missing"), Some("Order {id} was not found."), "what the other catalog lacks is kept");
+    assert_eq!(merged.locales().collect::<Vec<_>>(), ["en-US", "ja-JP", "zh-CN"]);
+    assert_eq!(merged.resolve("orders.empty", "ja-JP", &Details::new()).as_deref(), Some("注文はありません。"));
+    assert_eq!(base.template("zh-CN", "orders.missing"), Some("订单 {id} 不存在。"), "the source of a clone is untouched");
+    merged.extend(Catalog::new());
+    assert_eq!(merged.locales().count(), 3, "an empty catalog adds nothing");
+}
+
+/// 内置的 10 种区域、区域名文法与规范的空白（RFC-0010、RFC-0001「空白字符」）是原语层的公开项，不打开 feature `plugin` 也能用；
+/// `set_default_messages` 对不合文法的区域名 panic，外来的区域名先用 `is_locale_name` 判断。
+#[test]
+fn locales_and_whitespace_belong_to_the_primitives() {
+    let _guard = default_messages();
+    assert_eq!(primitives::LOCALES, ["en-US", "zh-CN", "zh-TW", "ja-JP", "ko-KR", "de-DE", "es-ES", "fr-FR", "pt-BR", "ru-RU"]);
+    assert_eq!(primitives::LOCALES[0], primitives::DEFAULT_LOCALE, "the fallback locale comes first");
+    assert!(primitives::LOCALES.iter().all(|locale| primitives::is_locale_name(locale)));
+    for locale in ["en-US", "zh-Hant-TW", "de", "EN-us"] {
+        assert!(primitives::is_locale_name(locale), "{locale}");
+    }
+    for locale in ["", "e", "english", "en_US", "en-", "en-x", "zh CN"] {
+        assert!(!primitives::is_locale_name(locale), "{locale:?}");
+        let message = common::panic_message(move || primitives::set_default_messages(None, Some(locale)));
+        assert!(message.starts_with(ERROR_CODE_INVALID_ARGUMENT), "{locale:?}: {message}");
+    }
+
+    // 规范的空白是写死的 25 个码位，逐个核对全部 Unicode 标量值
+    let whitespace: Vec<char> = (0..=u32::from(char::MAX)).filter_map(char::from_u32).filter(|char| primitives::is_whitespace(*char)).collect();
+    let expected: Vec<char> = ('\u{09}'..='\u{0D}')
+        .chain([' ', '\u{85}', '\u{A0}', '\u{1680}'])
+        .chain('\u{2000}'..='\u{200A}')
+        .chain(['\u{2028}', '\u{2029}', '\u{202F}', '\u{205F}', '\u{3000}'])
+        .collect();
+    assert_eq!((whitespace.len(), &whitespace), (25, &expected));
+    for char in ['\u{1C}', '\u{1F}', '\u{180E}', '\u{200B}', '\u{FEFF}'] {
+        assert!(!primitives::is_whitespace(char), "{char:?} is whitespace for Unicode or for some languages, not for the spec");
+    }
+    for blank in ["", " ", "\t\r\n", "\u{A0}\u{3000}"] {
+        assert!(primitives::is_blank(blank), "{blank:?}");
+    }
+    for text in ["a", " a ", "\u{200B}", "\u{FEFF} "] {
+        assert!(!primitives::is_blank(text), "{text:?}");
+    }
+}
+
 #[test]
 fn error_wire_encoding() {
     let _guard = default_messages();
@@ -434,6 +515,8 @@ fn stability_names() {
         assert_eq!(stability.to_string(), name);
     }
     assert_eq!(serde_json::to_string(&Stability::Experimental).unwrap(), r#""experimental""#);
+    // as_str 与 name 是同一个访问器，原语层的三个枚举也有
+    assert_eq!((Stability::Preview.as_str(), PipelineStage::Egress.as_str(), LifecycleState::Ready.as_str()), ("preview", "egress", "Ready"));
     assert!(serde_json::from_str::<Stability>(r#""solid""#).unwrap_err().to_string().contains("'solid' is not a stability."));
 }
 
@@ -451,6 +534,32 @@ fn framework_errors_convert_to_literal_errors() {
     assert_eq!(primitives::SDK_VERSION, env!("CARGO_PKG_VERSION"));
     assert_eq!(BAGGAGE_TENANT, "xihan.tenant");
     assert_eq!(BAGGAGE_CORRELATION, "xihan.correlation");
+}
+
+/// 配置期的 `FrameworkError` 可以在返回 `primitives::Result` 的函数里用 `?`：转换同 `to_error`，带上消息键、参数与已解析的文案。
+#[test]
+fn framework_errors_propagate_with_the_question_mark() {
+    fn configure(error: FrameworkError) -> Result<()> {
+        Err(error)?;
+        Ok(())
+    }
+    let keyed = FrameworkError::with_message("KERNEL_OPERATION_002", "kernel.operation.registry_full", details(json!({"capacity": 10000})));
+    let expected = keyed.to_error();
+    let converted = configure(keyed).unwrap_err();
+    assert_eq!(converted, expected);
+    assert_eq!((converted.code(), converted.message_key()), ("KERNEL_OPERATION_002", Some("kernel.operation.registry_full")));
+    assert_eq!(converted.text(), Some("The operation registry has reached its capacity of 10000."));
+    // 没有消息键的是自由文本错误；底层错误不随之带上，错误码不合文法的换成 PRIMITIVES_VALIDATION_001
+    let literal = Error::from(FrameworkError::new("KERNEL_PIPELINE_001", "The constraints form a cycle.").with_cause(std::io::Error::other("disk")));
+    assert_eq!(
+        (literal.code(), literal.message_key(), literal.text(), literal.inner()),
+        ("KERNEL_PIPELINE_001", None, Some("The constraints form a cycle."), None)
+    );
+    assert_eq!(Error::from(FrameworkError::new("bad", "x")).code(), ERROR_CODE_INVALID_ARGUMENT);
+
+    // Error 是全等关系：可以作映射的键的一部分、放进要求 Eq 的容器
+    fn assert_eq_type<T: Eq>() {}
+    assert_eq_type::<Error>();
 }
 
 #[derive(Deserialize)]

@@ -10,12 +10,22 @@ use crate::primitives::{Error, LifecycleState};
 pub const ERROR_CODE_UNAVAILABLE: &str = "PLUGINS_UNAVAILABLE_001";
 /// 插件回调被拒：会话令牌无效、所需权限未在清单声明或未被授予、带了宿主没有交给插件的租户（`invocation.md` §5）。
 pub const ERROR_CODE_CALLBACK_DENIED: &str = "PLUGINS_DENIED_002";
-/// 插件一侧的未预期失败：生命周期或健康钩子 panic、配置节不是 JSON 对象、对方写来的错误不合法、没有对应的 gRPC 状态。
-pub const ERROR_CODE_UNEXPECTED: &str = "PLUGINS_UNEXPECTED_001";
+/// 插件一侧的未预期失败（.NET 的 `PluginErrors.Unexpected`）：生命周期或健康钩子 panic、配置节不是 JSON 对象、对方写来的错误不合法、
+/// 没有对应的 gRPC 状态。
+///
+/// 名字带 `PLUGIN`：内核的 [`operation::ERROR_CODE_UNEXPECTED`](crate::operation::ERROR_CODE_UNEXPECTED) 是另一个码
+/// （`KERNEL_UNEXPECTED_001`），两个模块一起引入时不会认错。
+pub const ERROR_CODE_PLUGIN_UNEXPECTED: &str = "PLUGINS_UNEXPECTED_001";
+/// 插件的清单、种类或隔离级别不合法（.NET 的 `PluginErrors.InvalidSource`）：[`Plugin::start`](super::Plugin::start) 在清单不是
+/// `kind: plugin`、`isolation: out-of-process` 或写了 `contributes.pipeline` 时报它，宿主发现插件时也以它拒绝。
+pub const ERROR_CODE_INVALID_SOURCE: &str = "PLUGINS_VALIDATION_001";
+/// 握手响应与清单不一致（.NET 的 `PluginErrors.HandshakeMismatch`）：[`Plugin::start`](super::Plugin::start) 在原语层版本不符、登记的
+/// 操作不在清单里、订阅重复或不合法时报它，宿主会以同一个码拒绝握手（`handshake.md` §3）。
+pub const ERROR_CODE_HANDSHAKE_MISMATCH: &str = "PLUGINS_VALIDATION_004";
 
 /// 插件不可用的消息键，错误码 [`ERROR_CODE_UNAVAILABLE`]；参数 `id`、`state`（插件此刻的状态名，如 `Configured`）。
 pub const MESSAGE_UNAVAILABLE: &str = "plugins.process.unavailable";
-/// 插件一侧失败的消息键，错误码 [`ERROR_CODE_UNEXPECTED`]；参数 `id`、`phase`（小写：`configure`、`start`、`stop`、`health`、
+/// 插件一侧失败的消息键，错误码 [`ERROR_CODE_PLUGIN_UNEXPECTED`]；参数 `id`、`phase`（小写：`configure`、`start`、`stop`、`health`、
 /// `invoke`、`publish`，或回调的操作 ID）、`reason`（英文诊断文本，不本地化）。
 pub const MESSAGE_FAILED: &str = "plugins.process.failed";
 /// 投递找不到订阅的消息键，错误码 `KERNEL_NOTFOUND_001`；参数 `id`、`topic`、`type`、`mode`（空的方式写 `competing`）。
@@ -74,7 +84,7 @@ pub(crate) fn unavailable(id: &str, state: LifecycleState) -> Error {
 
 /// 插件一侧某个阶段的失败。
 pub(crate) fn failed(id: &str, phase: &str, reason: impl Into<String>) -> Error {
-    Error::unexpected(ERROR_CODE_UNEXPECTED, MESSAGE_FAILED).with_detail("id", id).with_detail("phase", phase).with_detail("reason", reason.into())
+    Error::unexpected(ERROR_CODE_PLUGIN_UNEXPECTED, MESSAGE_FAILED).with_detail("id", id).with_detail("phase", phase).with_detail("reason", reason.into())
 }
 
 /// 投递找不到（主题，方式，类型）匹配的订阅（`invocation.md` §4）。

@@ -100,6 +100,15 @@ impl FrameworkError {
     }
 }
 
+impl From<FrameworkError> for Error {
+    /// 同 [`FrameworkError::to_error`]：返回 `FrameworkError` 的配置期函数因此可以在返回 `primitives::Result` 的函数里用 `?`。
+    ///
+    /// `Error` 只有可上线的成员，底层错误（[`FrameworkError::cause`]）不随之带上；要保留它就不要转换。
+    fn from(error: FrameworkError) -> Self {
+        error.to_error()
+    }
+}
+
 impl fmt::Display for FrameworkError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}: {}", self.code, self.message)?;

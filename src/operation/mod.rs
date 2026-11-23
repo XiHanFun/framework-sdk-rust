@@ -1,6 +1,8 @@
 //! 操作契约与 XGI 消息（RFC-0011）：业务以操作为单位声明，调用器让它经过完整管道并在 handle 阶段执行。
 //!
-//! 请求与响应用 `serde_json` 编解码，JSON 是 XGI 的规范编码；类型化入口 [`Invoker::invoke_typed`] 不经 JSON。
+//! JSON 是 XGI 的规范编码：请求载荷先过共同的 JSON 读取检查（`primitives::json` 的读取器，不是 `serde_json::from_slice`），再按请求类型的
+//! `Deserialize` 解码，数字按值模型；响应在管道结束之后按类型的 `Serialize` 写出，非有限的浮点写不出、报错。类型化入口
+//! [`Invoker::invoke_typed`] 不经 JSON。
 //!
 //! ```
 //! use std::sync::Arc;
@@ -38,7 +40,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::BoxFuture;
-use crate::invocation::{Context, ERROR_CODE_CANCELLED, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START, MESSAGE_DEADLINE_EXCEEDED};
+use crate::invocation::{self, Context, ERROR_CODE_CANCELLED, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_BEFORE_START};
 use crate::pipeline::{self, APP_OWNER, Middleware, Next, Pipeline, Placement, Step};
 use crate::primitives::json::{self, Node};
 use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, Error, FrameworkError, PipelineStage, Result, Stability};
@@ -97,6 +99,10 @@ pub const EXPOSE_MCP: &str = "mcp";
 pub const EXPOSE_COMMAND_LINE: &str = "commandline";
 /// 暴露的协议：AI 工具目录（`ai.tools@1`）。
 pub const EXPOSE_AI: &str = "ai";
+/// 全部五个协议（`plugin.proto` 的 `OperationDeclaration.expose` 列出的名字），按上面的顺序：`with_expose(EXPOSE_ALL)`。
+///
+/// 冻结为这五个，与 .NET 的 `Expose.All` 一样（ADR-0136）：以后规范新增的协议不进这个常量，已经发布的操作不会因此自动暴露到新协议上。
+pub const EXPOSE_ALL: [&str; 5] = [EXPOSE_HTTP, EXPOSE_GRPC, EXPOSE_MCP, EXPOSE_COMMAND_LINE, EXPOSE_AI];
 
 /// 判断操作 ID 是否符合 `<resource>.<verb>`：`^[a-z][a-z0-9]*(-[a-z0-9]+)*\.[a-z][a-z0-9]*(-[a-z0-9]+)*$`。
 pub fn is_id(id: &str) -> bool {
@@ -111,7 +117,8 @@ pub struct Contract {
     pub id: String,
     /// 稳定性；缺省 [`Stability::Stable`]。
     pub stability: Stability,
-    /// 暴露的协议名（`EXPOSE_*`）；空表示没有声明，由宿主按它的缺省处理。
+    /// 暴露的协议名（`EXPOSE_*`）；空表示不对外发布（`plugin.proto` 的 `OperationDeclaration.expose`）：协议适配器只发布列出自己的
+    /// 操作，没有列出任何协议的操作在 HTTP、gRPC、MCP、命令行与 AI 工具目录里都不出现，只能在进程内调用。
     pub expose: Vec<String>,
     /// 所需的权限码。
     pub permission: Option<String>,
@@ -120,18 +127,25 @@ pub struct Contract {
 }
 
 impl Contract {
-    /// 用操作 ID 创建：稳定，没有声明暴露的协议与授权要求。
+    /// 用操作 ID 创建：稳定，没有授权要求，不对外发布（`expose` 为空）。
+    ///
+    /// 要让宿主在某个协议上发布它，必须调 [`Contract::with_expose`]：`with_expose([EXPOSE_HTTP])`，或全部五个协议的
+    /// `with_expose(EXPOSE_ALL)`。
     pub fn new(id: impl Into<String>) -> Self {
         Self { id: id.into(), stability: Stability::Stable, expose: Vec::new(), permission: None, policy: None }
     }
 
     /// 设置稳定性。
+    #[must_use]
     pub fn with_stability(mut self, stability: Stability) -> Self {
         self.stability = stability;
         self
     }
 
-    /// 设置暴露的协议。
+    /// 设置暴露的协议，替换原有的；名字是 `EXPOSE_*`（区分大小写），空集合即不对外发布。
+    ///
+    /// 这里不核对名字：五个协议名之外的值在登记时（[`Registry::add_with`]）报 `PRIMITIVES_VALIDATION_001`。
+    #[must_use]
     pub fn with_expose<I, S>(mut self, protocols: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -142,12 +156,14 @@ impl Contract {
     }
 
     /// 设置所需的权限码。
+    #[must_use]
     pub fn with_permission(mut self, permission: impl Into<String>) -> Self {
         self.permission = Some(permission.into());
         self
     }
 
     /// 设置所需的策略名。
+    #[must_use]
     pub fn with_policy(mut self, policy: impl Into<String>) -> Self {
         self.policy = Some(policy.into());
         self
@@ -262,8 +278,8 @@ impl<T: Serialize + Send + 'static> Response for T {
 fn encode(response: &dyn Response) -> Result<Vec<u8>> {
     match panic::catch_unwind(AssertUnwindSafe(|| response.encode())) {
         Ok(Ok(payload)) => Ok(payload),
-        Ok(Err(_)) => Err(Error::unexpected(ERROR_CODE_UNEXPECTED, MESSAGE_UNHANDLED_PANIC)),
-        Err(payload) => Err(unhandled(payload.as_ref())),
+        Ok(Err(_)) => Err(unhandled()),
+        Err(payload) => Err(unhandled_panic(payload.as_ref())),
     }
 }
 
@@ -383,8 +399,8 @@ impl Registry {
 
     /// 登记一个操作。
     ///
-    /// ID 不合法、同时声明了权限与策略、归属为空或 Schema 不是 JSON 对象返回 `PRIMITIVES_VALIDATION_001`，
-    /// 重复返回 `KERNEL_OPERATION_001`，已满返回 `KERNEL_OPERATION_002`。
+    /// ID 不合法、同时声明了权限与策略、暴露的协议不是五个协议名（[`EXPOSE_ALL`]）之一、归属为空或 Schema 不是 JSON 对象返回
+    /// `PRIMITIVES_VALIDATION_001`，重复返回 `KERNEL_OPERATION_001`，已满返回 `KERNEL_OPERATION_002`。
     pub fn add_with<Req, Res, H>(&self, contract: Contract, handler: H, schema: Option<Schema>, owner: &str) -> std::result::Result<(), FrameworkError>
     where
         Req: DeserializeOwned + Send + 'static,
@@ -397,6 +413,10 @@ impl Registry {
         }
         if contract.permission.is_some() && contract.policy.is_some() {
             return Err(invalid(format!("The operation '{id}' must declare either a permission or a policy.")));
+        }
+        // 协议名之外的值宿主认不出、会当作没有写：拼错的名字（如 htpp）在这里报出来，不让操作悄悄地不发布
+        if let Some(protocol) = contract.expose.iter().find(|protocol| !EXPOSE_ALL.contains(&protocol.as_str())) {
+            return Err(invalid(format!("The operation '{id}' cannot be exposed to '{protocol}'.")));
         }
         if owner.is_empty() {
             return Err(invalid(format!("The operation '{id}' needs an owner.")));
@@ -655,7 +675,7 @@ impl Middleware for DeadlineStep {
                 // 下游只知道取消发生了，不知道是哪个令牌触发的（如插件回调把 gRPC 的 Cancelled 映射成取消）：截止令牌已触发即超时，
                 // 调用方同时取消也一样（RFC-0003 规则 1，ADR-0092、ADR-0236）
                 Err(error) if error.code() == ERROR_CODE_CANCELLED && ctx.cancellation().is_some_and(|fired| fired.code() == ERROR_CODE_DEADLINE_EXCEEDED) => {
-                    Err(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_EXCEEDED))
+                    Err(invocation::deadline_exceeded())
                 }
                 outcome => outcome,
             }
@@ -696,18 +716,24 @@ impl Future for CatchPanic<'_> {
         // AssertUnwindSafe：panic 之后内层 future 只会被丢弃，不会再被轮询，它里面可能半改的状态不会再被读到
         match panic::catch_unwind(AssertUnwindSafe(|| self.0.as_mut().poll(context))) {
             Ok(poll) => poll,
-            Err(payload) => Poll::Ready(Err(unhandled(payload.as_ref()))),
+            Err(payload) => Poll::Ready(Err(unhandled_panic(payload.as_ref()))),
         }
     }
 }
 
+/// 调用期间的未处理失败（RFC-0011 规则 5）：`KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception`，没有参数。
+///
+/// 调用器翻译 panic、响应写不出，与插件运行时里处理器任务的 panic 都用这一个构造。
+pub(crate) fn unhandled() -> Error {
+    Error::unexpected(ERROR_CODE_UNEXPECTED, MESSAGE_UNHANDLED_PANIC)
+}
+
 /// 把 panic 的内容翻译成未处理失败；内容是 [`FrameworkError`]（`std::panic::panic_any` 抛出，原语的非法参数就是这样）时，
 /// 它转成的错误成为内部错误。按类型认出，不看文本：内容是字符串的 panic 一律没有内部错误。
-fn unhandled(payload: &(dyn Any + Send)) -> Error {
-    let error = Error::unexpected(ERROR_CODE_UNEXPECTED, MESSAGE_UNHANDLED_PANIC);
+fn unhandled_panic(payload: &(dyn Any + Send)) -> Error {
     match payload.downcast_ref::<FrameworkError>() {
-        Some(framework) => error.with_inner(framework.to_error()),
-        None => error,
+        Some(framework) => unhandled().with_inner(framework.to_error()),
+        None => unhandled(),
     }
 }
 
@@ -823,11 +849,11 @@ impl fmt::Debug for Invoker {
 fn decode<Req: DeserializeOwned>(id: &str, payload: &[u8]) -> Result<Req> {
     // 只有长度为 0 的载荷等价于 {}：只有空白的不是 JSON
     let payload = if payload.is_empty() { b"{}".as_slice() } else { payload };
-    let node = json::parse(payload).map_err(|error| invalid_payload(id, error.path().to_owned()))?;
+    let node = json::parse(payload).map_err(|error| invalid_payload(id, error.path()))?;
     if node == Node::Null {
-        return Err(invalid_payload(id, "$".to_owned()));
+        return Err(invalid_payload(id, "$"));
     }
-    json::decode(&node).map_err(|error| invalid_payload(id, error.path().to_owned()))
+    json::decode(&node).map_err(|error| invalid_payload(id, error.path()))
 }
 
 /// 请求类型里必填而接受 `null` 的成员：`#[serde(deserialize_with = "operation::nullable")] name: Option<String>`（RFC-0011 规则 2）。
@@ -866,11 +892,15 @@ pub fn nullable<'de, D: Deserializer<'de>, T: Deserialize<'de>>(deserializer: D)
     Option::<T>::deserialize(deserializer)
 }
 
-fn invalid_payload(id: &str, reason: String) -> Error {
+/// 载荷不合法：`KERNEL_VALIDATION_001` + `kernel.operation.invalid_payload`，参数 `id` 与 `reason`（RFC-0011 规则 2）。
+///
+/// 调用器解码载荷时 `reason` 是出错位置的 JSON 路径；插件回调把宿主的 `InvalidArgument` 映射过来时是状态的说明（`invocation.md` §5）。
+pub(crate) fn invalid_payload(id: &str, reason: &str) -> Error {
     Error::validation(ERROR_CODE_INVALID_PAYLOAD, MESSAGE_INVALID_PAYLOAD).with_detail("id", id).with_detail("reason", reason)
 }
 
-fn not_found(id: &str) -> Error {
+/// 操作未登记：`KERNEL_NOTFOUND_001` + `kernel.operation.unknown`，参数 `id`；调用器与插件回调（宿主的 `Unimplemented`）共用。
+pub(crate) fn not_found(id: &str) -> Error {
     Error::not_found(ERROR_CODE_NOT_FOUND, MESSAGE_NOT_FOUND).with_detail("id", id)
 }
 

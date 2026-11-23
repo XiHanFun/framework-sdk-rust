@@ -11,6 +11,8 @@
 //! | `TypedId` | [`TypedId`] |
 //! | `FrameworkException` | [`FrameworkError`] |
 //! | `MessageTemplate` / `IMessageResolver` / `MessageScope.Default` | [`format_message`]、[`MessageResolver`]、[`set_default_messages`] |
+//! | `MessageCatalog` / `LocaleName` 与内置的 10 种区域 | [`Catalog`]、[`is_locale_name`]、[`LOCALES`] |
+//! | 「空白字符」 | [`is_whitespace`]、[`is_blank`] |
 //! | 「JSON 文本」的共同读取检查与值模型 | [`json::check`]、[`json::from_slice`]、[`json::Model`] |
 
 mod baggage;
@@ -40,12 +42,15 @@ pub use framework::{DOCUMENTATION, FrameworkError, NAME, REPOSITORY, SDK_NAME, S
 pub use id::TypedId;
 pub use lifecycle::LifecycleState;
 #[cfg(feature = "plugin")]
-pub(crate) use messages::is_locale_name;
+pub(crate) use messages::builtin_locales;
 pub use messages::{
-    Catalog, DEFAULT_LOCALE, Details, MESSAGE_KEY_MAX_LENGTH, MESSAGE_UNINITIALIZED_RESULT, MessageResolver, builtin_catalog, default_locale, describe,
-    format_message, format_message_in, format_value, format_value_in, is_message_key, message_key_domain, placeholders, positional, resolve_message,
-    set_default_messages, try_format_message, try_format_message_in,
+    Catalog, DEFAULT_LOCALE, Details, ERROR_CODE_INVALID_CATALOG, LOCALES, MESSAGE_KEY_MAX_LENGTH, MESSAGE_UNINITIALIZED_RESULT, MessageResolver,
+    builtin_catalog, default_locale, describe, format_message, format_message_in, format_value, format_value_in, is_locale_name, is_message_key,
+    message_key_domain, placeholders, positional, resolve_message, set_default_messages, try_format_message, try_format_message_in,
 };
+pub(crate) use named::named_enum;
 pub use result::{Maybe, Result, WireResult, wire_result};
 pub use stability::Stability;
 pub use stage::PipelineStage;
+
+pub use crate::grammar::{is_blank, is_whitespace};

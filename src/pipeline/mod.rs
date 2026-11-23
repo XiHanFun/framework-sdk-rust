@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use crate::BoxFuture;
 use crate::invocation::Context;
-use crate::primitives::{FrameworkError, PipelineStage, Result};
+use crate::primitives::{FrameworkError, PipelineStage, Result, named_enum};
 
 /// 中间件顺序约束成环。
 pub const ERROR_CODE_CYCLE: &str = "KERNEL_PIPELINE_001";
@@ -152,21 +152,13 @@ impl fmt::Debug for Next<'_> {
     }
 }
 
-/// 中间件在阶段内的位置。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Placement {
-    /// 阶段开头。
-    Beginning,
-    /// 阶段末尾。
-    End,
-}
-
-impl fmt::Display for Placement {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::Beginning => "Beginning",
-            Self::End => "End",
-        })
+named_enum! {
+    /// 中间件在阶段内的位置（RFC-0004 排序规则第 2 条）：`Beginning` 排在 `End` 之前；名字同规范与 .NET 的 `Placement`。
+    pub enum Placement ("placement") {
+        /// 阶段开头。
+        Beginning = 0 => "Beginning",
+        /// 阶段末尾。
+        End = 1 => "End",
     }
 }
 

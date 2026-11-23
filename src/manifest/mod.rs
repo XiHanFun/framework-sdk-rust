@@ -27,7 +27,7 @@ mod shape;
 
 use crate::grammar::positive;
 use crate::primitives::json::{self, Node};
-use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, FrameworkError, PipelineStage, Stability};
+use crate::primitives::{Details, ERROR_CODE_INVALID_ARGUMENT, FrameworkError, PipelineStage, Stability, named_enum};
 
 /// 清单文件名。
 pub const FILE_NAME: &str = "xihan.manifest.json";
@@ -68,100 +68,51 @@ pub const MESSAGE_DUPLICATE_REQUIRES: &str = "primitives.manifest.duplicate_requ
 /// 绑定名重复；参数 `id`。
 pub const MESSAGE_DUPLICATE_BINDINGS: &str = "primitives.manifest.duplicate_bindings";
 
-/// 清单种类。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Kind {
-    /// 能力包。
-    Capability,
-    /// Provider。
-    Provider,
-    /// 插件。
-    Plugin,
-    /// 宿主。
-    Host,
-    /// 协议适配器。
-    Protocol,
+named_enum! {
+    /// 清单种类；名字是清单里的小写名。
+    ///
+    /// 规范以后可以增加种类，所以是 `#[non_exhaustive]`：本 crate 之外的 `match` 要带通配分支。
+    #[non_exhaustive]
+    pub enum Kind ("manifest kind") {
+        /// 能力包。
+        Capability = 0 => "capability",
+        /// Provider。
+        Provider = 1 => "provider",
+        /// 插件。
+        Plugin = 2 => "plugin",
+        /// 宿主。
+        Host = 3 => "host",
+        /// 协议适配器。
+        Protocol = 4 => "protocol",
+    }
 }
 
-/// Provider 角色。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Role {
-    /// 普通 Provider（缺省）。
-    Provider,
-    /// 没有显式 Provider 时被选中的实现。
-    Default,
+named_enum! {
+    /// Provider 角色；名字是清单里的小写名。
+    pub enum Role ("provider role") {
+        /// 普通 Provider（缺省）。
+        Provider = 0 => "provider",
+        /// 没有显式 Provider 时被选中的实现。
+        Default = 1 => "default",
+    }
 }
 
-/// 插件隔离级别。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum Isolation {
-    /// 进程内。
-    InProcess,
-    /// Wasm 沙箱。
-    Wasm,
-    /// 进程外。
-    OutOfProcess,
+named_enum! {
+    /// 插件隔离级别；名字是清单里的小写名。
+    pub enum Isolation ("plugin isolation") {
+        /// 进程内。
+        InProcess = 0 => "in-process",
+        /// Wasm 沙箱。
+        Wasm = 1 => "wasm",
+        /// 进程外。
+        OutOfProcess = 2 => "out-of-process",
+    }
 }
 
 impl Default for Role {
     /// 缺省的 `provider`。
     fn default() -> Self {
         Self::Provider
-    }
-}
-
-impl Kind {
-    /// 清单里的名字。
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Capability => "capability",
-            Self::Provider => "provider",
-            Self::Plugin => "plugin",
-            Self::Host => "host",
-            Self::Protocol => "protocol",
-        }
-    }
-}
-
-impl Role {
-    /// 清单里的名字。
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Provider => "provider",
-            Self::Default => "default",
-        }
-    }
-}
-
-impl Isolation {
-    /// 清单里的名字。
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::InProcess => "in-process",
-            Self::Wasm => "wasm",
-            Self::OutOfProcess => "out-of-process",
-        }
-    }
-}
-
-impl fmt::Display for Kind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl fmt::Display for Role {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.name())
-    }
-}
-
-impl fmt::Display for Isolation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.name())
     }
 }
 

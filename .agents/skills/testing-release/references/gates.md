@@ -4,7 +4,7 @@
 
 | 作业 | 平台 | 步骤 | 失败时 |
 | --- | --- | --- | --- |
-| `test` | ubuntu-latest、windows-latest | 检出含规范 submodule；装 stable Rust（rustfmt、clippy）与 Go（版本取 `spec/conformance/go.mod`） | — |
+| `test` | ubuntu-latest、windows-latest | 检出含规范 submodule；装 stable Rust（rustfmt、clippy）与 Go（版本取 `spec/conformance/go.mod`）；缓存 cargo 产物（`Swatinem/rust-cache`，另两个作业同样缓存） | — |
 | | | `cargo fmt --check` | `cargo fmt` 后复核改动 |
 | | | `cargo clippy --all-targets -- -D warnings` 与 `--features plugin` 各一遍 | 修代码；`missing_docs` 随 `-D warnings` 生效，公开项补中文文档注释 |
 | | | `RUSTDOCFLAGS=-D warnings` 下 `cargo doc --no-deps` 与 `--features plugin` 各一遍 | 修断掉的文档链接与文档注释 |
@@ -26,7 +26,7 @@
 | `tests/conformance_vectors.rs` | 默认 | 认领的档要求的向量都回放或列为缺口 |
 | `tests/plugin.rs` | `plugin` | 扮演宿主的 gRPC 客户端核对插件运行时；`plugin/` 向量 |
 | `tests/plugin_conformance.rs` | `plugin` | 构建 echo，黑盒运行器的全部用例 |
-| crate 内 `#[cfg(test)]` | 两者 | 内部函数，含 `plugin/deadlines.json`、`plugin/error-reading.json`、`plugin/plugin-messages.json` 的回放 |
+| crate 内 `#[cfg(test)]` | 两者 | 内部函数，含 `plugin/callback-status.json`、`plugin/deadlines.json`、`plugin/error-reading.json`、`plugin/plugin-messages.json` 的回放 |
 | 文档测试 | 两者 | 模块文档与两份 README 的示例 |
 
 ## 黑盒运行器的环境

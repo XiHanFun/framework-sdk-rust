@@ -41,7 +41,7 @@ git status --porcelain -- src/plugin/generated
 
 ## 打包
 
-CI 不跑打包。发布前用 `cargo package --list` 核对包内容：不含 `spec/`、`tests/`、`tools/`、Agent 的指令与技能（`AGENTS.md`、`CLAUDE.md`、`.agents/`、`.claude/`）和仓库配置文件（`Cargo.toml` 的 `exclude`）。发布见 `version-release` 技能。
+CI 不跑打包。发布前用 `cargo package --list` 核对包内容：不含 `spec/`、`tests/`、`tools/`、`scripts/`、Agent 的指令与技能（`AGENTS.md`、`CLAUDE.md`、`.agents/`、`.claude/`）和仓库配置文件（`Cargo.toml` 的 `exclude`）。发布见 `version-release` 技能。
 
 ## 本机没有 Go 时
 

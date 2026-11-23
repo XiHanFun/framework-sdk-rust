@@ -31,6 +31,7 @@
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let registry = Arc::new(Registry::new());
 //!     registry.add(
+//!         // 不调 with_expose 的操作不对外发布：宿主不在任何协议上发布它，只能在进程内调用
 //!         Contract::new("pings.create"),
 //!         operation::handler_fn(|_ctx, ping: Ping| Box::pin(async move { Ok(Pong { text: ping.text }) })),
 //!     )?;
@@ -60,20 +61,24 @@ pub mod v1 {
     include!("generated/xihan.plugin.v1.rs");
 }
 
-pub use catalog::{LOCALES, MessageCatalog, runtime_catalog};
-pub use endpoint::{Endpoint, Network, is_whitespace, parse_handshake_line, parse_host_addresses, select_host_endpoint};
+pub use catalog::{MessageCatalog, runtime_catalog};
+pub use endpoint::{Endpoint, Network, parse_handshake_line, parse_host_addresses, select_host_endpoint};
 pub use host::{Host, host};
 pub use log::{Level, Logger};
 pub(crate) use messages::BUILTIN_TEMPLATES;
 pub use messages::{
-    ERROR_CODE_CALLBACK_DENIED, ERROR_CODE_UNAVAILABLE, ERROR_CODE_UNEXPECTED, MESSAGE_CALLBACK_DENIED, MESSAGE_CALLBACK_TENANT_DENIED, MESSAGE_FAILED,
-    MESSAGE_HOST_UNAVAILABLE, MESSAGE_SESSION_INVALID, MESSAGE_UNAVAILABLE, MESSAGE_UNSUBSCRIBED,
+    ERROR_CODE_CALLBACK_DENIED, ERROR_CODE_HANDSHAKE_MISMATCH, ERROR_CODE_INVALID_SOURCE, ERROR_CODE_PLUGIN_UNEXPECTED, ERROR_CODE_UNAVAILABLE,
+    MESSAGE_CALLBACK_DENIED, MESSAGE_CALLBACK_TENANT_DENIED, MESSAGE_FAILED, MESSAGE_HOST_UNAVAILABLE, MESSAGE_SESSION_INVALID, MESSAGE_UNAVAILABLE,
+    MESSAGE_UNSUBSCRIBED,
 };
 pub use runtime::{Launch, Plugin, Running};
 pub use types::{
     Binding, Configuration, Envelope, Event, EventHandler, EventHandlerFn, Health, HealthItem, HealthStatus, Hooks, Subscription, SubscriptionMode,
     event_handler_fn,
 };
+
+// 这两项属于原语层（RFC-0010 的区域、RFC-0001「空白字符」），不打开 feature `plugin` 也能用；这里的旧路径照常可用
+pub use crate::primitives::{LOCALES, is_whitespace};
 
 /// 本运行时支持的协议版本（`handshake.md` §3 第 1 条），升序。
 pub const PROTOCOL_VERSIONS: &[u32] = &[1];
@@ -84,8 +89,15 @@ pub const HANDSHAKE_LINE_VERSION: &str = "xihan-plugin/1";
 /// 携带会话令牌的元数据键：宿主调用插件、插件回调宿主的每个 RPC 都带它（`handshake.md` §4）。
 pub const SESSION_METADATA_KEY: &str = "xihan-plugin-session";
 
-/// 插件目录里的清单文件名（`handshake.md` §1）。
-pub const MANIFEST_FILE_NAME: &str = "xihan.manifest.json";
+/// 插件目录里的清单文件名（`handshake.md` §1）：就是 [`manifest::FILE_NAME`](crate::manifest::FILE_NAME)，文件名只写在那一处。
+#[doc(inline)]
+pub use crate::manifest::FILE_NAME as MANIFEST_FILE_NAME;
+
+/// [`ERROR_CODE_PLUGIN_UNEXPECTED`] 的旧名，值相同（`PLUGINS_UNEXPECTED_001`）。
+///
+/// 与内核的 [`operation::ERROR_CODE_UNEXPECTED`](crate::operation::ERROR_CODE_UNEXPECTED)（`KERNEL_UNEXPECTED_001`）同名不同值，所以改了名字。
+#[deprecated(since = "0.2.0", note = "use `ERROR_CODE_PLUGIN_UNEXPECTED`; `operation::ERROR_CODE_UNEXPECTED` is a different code")]
+pub const ERROR_CODE_UNEXPECTED: &str = ERROR_CODE_PLUGIN_UNEXPECTED;
 
 /// 握手时上报的实现语言（`SdkInfo.language`）。
 pub const SDK_LANGUAGE: &str = "rust";

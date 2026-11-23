@@ -218,9 +218,9 @@ impl Context {
     /// 已经过去的 `kernel.invocation.deadline_before_start` 由调用器在第一个中间件之前判断（RFC-0011 规则 10），不在这里。
     pub fn cancellation(&self) -> Option<Error> {
         if self.deadline_fired() {
-            return Some(Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_EXCEEDED));
+            return Some(deadline_exceeded());
         }
-        self.token.is_cancelled().then(|| Error::cancelled(ERROR_CODE_CANCELLED, MESSAGE_CANCELLED))
+        self.token.is_cancelled().then(cancelled)
     }
 
     /// 截止令牌是否已触发：只看定时器，不读时钟；没有截止时间时为假。
@@ -259,6 +259,18 @@ impl Items {
     fn write(&self) -> std::sync::RwLockWriteGuard<'_, HashMap<TypeId, Arc<dyn Any + Send + Sync>>> {
         self.values.write().unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// 截止时间在调用途中到达：`KERNEL_TIMEOUT_001` + `kernel.invocation.deadline_exceeded`，没有参数（RFC-0011「错误码」）。
+///
+/// 上下文的归因、调用器的截止时间步骤与插件回调的状态映射都用这一个构造，码与键只写在这里。
+pub(crate) fn deadline_exceeded() -> Error {
+    Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_EXCEEDED)
+}
+
+/// 调用被调用方取消：`KERNEL_CANCELLED_001` + `kernel.invocation.cancelled`，没有参数。
+pub(crate) fn cancelled() -> Error {
+    Error::cancelled(ERROR_CODE_CANCELLED, MESSAGE_CANCELLED)
 }
 
 /// 按类型取出：表以 `TypeId::of::<T>()` 为键，取出的值一定是 `T`。

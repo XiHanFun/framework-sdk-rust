@@ -16,39 +16,25 @@ use tonic::transport::server::Connected;
 
 use super::HANDSHAKE_LINE_VERSION;
 use crate::BoxFuture;
+use crate::primitives::{is_whitespace, named_enum};
 
-/// 端点的网络类型（`plugin.proto` 的 `Endpoint.network`）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Network {
-    /// Unix 域套接字 `unix`：放在本进程新建的私有目录里（目录 `0700`、套接字 `0600`）；只在 Unix 上可用。
-    Unix,
-    /// 回环 TCP `tcp`：只绑定 `127.0.0.1`，同机的其他用户连得上，隔离只靠会话令牌。
-    Tcp,
-    /// Windows 命名管道 `npipe`：拒绝远程客户端，用系统缺省的安全描述符（其他本机用户只能以只读打开、发不出请求），与回环 TCP
-    /// 一样隔离靠会话令牌（`handshake.md` §4）；只在 Windows 上可用。
-    NamedPipe,
+named_enum! {
+    /// 端点的网络类型（`plugin.proto` 的 `Endpoint.network`）；名字是协议里的 `unix`、`tcp` 与 `npipe`。
+    ///
+    /// 协议以后可以增加网络类型，所以是 `#[non_exhaustive]`：本 crate 之外的 `match` 要带通配分支。
+    #[non_exhaustive]
+    pub enum Network ("network") {
+        /// Unix 域套接字 `unix`：放在本进程新建的私有目录里（目录 `0700`、套接字 `0600`）；只在 Unix 上可用。
+        Unix = 0 => "unix",
+        /// 回环 TCP `tcp`：只绑定 `127.0.0.1`，同机的其他用户连得上，隔离只靠会话令牌。
+        Tcp = 1 => "tcp",
+        /// Windows 命名管道 `npipe`：拒绝远程客户端，用系统缺省的安全描述符（其他本机用户只能以只读打开、发不出请求），与回环 TCP
+        /// 一样隔离靠会话令牌（`handshake.md` §4）；只在 Windows 上可用。
+        NamedPipe = 2 => "npipe",
+    }
 }
 
 impl Network {
-    /// 协议里的名字：`unix`、`tcp` 或 `npipe`。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unix => "unix",
-            Self::Tcp => "tcp",
-            Self::NamedPipe => "npipe",
-        }
-    }
-
-    /// 按协议里的名字解析，区分大小写；未知名字为 `None`。
-    pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "unix" => Some(Self::Unix),
-            "tcp" => Some(Self::Tcp),
-            "npipe" => Some(Self::NamedPipe),
-            _ => None,
-        }
-    }
-
     /// 本平台上插件监听的缺省网络：Unix 上是 Unix 域套接字，Windows 上是命名管道，其他平台是回环 TCP。
     pub const fn platform_default() -> Self {
         if cfg!(unix) {
@@ -70,12 +56,6 @@ impl Network {
         } else {
             &[Self::Tcp]
         }
-    }
-}
-
-impl fmt::Display for Network {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
     }
 }
 
@@ -149,14 +129,6 @@ pub fn parse_host_addresses(value: &str) -> Option<Vec<Endpoint>> {
 /// 能连的项时为 `None`，插件照常服务，回调以 `plugins.host.unavailable` 失败、不发请求。运行时用 [`Network::supported`]。
 pub fn select_host_endpoint(value: &str, supported: &[Network]) -> Option<Endpoint> {
     parse_host_addresses(value)?.into_iter().find(|endpoint| supported.contains(&endpoint.network))
-}
-
-/// 握手行与回调端点所说的空白（`handshake.md` §2，即 RFC-0001「空白字符」，与 .NET 正则的 `\s` 相同）：U+0009–U+000D、U+0020、
-/// U+0085、U+00A0、U+1680、U+2000–U+200A、U+2028、U+2029、U+202F、U+205F、U+3000；其余字符（含 U+200B 这样的零宽字符）都不是空白。
-///
-/// 集合按规范逐个写出，不用 [`char::is_whitespace`]：后者跟着 Unicode 的版本走，规范的集合是固定的。与 Error 的文案用同一个判断。
-pub fn is_whitespace(c: char) -> bool {
-    crate::grammar::is_whitespace(c)
 }
 
 /// `tcp` 端点的地址是不是回环地址加端口（`handshake.md` §2）：主机是 `127.0.0.0/8` 的四段点分十进制（每段 `0`–`255`、不带前导零）
@@ -485,7 +457,8 @@ mod tests {
         }
         assert_eq!(Network::platform_default().as_str(), if cfg!(windows) { "npipe" } else { "unix" });
         assert!(Network::supported().contains(&Network::platform_default()) && Network::supported().ends_with(&[Network::Tcp]));
-        // 规范的空白集合是固定的：U+200B、U+180E 不是空白
-        assert!(is_whitespace('\u{3000}') && is_whitespace('\u{0B}') && !is_whitespace('\u{200B}') && !is_whitespace('\u{180E}'));
+        // 地址里不能有规范的空白（RFC-0001「空白字符」的固定集合）；U+200B 不在其中，可以出现
+        assert_eq!(Endpoint::parse("unix /a\u{3000}b"), None);
+        assert_eq!(Endpoint::parse("unix /a\u{200B}b").map(|endpoint| endpoint.address().to_owned()).as_deref(), Some("/a\u{200B}b"));
     }
 }

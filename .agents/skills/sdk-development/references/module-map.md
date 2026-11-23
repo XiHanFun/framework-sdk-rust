@@ -10,7 +10,7 @@
 | `invocation` | `src/invocation/`（`cancellation.rs` 令牌、`deadline.rs` 后台定时器、`trace.rs` W3C 追踪） | RFC-0003 | `primitives/trace-context.json` | `tests/invocation.rs` |
 | `pipeline` | `src/pipeline/` | RFC-0004 | `pipeline/ordering.json` | `tests/pipeline.rs` |
 | `operation` | `src/operation/`（契约、`Schema`、`Registry`、`Invoker`、三个内置步骤） | RFC-0011 | `operations/payload-reasons.json`、`primitives/kernel-messages.json` | `tests/operation.rs` |
-| 文法 | `src/grammar.rs` | 各 RFC 与 `conventions/` 里的正则、RFC-0001「空白字符」 | 随所在模块 | 随所在模块 |
+| 文法 | 共用的字节类、组合与空白字符表在 `src/grammar.rs`；各领域的文法在各自的模块：`primitives/error_code.rs`、`primitives/messages.rs`（消息键、区域名）、`primitives/baggage.rs`、`manifest/shape.rs`、`invocation/trace.rs`、`plugin/types.rs`（主题）、`plugin/endpoint.rs`、`plugin/time.rs` | 各 RFC 与 `conventions/` 里的正则、RFC-0001「空白字符」 | 随所在模块 | 随所在模块 |
 | `plugin` | `src/plugin/`（见 `plugin-runtime` 技能） | RFC-0017、`plugin/` | `plugin/` | `tests/plugin.rs`、`tests/plugin_conformance.rs`、模块内单元测试 |
 
 `primitives/kernel-messages.json` 由 `tests/common` 读取，供 primitives、invocation、manifest、operation 的测试共用。

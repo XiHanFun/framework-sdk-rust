@@ -13,40 +13,21 @@ use super::host::Host;
 use crate::BoxFuture;
 use crate::invocation::Context;
 use crate::primitives::json::{self, ReadError};
-use crate::primitives::{Error, LifecycleState, Result};
+use crate::primitives::{Error, LifecycleState, Result, named_enum};
 
-/// 订阅方式（RFC-0009「订阅方式」）：宿主按它向消息代理订阅主题，投递时在 `HandleEventRequest.mode` 里带上（`invocation.md` §4）。
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum SubscriptionMode {
-    /// `competing`：订阅了主题的宿主实例里只有一个把消息交给插件；协议里的空同它。
-    #[default]
-    Competing,
-    /// `broadcast`：每个在线的宿主实例都把消息交给自己的插件实例，尽力而为、不进死信。
-    Broadcast,
-}
-
-impl SubscriptionMode {
-    /// 协议里的名字：`competing` 或 `broadcast`。
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Competing => "competing",
-            Self::Broadcast => "broadcast",
-        }
-    }
-
-    /// 按协议里的名字解析：空与 `competing` 是竞争消费，`broadcast` 是广播，其余为 `None`。
-    pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "" | "competing" => Some(Self::Competing),
-            "broadcast" => Some(Self::Broadcast),
-            _ => None,
-        }
-    }
-}
-
-impl fmt::Display for SubscriptionMode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+named_enum! {
+    /// 订阅方式（RFC-0009「订阅方式」）：宿主按它向消息代理订阅主题，投递时在 `HandleEventRequest.mode` 里带上（`invocation.md` §4）。
+    ///
+    /// 名字是协议里的 `competing` 与 `broadcast`；读入（`parse`、`FromStr`、serde）时协议里的空同 `competing`，写出总是名字。
+    /// 协议以后可以增加订阅方式，所以是 `#[non_exhaustive]`：本 crate 之外的 `match` 要带通配分支。
+    #[derive(Default)]
+    #[non_exhaustive]
+    pub enum SubscriptionMode ("subscription mode") {
+        /// `competing`：订阅了主题的宿主实例里只有一个把消息交给插件；协议里的空同它。
+        #[default]
+        Competing = 0 => "competing" | "",
+        /// `broadcast`：每个在线的宿主实例都把消息交给自己的插件实例，尽力而为、不进死信。
+        Broadcast = 1 => "broadcast",
     }
 }
 
@@ -71,12 +52,14 @@ impl Subscription {
     }
 
     /// 只投递这个 CloudEvents `type` 的消息。
+    #[must_use]
     pub fn with_message_type(mut self, message_type: impl Into<String>) -> Self {
         self.message_type = Some(message_type.into());
         self
     }
 
     /// 设置订阅方式。
+    #[must_use]
     pub fn with_mode(mut self, mode: SubscriptionMode) -> Self {
         self.mode = mode;
         self
@@ -140,18 +123,21 @@ impl Envelope {
     }
 
     /// 设置数据；`datacontenttype` 不变。
+    #[must_use]
     pub fn with_data(mut self, data: impl Into<Vec<u8>>) -> Self {
         self.data = data.into();
         self
     }
 
     /// 设置 `subject`。
+    #[must_use]
     pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
         self.subject = Some(subject.into());
         self
     }
 
     /// 加一个扩展属性。
+    #[must_use]
     pub fn with_extension(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extensions.insert(name.into(), value.into());
         self
@@ -214,8 +200,11 @@ impl<F> fmt::Debug for EventHandlerFn<F> {
     }
 }
 
-/// 健康项状态（`plugin.proto` 的 `HealthStatus`）。
+/// 健康项状态（`plugin.proto` 的 `HealthStatus`）；协议里是数值，没有按名字的编码。
+///
+/// 协议以后可以增加状态，所以是 `#[non_exhaustive]`：本 crate 之外的 `match` 要带通配分支。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub enum HealthStatus {
     /// 健康。
     Healthy,

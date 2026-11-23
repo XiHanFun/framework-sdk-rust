@@ -33,7 +33,7 @@ git -C spec log -1 --oneline
 ## 实现要点
 
 - 可恢复失败返回 `Err(Error)`，配置期失败返回 `FrameworkError`，编程错误 panic 且内容是 `FrameworkError`；对不可信输入另给 `try_*` 或 `is_*`。
-- 文法手写逐字节判定（`src/grammar.rs`），整串匹配；空白用 `grammar::is_whitespace`。
+- 文法手写逐字节判定，整串匹配：共用的字节类与组合在 `src/grammar.rs`，各领域的文法在各自的模块里（见 `references/module-map.md`）；空白用 `grammar::is_whitespace`（公开为 `primitives::is_whitespace`）。
 - 线上文本经 `primitives::json::from_slice`；值经 `json::Model` 写出。
 - 取消与截止时间只经 `Context` 的令牌；归因只看截止令牌。
 - feature `plugin` 之外不引入异步运行时；新依赖要有明确收益。

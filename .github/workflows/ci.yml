@@ -37,6 +37,10 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # 缓存 cargo 的注册表与 target：键含平台、工具链与依赖清单，两种 feature 组合共用一份
+      - name: 缓存 cargo 产物
+        uses: Swatinem/rust-cache@v2
+
       # tests/plugin_conformance.rs 用它在 spec/conformance 里 go run 黑盒运行器；版本跟着锁定的规范
       - name: 安装 Go
         uses: actions/setup-go@v6
@@ -77,6 +81,9 @@ jobs:
       - name: 安装 Rust 1.85
         uses: dtolnay/rust-toolchain@1.85
 
+      - name: 缓存 cargo 产物
+        uses: Swatinem/rust-cache@v2
+
       # 只构建库：测试读 spec/，在上面的作业里跑；依赖按 rust-version 解析到兼容的版本（tonic 到 0.14.5）
       - name: 构建
         run: |
@@ -94,6 +101,12 @@ jobs:
 
       - name: 安装 Rust
         uses: dtolnay/rust-toolchain@stable
+
+      # 生成器是独立的工作区，它的 target 在 tools/protogen 下
+      - name: 缓存 cargo 产物
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/protogen
 
       # 从 spec/plugin/plugin.proto 重新生成，与提交的 src/plugin/generated 不同即失败；
       # 按 git status 判空：git diff 只看已跟踪的文件，发现不了新增的生成文件

@@ -36,7 +36,7 @@ use xihan_framework::plugin::{
     self, Configuration, Endpoint, Envelope, Event, Health, HealthItem, HealthStatus, Hooks, Launch, Logger, MessageCatalog, Network, Plugin, Running,
     Subscription, SubscriptionMode, event_handler_fn, v1,
 };
-use xihan_framework::primitives::{BAGGAGE_TENANT, Error, LifecycleState, Result};
+use xihan_framework::primitives::{self, BAGGAGE_TENANT, Catalog, Error, LifecycleState, Result};
 
 /// 测试里宿主下发的会话令牌。
 const TOKEN: &str = "c2Vzc2lvbi10b2tlbi1mb3ItdGhlLXRlc3RzLW9ubHk";
@@ -208,6 +208,73 @@ fn launch_reads_the_environment() {
     ] {
         assert_eq!(environment(pairs).unwrap_err().code(), "PRIMITIVES_VALIDATION_001", "{pairs:?}");
     }
+}
+
+/// 下沉到原语层的项从旧路径照常可用：`plugin::LOCALES` 与 `plugin::is_whitespace` 就是原语层的那一项；`MessageCatalog` 的公开面
+/// 不变，它是带目录名、要求有 `en-US` 的 `Catalog`。
+#[test]
+fn locale_helpers_are_the_primitives_ones() {
+    assert_eq!(plugin::LOCALES, primitives::LOCALES);
+    assert!(plugin::is_whitespace('\u{85}') && !plugin::is_whitespace('\u{200B}'));
+    let check: fn(char) -> bool = plugin::is_whitespace;
+    assert!(check('\u{3000}'));
+
+    let english = r#"{"orders.quantity.invalid":"The quantity {quantity} is not valid."}"#;
+    let chinese = r#"{"orders.quantity.invalid":"数量 {quantity} 不合法。"}"#;
+    let catalog = MessageCatalog::from_json("orders", [("en-US", english), ("zh-CN", chinese)]).unwrap();
+    assert_eq!((catalog.name(), catalog.locales().collect::<Vec<_>>()), ("orders", vec!["en-US", "zh-CN"]));
+    assert_eq!(catalog.templates("zh-CN").collect::<Vec<_>>(), [("orders.quantity.invalid", "数量 {quantity} 不合法。")]);
+    assert_eq!(catalog.to_catalog(), Catalog::from_json([("en-US", english), ("zh-CN", chinese)]).unwrap());
+    assert_eq!(
+        catalog,
+        MessageCatalog::new("orders").with("en-US", "orders.quantity.invalid", "The quantity {quantity} is not valid.").with(
+            "zh-CN",
+            "orders.quantity.invalid",
+            "数量 {quantity} 不合法。"
+        )
+    );
+
+    // 握手交给宿主的目录要有 en-US（handshake.md §3 第 6 条），原语层的目录不要求；错误的说明带目录名
+    let missing = MessageCatalog::from_json("orders", [("zh-CN", chinese)]).unwrap_err();
+    assert_eq!((missing.code(), missing.message()), (primitives::ERROR_CODE_INVALID_CATALOG, "The message catalog 'orders' has no en-US templates."));
+    let invalid = MessageCatalog::from_json("orders", [("en-US", "[]")]).unwrap_err();
+    assert_eq!(invalid.code(), primitives::ERROR_CODE_INVALID_CATALOG);
+    assert!(invalid.message().starts_with("The 'en-US' templates of the message catalog 'orders' are not a JSON object of strings: "), "{invalid}");
+    let key = MessageCatalog::from_json("orders", [("en-US", r#"{"Orders.bad":"x"}"#)]).unwrap_err();
+    assert_eq!(key.message(), "The message catalog 'orders' has an invalid message key 'Orders.bad' in 'en-US'.");
+
+    // 运行时自己的目录与插件的目录合并成一份，交给进程默认解析器
+    let mut merged = plugin::runtime_catalog().to_catalog();
+    merged.extend(catalog.to_catalog());
+    assert_eq!(merged.locales().count(), primitives::LOCALES.len());
+    assert!(merged.template("zh-CN", plugin::MESSAGE_UNAVAILABLE).is_some() && merged.template("zh-CN", "orders.quantity.invalid").is_some());
+}
+
+/// 插件运行时里按名字编码的枚举：名字是协议里的写法，`name` 与 `as_str` 是同一个访问器；订阅方式在协议里的空同 `competing`，
+/// 日志级别按严重程度排序。
+#[test]
+fn plugin_enums_are_encoded_by_name() {
+    common::assert_named(Network::ALL, &["unix", "tcp", "npipe"], Network::name, Network::as_str);
+    let levels = ["trace", "debug", "information", "warning", "error", "critical"];
+    common::assert_named(plugin::Level::ALL, &levels, plugin::Level::name, plugin::Level::as_str);
+    assert!(plugin::Level::ALL.windows(2).all(|pair| pair[0] < pair[1]));
+    common::assert_named(SubscriptionMode::ALL, &["competing", "broadcast"], SubscriptionMode::name, SubscriptionMode::as_str);
+    assert_eq!((SubscriptionMode::parse(""), "".parse::<SubscriptionMode>().ok()), (Some(SubscriptionMode::Competing), Some(SubscriptionMode::Competing)));
+    assert_eq!(SubscriptionMode::default(), SubscriptionMode::Competing);
+    assert_eq!("TCP".parse::<Network>().unwrap_err().to_string(), "PRIMITIVES_VALIDATION_001: 'TCP' is not a network.");
+    // 握手交给宿主的目录要有模板：没有键的 en-US 不算有
+    assert_eq!(MessageCatalog::from_json("orders", [("en-US", "{}")]).unwrap_err().message(), "The message catalog 'orders' has no en-US templates.");
+}
+
+/// 常量各有一个出处：插件一侧的未预期失败有不与内核同名的名字，旧名弃用、值不变；清单文件名就是 `manifest::FILE_NAME`；
+/// `Plugin::start` 报的两个校验码是公开常量，名字同 .NET 的 `PluginErrors`。
+#[test]
+#[allow(deprecated)]
+fn plugin_constants_have_one_source() {
+    assert_eq!((plugin::ERROR_CODE_PLUGIN_UNEXPECTED, plugin::ERROR_CODE_UNEXPECTED), ("PLUGINS_UNEXPECTED_001", "PLUGINS_UNEXPECTED_001"));
+    assert_eq!(operation::ERROR_CODE_UNEXPECTED, "KERNEL_UNEXPECTED_001", "the kernel code of the same old name is a different one");
+    assert_eq!((plugin::MANIFEST_FILE_NAME, manifest::FILE_NAME), ("xihan.manifest.json", "xihan.manifest.json"));
+    assert_eq!((plugin::ERROR_CODE_INVALID_SOURCE, plugin::ERROR_CODE_HANDSHAKE_MISMATCH), ("PLUGINS_VALIDATION_001", "PLUGINS_VALIDATION_004"));
 }
 
 #[test]

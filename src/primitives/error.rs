@@ -22,7 +22,7 @@ static NO_DETAILS: Details = Details::new();
 /// 值语义：`with_*` 方法消耗原值、返回新值。线上编码见 [`Serialize`] 的实现：
 /// `{"code":…,"message":…,"messageKey":…,"details":{…},"inner":{…}}`，`message` 是发送端已解析的文案，
 /// `messageKey` 让接收端可以再翻译。
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Error {
     code: String,
     message_key: Option<String>,
@@ -145,18 +145,21 @@ impl Error {
     }
 
     /// 换上细节（同时是模板参数），替换原有的细节。
+    #[must_use]
     pub fn with_details(mut self, details: Details) -> Self {
         self.details = Some(details);
         self
     }
 
     /// 加一项细节。
+    #[must_use]
     pub fn with_detail(mut self, name: impl Into<String>, value: impl Into<Value>) -> Self {
         self.details.get_or_insert_with(Details::new).insert(name.into(), value.into());
         self
     }
 
     /// 附上内部错误。
+    #[must_use]
     pub fn with_inner(mut self, inner: Error) -> Self {
         self.inner = Some(Box::new(inner));
         self
@@ -168,6 +171,7 @@ impl Error {
     ///
     /// 错误码不合文法时 panic。
     #[track_caller]
+    #[must_use]
     pub fn with_code(mut self, code: impl Into<String>) -> Self {
         let code = code.into();
         if let Err(error) = validate_error_code(&code) {
@@ -183,6 +187,7 @@ impl Error {
     ///
     /// 文案为空或只有空白（RFC-0001「空白字符」）时 panic；来自不可信输入时用 [`Error::try_with_text`]。
     #[track_caller]
+    #[must_use]
     pub fn with_text(self, text: impl Into<String>) -> Self {
         match self.try_with_text(text) {
             Ok(error) => error,

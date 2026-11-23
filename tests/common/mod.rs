@@ -52,6 +52,21 @@ pub fn panic_message(action: impl FnOnce() + std::panic::UnwindSafe) -> String {
     payload.downcast_ref::<&str>().map(|text| (*text).to_owned()).unwrap_or_default()
 }
 
+/// 核对一个按名字编码的枚举：`name`、`as_str`、`Display`、`FromStr` 与 serde 给出、接受的都是同一个名字，未知名字读不进来。
+pub fn assert_named<T>(all: &[T], names: &[&str], name: fn(T) -> &'static str, as_str: fn(T) -> &'static str)
+where
+    T: Copy + PartialEq + std::fmt::Debug + std::fmt::Display + std::str::FromStr + serde::Serialize + DeserializeOwned,
+{
+    assert_eq!(all.len(), names.len(), "{all:?}");
+    for (value, expected) in all.iter().zip(names) {
+        assert_eq!((name(*value), as_str(*value), value.to_string().as_str()), (*expected, *expected, *expected));
+        assert!(expected.parse::<T>().ok() == Some(*value), "{expected} must parse");
+        assert_eq!(serde_json::to_value(value).unwrap(), serde_json::json!(expected));
+        assert_eq!(serde_json::from_value::<T>(serde_json::json!(expected)).unwrap(), *value);
+    }
+    assert!("no such name".parse::<T>().is_err() && serde_json::from_value::<T>(serde_json::json!("no such name")).is_err());
+}
+
 /// 向量 `kernel-messages.json` 里的一条内核错误。
 #[derive(serde::Deserialize)]
 pub struct KernelMessage {

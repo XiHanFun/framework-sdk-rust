@@ -15,8 +15,8 @@ use super::messages::{PHASE_PUBLISH, REASON_NO_ENDPOINT, denied, failed, host_un
 use super::types::Envelope;
 use super::v1::host_client::HostClient;
 use super::{PERMISSION_MESSAGING, PERMISSION_PIPELINE, SESSION_METADATA_KEY, v1};
-use crate::invocation::{Context, ERROR_CODE_CANCELLED, ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_CANCELLED, MESSAGE_DEADLINE_EXCEEDED};
-use crate::operation::{ERROR_CODE_INVALID_PAYLOAD, ERROR_CODE_NOT_FOUND, MESSAGE_INVALID_PAYLOAD, MESSAGE_NOT_FOUND};
+use crate::invocation::{self, Context};
+use crate::operation;
 use crate::primitives::{Error, Result};
 
 /// 宿主回调服务的客户端：每次调用带会话令牌，追踪、截止时间与已登记的 Baggage 取自调用上下文（`invocation.md` §5）。
@@ -256,15 +256,13 @@ pub(crate) fn callback_failure(rpc: Rpc<'_>, code: Code, message: &str, context_
     match (code, rpc) {
         (Code::Unauthenticated, _) => session_invalid(),
         (Code::PermissionDenied, _) => denied(plugin, rpc.permission()),
-        (Code::DeadlineExceeded, _) => Error::timeout(ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_EXCEEDED),
+        (Code::DeadlineExceeded, _) => invocation::deadline_exceeded(),
         // Cancelled 只在调用方确实取消时算取消；调用方没有取消的 Cancelled 是连接被宿主或网络切断，与 Unavailable 同样处理
-        (Code::Cancelled, _) if context_cancelled => Error::cancelled(ERROR_CODE_CANCELLED, MESSAGE_CANCELLED),
+        (Code::Cancelled, _) if context_cancelled => invocation::cancelled(),
         (Code::Cancelled | Code::Unavailable, _) => host_unavailable(plugin, status_reason(code, message)),
         // Unimplemented 与 InvalidArgument 只对 Host.Invoke 有操作层面的含义；Host.Publish 的这两种落到最后一项
-        (Code::Unimplemented, Rpc::Invoke(operation)) => Error::not_found(ERROR_CODE_NOT_FOUND, MESSAGE_NOT_FOUND).with_detail("id", operation),
-        (Code::InvalidArgument, Rpc::Invoke(operation)) => {
-            Error::validation(ERROR_CODE_INVALID_PAYLOAD, MESSAGE_INVALID_PAYLOAD).with_detail("id", operation).with_detail("reason", message)
-        }
+        (Code::Unimplemented, Rpc::Invoke(id)) => operation::not_found(id),
+        (Code::InvalidArgument, Rpc::Invoke(id)) => operation::invalid_payload(id, message),
         _ => failed(plugin, rpc.phase(), status_reason(code, message)),
     }
 }
@@ -351,6 +349,7 @@ mod tests {
     use super::super::endpoint::Network;
     use super::super::v1::host_server::{Host as HostRpc, HostServer};
     use super::*;
+    use crate::invocation::{ERROR_CODE_DEADLINE_EXCEEDED, MESSAGE_DEADLINE_EXCEEDED};
 
     /// 慢的回调服务：记下收到的请求数并通知，之后很久才应答，回调在应答之前就会被放弃。
     #[derive(Default)]

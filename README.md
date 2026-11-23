@@ -125,6 +125,7 @@ The maturity is Experimental: there is a prerelease pinned to a spec rc tag, and
 - Pinned spec version: the spec tag the `spec/` submodule points to.
 - Claimed profiles (RFC-0024): `core` and `plugin`.
 - Gaps: none.
+- Out of scope: streaming operations, Wasm plugins and remote providers are not provided yet; they are outside the claimed profiles.
 
 ## Ecosystem
 

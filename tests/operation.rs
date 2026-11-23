@@ -162,6 +162,35 @@ fn registry_rejects_duplicates_and_bad_ids() {
     assert!(operation::is_id("order-lines.list") && !operation::is_id("orders"));
 }
 
+/// 暴露的协议（`plugin.proto` 的 `OperationDeclaration.expose`）：空表示不对外发布，是 `Contract::new` 的缺省；写了就只能是五个协议名，
+/// 拼错的名字在登记时报出来，不留到宿主那里被悄悄忽略。
+#[test]
+fn registry_rejects_unknown_expose_names() {
+    let registry = Registry::new();
+    let handler = || operation::handler_fn(|_ctx, _request: CreateOrder| Box::pin(async { Ok(()) }));
+    assert!(Contract::new("orders.create").expose.is_empty(), "a contract is not published on any protocol unless it says so");
+
+    // 名字区分大小写，与协议里的写法逐字相同；一个不认识的名字就拒绝整个登记
+    for protocols in [vec!["htpp"], vec!["HTTP"], vec![""], vec![EXPOSE_HTTP, "rest"]] {
+        let error = registry.add(Contract::new("orders.create").with_expose(protocols.clone()), handler()).unwrap_err();
+        let unknown = protocols.last().unwrap();
+        assert_eq!(
+            (error.code(), error.message()),
+            (ERROR_CODE_INVALID_ARGUMENT, format!("The operation 'orders.create' cannot be exposed to '{unknown}'.").as_str()),
+            "{protocols:?}"
+        );
+    }
+    assert!(registry.is_empty());
+
+    // 五个协议名都认，EXPOSE_ALL 就是它们
+    assert_eq!(operation::EXPOSE_ALL, [EXPOSE_HTTP, operation::EXPOSE_GRPC, operation::EXPOSE_MCP, operation::EXPOSE_COMMAND_LINE, EXPOSE_AI]);
+    registry.add(Contract::new("orders.create").with_expose(operation::EXPOSE_ALL), handler()).unwrap();
+    assert_eq!(registry.get("orders.create").unwrap().contract().expose, ["http", "grpc", "mcp", "commandline", "ai"]);
+    // 不写（空）照常登记：不对外发布，只能在进程内调用
+    registry.add(Contract::new("orders.list"), handler()).unwrap();
+    assert!(registry.get("orders.list").unwrap().contract().expose.is_empty());
+}
+
 #[test]
 fn registry_capacity_is_bounded() {
     let registry = Registry::new();
