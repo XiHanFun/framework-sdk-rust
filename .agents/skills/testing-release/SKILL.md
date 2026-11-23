@@ -41,7 +41,7 @@ git status --porcelain -- src/plugin/generated
 
 ## 打包
 
-CI 不跑打包。发布前用 `cargo package --list` 核对包内容：不含 `spec/`、`tests/`、`tools/`、`scripts/`、Agent 的指令与技能（`AGENTS.md`、`CLAUDE.md`、`.agents/`、`.claude/`）和仓库配置文件（`Cargo.toml` 的 `exclude`）。发布见 `version-release` 技能。
+CI 的 `test` 作业在 ubuntu 上跑 `cargo publish --dry-run`：打包并构建包里的内容，不上传（版本已经发布过时只给警告）；本地复现要工作区干净，或加 `--allow-dirty`。它不看包里多了什么：发布前仍用 `cargo package --list` 核对包内容：不含 `spec/`、`tests/`、`tools/`、`scripts/`、Agent 的指令与技能（`AGENTS.md`、`CLAUDE.md`、`.agents/`、`.claude/`）和仓库配置文件（`Cargo.toml` 的 `exclude`）。发布见 `version-release` 技能。
 
 ## 本机没有 Go 时
 

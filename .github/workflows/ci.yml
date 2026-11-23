@@ -71,6 +71,13 @@ jobs:
         shell: bash
         run: cargo test --features plugin
 
+      # 打包并构建包里的内容，不上传：exclude 排掉了构建要用的文件、包里缺文件时在这里失败，不留到发版。包与平台无关，只在 ubuntu 上做；
+      # 版本已经发布过时 cargo 只给警告
+      - name: 打包验证
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: cargo publish --dry-run
+
   msrv:
     name: 最低 Rust 版本（1.85）
     runs-on: ubuntu-latest
