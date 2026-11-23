@@ -9,7 +9,7 @@
 //! use xihan_framework::pipeline::{self, Builder, Placement, APP_OWNER};
 //! use xihan_framework::primitives::PipelineStage;
 //!
-//! let observe = pipeline::from_fn("Observe", |ctx, next| Box::pin(async move { next.run(ctx).await }));
+//! let observe = pipeline::middleware_fn("Observe", |ctx, next| Box::pin(async move { next.run(ctx).await }));
 //! let mut builder = Builder::new();
 //! builder.use_at(observe, PipelineStage::Observe, Placement::End, APP_OWNER).unwrap(); // 重复登记等错误在登记时即返回
 //! assert_eq!(builder.dump().unwrap(), "observe      Observe\n");
@@ -96,18 +96,28 @@ impl<M: Middleware + ?Sized> Middleware for Arc<M> {
     }
 }
 
-/// 由函数实现的 [`Middleware`]，见 [`from_fn`]。
+/// 由函数实现的 [`Middleware`]，见 [`middleware_fn`]。
 pub struct FnMiddleware<F> {
     name: String,
     function: F,
 }
 
-/// 用名字与函数创建中间件：`from_fn("Audit", |ctx, next| Box::pin(async move { next.run(ctx).await }))`。
-pub fn from_fn<F>(name: impl Into<String>, function: F) -> FnMiddleware<F>
+/// 用名字与函数创建中间件：`middleware_fn("Audit", |ctx, next| Box::pin(async move { next.run(ctx).await }))`。
+///
+/// 与 [`step_fn`]、[`operation::handler_fn`](crate::operation::handler_fn) 成套。
+pub fn middleware_fn<F>(name: impl Into<String>, function: F) -> FnMiddleware<F>
 where
     F: for<'a> Fn(&'a Context, Next<'a>) -> BoxFuture<'a, Result<()>> + Send + Sync,
 {
     FnMiddleware { name: name.into(), function }
+}
+
+/// 同 [`middleware_fn`]，是它早先的名字，照常可用。
+pub fn from_fn<F>(name: impl Into<String>, function: F) -> FnMiddleware<F>
+where
+    F: for<'a> Fn(&'a Context, Next<'a>) -> BoxFuture<'a, Result<()>> + Send + Sync,
+{
+    middleware_fn(name, function)
 }
 
 impl<F> Middleware for FnMiddleware<F>

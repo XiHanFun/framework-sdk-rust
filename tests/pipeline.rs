@@ -391,3 +391,32 @@ fn placements_are_encoded_by_name() {
     assert!(Placement::Beginning < Placement::End);
     assert_eq!("end".parse::<Placement>().unwrap_err().to_string(), "PRIMITIVES_VALIDATION_001: 'end' is not a placement.");
 }
+
+/// `middleware_fn` 与 `step_fn`、`handler_fn` 成套，`from_fn` 是它早先的名字，两个造出同样的中间件。
+#[test]
+fn middleware_fn_is_the_same_as_from_fn() {
+    let log = Arc::new(Mutex::new(Vec::new()));
+    let (new, old) = (Arc::clone(&log), Arc::clone(&log));
+    let by_new_name = pipeline::middleware_fn("New", move |ctx, next| {
+        new.lock().unwrap().push("new");
+        next.run(ctx)
+    });
+    let by_old_name = pipeline::from_fn("Old", move |ctx, next| {
+        old.lock().unwrap().push("old");
+        next.run(ctx)
+    });
+    assert_eq!((by_new_name.name(), by_old_name.name()), ("New", "Old"));
+    let mut builder = Builder::new();
+    builder.use_at(by_new_name, PipelineStage::Observe, Placement::End, APP_OWNER).unwrap();
+    builder.use_at(by_old_name, PipelineStage::Validate, Placement::End, APP_OWNER).unwrap();
+    assert_eq!(
+        builder.dump().unwrap(),
+        "observe      New
+validate     Old
+"
+    );
+    let pipeline = builder.build().unwrap();
+    let terminal = pipeline::step_fn(|_ctx| Box::pin(async { Ok(()) }));
+    common::block_on(pipeline.run(&Context::background(), &terminal)).unwrap();
+    assert_eq!(log.lock().unwrap().as_slice(), ["new", "old"]);
+}
