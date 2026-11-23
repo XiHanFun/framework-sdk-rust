@@ -25,7 +25,6 @@
 //! ```
 
 mod de;
-#[cfg(feature = "plugin")]
 mod lenient;
 mod reader;
 mod ser;

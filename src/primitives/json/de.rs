@@ -9,6 +9,7 @@ use serde::de::value::BorrowedStrDeserializer;
 use serde::de::{self, DeserializeSeed, EnumAccess, Error as _, Expected, MapAccess, SeqAccess, Unexpected, VariantAccess, Visitor};
 use serde::forward_to_deserialize_any;
 
+use super::lenient::Lenient;
 use super::reader::{Node, Number, write_node};
 use super::value::JSON_TOKEN;
 
@@ -49,8 +50,8 @@ impl<'de> de::Deserializer<'de> for &'de Node {
             Node::Number(Number::Unsigned(number), _) => visitor.visit_u64(*number),
             Node::Number(Number::Float(number), _) => visitor.visit_f64(*number),
             Node::String(text) => visitor.visit_borrowed_str(text),
-            Node::Array(items) => visit_array(items, visitor),
-            Node::Object(members) => visit_object(members, visitor),
+            Node::Array(items) => visit_array::<_, false>(items, visitor),
+            Node::Object(members) => visit_object::<_, false>(members, &[], visitor),
         }
     }
 
@@ -84,7 +85,7 @@ impl<'de> de::Deserializer<'de> for &'de Node {
 
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match self {
-            Node::Array(items) => visit_array(items, visitor),
+            Node::Array(items) => visit_array::<_, false>(items, visitor),
             _ => Err(self.invalid_type(&visitor)),
         }
     }
@@ -99,7 +100,7 @@ impl<'de> de::Deserializer<'de> for &'de Node {
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match self {
-            Node::Object(members) => visit_object(members, visitor),
+            Node::Object(members) => visit_object::<_, false>(members, &[], visitor),
             _ => Err(self.invalid_type(&visitor)),
         }
     }
@@ -129,8 +130,12 @@ impl<'de> de::Deserializer<'de> for &'de Node {
     }
 }
 
-fn visit_array<'de, V: Visitor<'de>>(items: &'de [Node], visitor: V) -> Result<V::Value, Error> {
-    let mut access = Items(items.iter());
+/// 把数组交给访问者，访问者没有读完全部项即报错。
+///
+/// 两种读法共用这一份，做法同 `ser.rs` 的 `const STRICT`：`LENIENT` 为假时各项按常规读法（`&Node`），为真时按配置节放宽的读法
+/// （[`Lenient`]，`plugin/lifecycle.md` §7.2）。
+pub(super) fn visit_array<'de, V: Visitor<'de>, const LENIENT: bool>(items: &'de [Node], visitor: V) -> Result<V::Value, Error> {
+    let mut access = Items::<LENIENT>(items.iter());
     let value = visitor.visit_seq(&mut access)?;
     match access.0.len() {
         0 => Ok(value),
@@ -138,8 +143,15 @@ fn visit_array<'de, V: Visitor<'de>>(items: &'de [Node], visitor: V) -> Result<V
     }
 }
 
-fn visit_object<'de, V: Visitor<'de>>(members: &'de [(String, Node)], visitor: V) -> Result<V::Value, Error> {
-    let mut access = Members { members: members.iter(), value: None };
+/// 把对象交给访问者，访问者没有读完全部成员即报错；`LENIENT` 同 [`visit_array`]。
+///
+/// `fields` 是目标结构体的字段名，只有放宽的读法用它（成员名按 ASCII 不区分大小写对上字段）；映射与常规读法给空的。
+pub(super) fn visit_object<'de, V: Visitor<'de>, const LENIENT: bool>(
+    members: &'de [(String, Node)],
+    fields: &'static [&'static str],
+    visitor: V,
+) -> Result<V::Value, Error> {
+    let mut access = Members::<LENIENT> { members: members.iter(), fields, value: None };
     let value = visitor.visit_map(&mut access)?;
     match access.members.len() {
         0 => Ok(value),
@@ -147,13 +159,17 @@ fn visit_object<'de, V: Visitor<'de>>(members: &'de [(String, Node)], visitor: V
     }
 }
 
-struct Items<'de>(slice::Iter<'de, Node>);
+/// 按下标顺序给出数组的项。
+struct Items<'de, const LENIENT: bool>(slice::Iter<'de, Node>);
 
-impl<'de> SeqAccess<'de> for Items<'de> {
+impl<'de, const LENIENT: bool> SeqAccess<'de> for Items<'de, LENIENT> {
     type Error = Error;
 
     fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>, Error> {
-        self.0.next().map(|item| seed.deserialize(item)).transpose()
+        let Some(item) = self.0.next() else {
+            return Ok(None);
+        };
+        if LENIENT { seed.deserialize(Lenient(item)).map(Some) } else { seed.deserialize(item).map(Some) }
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -161,13 +177,14 @@ impl<'de> SeqAccess<'de> for Items<'de> {
     }
 }
 
-/// 按文本顺序给出成员。
-struct Members<'de> {
+/// 按文本顺序给出成员；`fields` 是结构体的字段名，映射与常规读法为空。
+struct Members<'de, const LENIENT: bool> {
     members: slice::Iter<'de, (String, Node)>,
+    fields: &'static [&'static str],
     value: Option<&'de Node>,
 }
 
-impl<'de> MapAccess<'de> for Members<'de> {
+impl<'de, const LENIENT: bool> MapAccess<'de> for Members<'de, LENIENT> {
     type Error = Error;
 
     fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>, Error> {
@@ -175,12 +192,19 @@ impl<'de> MapAccess<'de> for Members<'de> {
             return Ok(None);
         };
         self.value = Some(value);
+        if LENIENT {
+            // 完全相同的字段优先，否则取第一个只差 ASCII 大小写的字段；都对不上的照原名交给访问者（未知成员照常忽略）
+            let field = self.fields.iter().find(|field| **field == name).or_else(|| self.fields.iter().find(|field| field.eq_ignore_ascii_case(name)));
+            if let Some(field) = field {
+                return seed.deserialize(BorrowedStrDeserializer::new(field)).map(Some);
+            }
+        }
         seed.deserialize(Key(name)).map(Some)
     }
 
     fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
         let value = self.value.take().ok_or_else(|| Error::custom("a member value was requested before its name"))?;
-        seed.deserialize(value)
+        if LENIENT { seed.deserialize(Lenient(value)) } else { seed.deserialize(value) }
     }
 
     fn size_hint(&self) -> Option<usize> {
@@ -189,7 +213,7 @@ impl<'de> MapAccess<'de> for Members<'de> {
 }
 
 /// 成员名：交给访问者的是字符串；整数与布尔类型的键（如 `BTreeMap<i32, _>`）从名字的文本解析。
-pub(super) struct Key<'de>(pub(super) &'de str);
+struct Key<'de>(&'de str);
 
 macro_rules! parsed_key {
     ($($method:ident => $visit:ident: $type:ty),* $(,)?) => {

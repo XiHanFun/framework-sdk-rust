@@ -6,14 +6,15 @@
 //! - 字符串叶子读成布尔时只认 `true`、`false`（ASCII 不区分大小写）。
 //!
 //! 其余照目标类型的常规读法，与 [`Node`] 的反序列化相同。
+//!
+//! 数组与对象的访问（`visit_array`、`visit_object`）与 [`Node`] 的读法共用 `de.rs` 里的一份，以 `const LENIENT: bool` 区分各项、成员
+//! 怎么读；JSON 数字的文法用读取器的那一份（`reader::parse_number`）。这里只有放宽的读法自己的部分。共用的访问要叫得出
+//! [`Lenient`]，所以本模块总是编译；用它的入口（`json::decode_lenient`）只在 feature `plugin` 下。
 
-use std::slice;
+use serde::de::{self, Visitor};
 
-use serde::de::value::BorrowedStrDeserializer;
-use serde::de::{self, DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
-
-use super::de::Key;
-use super::reader::{Node, Number, parse};
+use super::de::{visit_array, visit_object};
+use super::reader::{Node, Number, parse_number};
 
 /// 反序列化的错误，同 [`Node`] 的反序列化。
 type Error = serde_json::Error;
@@ -23,17 +24,10 @@ type Error = serde_json::Error;
 pub(crate) struct Lenient<'de>(pub(crate) &'de Node);
 
 impl<'de> Lenient<'de> {
-    /// 字符串叶子按 JSON 数字的文法读成数；不是这样的字符串为 `None`。
+    /// 字符串叶子按 JSON 数字的文法读成数（整串匹配、不带空白，按值模型）；不是这样的字符串为 `None`。
     fn number(&self) -> Option<Number> {
-        let Node::String(text) = self.0 else {
-            return None;
-        };
-        if !is_json_number(text) {
-            return None;
-        }
-        // 文法已核对过，按值模型读出来的一定是数
-        match parse(text.as_bytes()) {
-            Ok(Node::Number(number, _)) => Some(number),
+        match self.0 {
+            Node::String(text) => parse_number(text),
             _ => None,
         }
     }
@@ -90,8 +84,8 @@ impl<'de> de::Deserializer<'de> for Lenient<'de> {
 
     fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match self.0 {
-            Node::Array(items) => visit_array(items, visitor),
-            Node::Object(members) => visit_object(members, &[], visitor),
+            Node::Array(items) => visit_array::<_, true>(items, visitor),
+            Node::Object(members) => visit_object::<_, true>(members, &[], visitor),
             other => de::Deserializer::deserialize_any(other, visitor),
         }
     }
@@ -135,7 +129,7 @@ impl<'de> de::Deserializer<'de> for Lenient<'de> {
 
     fn deserialize_seq<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match self.0 {
-            Node::Array(items) => visit_array(items, visitor),
+            Node::Array(items) => visit_array::<_, true>(items, visitor),
             other => de::Deserializer::deserialize_seq(other, visitor),
         }
     }
@@ -150,7 +144,7 @@ impl<'de> de::Deserializer<'de> for Lenient<'de> {
 
     fn deserialize_map<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, Error> {
         match self.0 {
-            Node::Object(members) => visit_object(members, &[], visitor),
+            Node::Object(members) => visit_object::<_, true>(members, &[], visitor),
             other => de::Deserializer::deserialize_map(other, visitor),
         }
     }
@@ -158,123 +152,12 @@ impl<'de> de::Deserializer<'de> for Lenient<'de> {
     /// 结构体的成员名按 ASCII 不区分大小写对上字段名。
     fn deserialize_struct<V: Visitor<'de>>(self, _name: &'static str, fields: &'static [&'static str], visitor: V) -> Result<V::Value, Error> {
         match self.0 {
-            Node::Object(members) => visit_object(members, fields, visitor),
+            Node::Object(members) => visit_object::<_, true>(members, fields, visitor),
             other => de::Deserializer::deserialize_map(other, visitor),
         }
     }
 
     fn deserialize_enum<V: Visitor<'de>>(self, name: &'static str, variants: &'static [&'static str], visitor: V) -> Result<V::Value, Error> {
         de::Deserializer::deserialize_enum(self.0, name, variants, visitor)
-    }
-}
-
-fn visit_array<'de, V: Visitor<'de>>(items: &'de [Node], visitor: V) -> Result<V::Value, Error> {
-    let mut access = Items(items.iter());
-    let value = visitor.visit_seq(&mut access)?;
-    match access.0.len() {
-        0 => Ok(value),
-        _ => Err(Error::invalid_length(items.len(), &"fewer elements in the array")),
-    }
-}
-
-fn visit_object<'de, V: Visitor<'de>>(members: &'de [(String, Node)], fields: &'static [&'static str], visitor: V) -> Result<V::Value, Error> {
-    let mut access = Members { members: members.iter(), fields, value: None };
-    let value = visitor.visit_map(&mut access)?;
-    match access.members.len() {
-        0 => Ok(value),
-        _ => Err(Error::invalid_length(members.len(), &"fewer members in the object")),
-    }
-}
-
-struct Items<'de>(slice::Iter<'de, Node>);
-
-impl<'de> SeqAccess<'de> for Items<'de> {
-    type Error = Error;
-
-    fn next_element_seed<T: DeserializeSeed<'de>>(&mut self, seed: T) -> Result<Option<T::Value>, Error> {
-        self.0.next().map(|item| seed.deserialize(Lenient(item))).transpose()
-    }
-
-    fn size_hint(&self) -> Option<usize> {
-        Some(self.0.len())
-    }
-}
-
-/// 按文本顺序给出成员；`fields` 是结构体的字段名，映射与集合为空。
-struct Members<'de> {
-    members: slice::Iter<'de, (String, Node)>,
-    fields: &'static [&'static str],
-    value: Option<&'de Node>,
-}
-
-impl<'de> MapAccess<'de> for Members<'de> {
-    type Error = Error;
-
-    fn next_key_seed<K: DeserializeSeed<'de>>(&mut self, seed: K) -> Result<Option<K::Value>, Error> {
-        let Some((name, value)) = self.members.next() else {
-            return Ok(None);
-        };
-        self.value = Some(value);
-        // 完全相同的字段优先，否则取第一个只差 ASCII 大小写的字段；都对不上的照原名交给访问者（未知成员照常忽略）
-        let field = self.fields.iter().find(|field| **field == name).or_else(|| self.fields.iter().find(|field| field.eq_ignore_ascii_case(name)));
-        match field {
-            Some(field) => seed.deserialize(BorrowedStrDeserializer::new(field)).map(Some),
-            None => seed.deserialize(Key(name)).map(Some),
-        }
-    }
-
-    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, Error> {
-        let value = self.value.take().ok_or_else(|| Error::custom("a member value was requested before its name"))?;
-        seed.deserialize(Lenient(value))
-    }
-
-    fn size_hint(&self) -> Option<usize> {
-        Some(self.members.len())
-    }
-}
-
-/// JSON 数字的文法 `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`，整串匹配、不带空白。
-fn is_json_number(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut at = usize::from(bytes.first() == Some(&b'-'));
-    let digits = |at: usize| bytes[at..].iter().take_while(|byte| byte.is_ascii_digit()).count();
-    match bytes.get(at) {
-        Some(b'0') => at += 1,
-        Some(b'1'..=b'9') => at += digits(at),
-        _ => return false,
-    }
-    if bytes.get(at) == Some(&b'.') {
-        let count = digits(at + 1);
-        if count == 0 {
-            return false;
-        }
-        at += 1 + count;
-    }
-    if matches!(bytes.get(at), Some(b'e' | b'E')) {
-        at += 1;
-        if matches!(bytes.get(at), Some(b'+' | b'-')) {
-            at += 1;
-        }
-        let count = digits(at);
-        if count == 0 {
-            return false;
-        }
-        at += count;
-    }
-    at == bytes.len()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn json_numbers_follow_the_grammar() {
-        for text in ["0", "-0", "12", "-1.5", "1e3", "2E-7", "0.25e+2"] {
-            assert!(is_json_number(text), "{text}");
-        }
-        for text in ["", "-", "01", "+1", "1.", ".5", "1e", "1e+", " 1", "1 ", "0x10", "NaN", "Infinity", "１"] {
-            assert!(!is_json_number(text), "{text:?}");
-        }
     }
 }

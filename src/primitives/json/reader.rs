@@ -41,6 +41,18 @@ pub(crate) fn parse(data: &[u8]) -> Result<Node, ReadError> {
     }
 }
 
+/// 整串按 JSON 数字的文法读成数：`-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?`，不带空白，按值模型分类；不是这样的文本为 `None`。
+///
+/// 文法就是读取器读数的那一份（`Reader::number`），不另写一遍：配置节把字符串叶子读成数时用它（`plugin/lifecycle.md` §7.2）。
+pub(crate) fn parse_number(text: &str) -> Option<Number> {
+    let mut reader = Reader { data: text.as_bytes(), at: 0, path: String::from("$"), duplicate: None };
+    match reader.number() {
+        // 读完一个数之后必须正好到末尾：后面还有字符（含空白）的不是一个数
+        Some(Node::Number(number, _)) if reader.at == text.len() => Some(number),
+        _ => None,
+    }
+}
+
 struct Reader<'a> {
     data: &'a [u8],
     at: usize,
@@ -320,5 +332,26 @@ pub(crate) fn write_node(out: &mut String, node: &Node) {
             }
             out.push('}');
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// JSON 数字的文法只有读取器里的一份：整串匹配、不带空白，数按值模型分类。
+    #[test]
+    fn json_numbers_follow_the_grammar() {
+        for text in ["0", "-0", "12", "-1.5", "1e3", "2E-7", "0.25e+2"] {
+            assert!(parse_number(text).is_some(), "{text}");
+        }
+        for text in ["", "-", "01", "+1", "1.", ".5", "1e", "1e+", " 1", "1 ", "0x10", "NaN", "Infinity", "１", "1,2", "1 2", "--1", "1e1.5"] {
+            assert_eq!(parse_number(text), None, "{text:?}");
+        }
+        assert_eq!(parse_number("-0"), Some(Number::Integer(0)));
+        assert_eq!(parse_number("8080"), Some(Number::Integer(8080)));
+        assert_eq!(parse_number("18446744073709551615"), Some(Number::Unsigned(u64::MAX)));
+        assert_eq!(parse_number("-1.5e3"), Some(Number::Float(-1500.0)));
+        assert_eq!(parse_number("1e400"), Some(Number::Float(f64::INFINITY)));
     }
 }
