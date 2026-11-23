@@ -180,6 +180,19 @@ fn registry_rejects_unknown_expose_names() {
             "{protocols:?}"
         );
     }
+    // 同一个协议写两次也拒绝；按出现的顺序报第一处问题，不认识的名字与重复谁在前报谁
+    for (protocols, problem) in [
+        (vec![EXPOSE_HTTP, EXPOSE_AI, EXPOSE_HTTP], "lists 'http' more than once"),
+        (vec![EXPOSE_AI, EXPOSE_AI, "rest"], "lists 'ai' more than once"),
+        (vec![EXPOSE_HTTP, "rest", EXPOSE_HTTP], "cannot be exposed to 'rest'"),
+    ] {
+        let error = registry.add(Contract::new("orders.create").with_expose(protocols.clone()), handler()).unwrap_err();
+        assert_eq!(
+            (error.code(), error.message()),
+            (ERROR_CODE_INVALID_ARGUMENT, format!("The operation 'orders.create' {problem}.").as_str()),
+            "{protocols:?}"
+        );
+    }
     assert!(registry.is_empty());
 
     // 五个协议名都认，EXPOSE_ALL 就是它们

@@ -144,7 +144,7 @@ impl Contract {
 
     /// 设置暴露的协议，替换原有的；名字是 `EXPOSE_*`（区分大小写），空集合即不对外发布。
     ///
-    /// 这里不核对名字：五个协议名之外的值在登记时（[`Registry::add_with`]）报 `PRIMITIVES_VALIDATION_001`。
+    /// 这里不核对名字：五个协议名之外的值、写了两次的协议在登记时（[`Registry::add_with`]）报 `PRIMITIVES_VALIDATION_001`。
     #[must_use]
     pub fn with_expose<I, S>(mut self, protocols: I) -> Self
     where
@@ -399,8 +399,8 @@ impl Registry {
 
     /// 登记一个操作。
     ///
-    /// ID 不合法、同时声明了权限与策略、暴露的协议不是五个协议名（[`EXPOSE_ALL`]）之一、归属为空或 Schema 不是 JSON 对象返回
-    /// `PRIMITIVES_VALIDATION_001`，重复返回 `KERNEL_OPERATION_001`，已满返回 `KERNEL_OPERATION_002`。
+    /// ID 不合法、同时声明了权限与策略、暴露的协议不是五个协议名（[`EXPOSE_ALL`]）之一或同一个协议写了两次、归属为空或 Schema 不是
+    /// JSON 对象返回 `PRIMITIVES_VALIDATION_001`，操作 ID 重复返回 `KERNEL_OPERATION_001`，已满返回 `KERNEL_OPERATION_002`。
     pub fn add_with<Req, Res, H>(&self, contract: Contract, handler: H, schema: Option<Schema>, owner: &str) -> std::result::Result<(), FrameworkError>
     where
         Req: DeserializeOwned + Send + 'static,
@@ -414,9 +414,15 @@ impl Registry {
         if contract.permission.is_some() && contract.policy.is_some() {
             return Err(invalid(format!("The operation '{id}' must declare either a permission or a policy.")));
         }
-        // 协议名之外的值宿主认不出、会当作没有写：拼错的名字（如 htpp）在这里报出来，不让操作悄悄地不发布
-        if let Some(protocol) = contract.expose.iter().find(|protocol| !EXPOSE_ALL.contains(&protocol.as_str())) {
-            return Err(invalid(format!("The operation '{id}' cannot be exposed to '{protocol}'.")));
+        // 协议名之外的值宿主认不出、会当作没有写：拼错的名字（如 htpp）在这里报出来，不让操作悄悄地不发布；同一个协议写两次多半也是
+        // 写错了名字。按出现的顺序报第一处，协议至多五个，逐个往前比较即可
+        for (index, protocol) in contract.expose.iter().enumerate() {
+            if !EXPOSE_ALL.contains(&protocol.as_str()) {
+                return Err(invalid(format!("The operation '{id}' cannot be exposed to '{protocol}'.")));
+            }
+            if contract.expose[..index].contains(protocol) {
+                return Err(invalid(format!("The operation '{id}' lists '{protocol}' more than once.")));
+            }
         }
         if owner.is_empty() {
             return Err(invalid(format!("The operation '{id}' needs an owner.")));
