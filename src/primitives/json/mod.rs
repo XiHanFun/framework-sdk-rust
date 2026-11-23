@@ -38,8 +38,7 @@ use serde_path_to_error::Segment;
 #[cfg(feature = "plugin")]
 pub(crate) use reader::Number;
 pub(crate) use reader::{Node, parse};
-pub(crate) use ser::to_vec_strict;
-pub use ser::{Model, to_value};
+pub use ser::{Model, to_value, to_vec};
 pub use value::Json;
 
 /// 嵌套的最大层数（RFC-0001「JSON 文本」）。

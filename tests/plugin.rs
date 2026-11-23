@@ -36,6 +36,7 @@ use xihan_framework::plugin::{
     self, Configuration, Endpoint, Envelope, Event, Health, HealthItem, HealthStatus, Hooks, Launch, Logger, MessageCatalog, Network, Plugin, Running,
     Subscription, SubscriptionMode, event_handler_fn, v1,
 };
+use xihan_framework::primitives::json::ReadError;
 use xihan_framework::primitives::{self, BAGGAGE_TENANT, Catalog, Error, LifecycleState, Result};
 
 /// 测试里宿主下发的会话令牌。
@@ -439,6 +440,14 @@ struct Relay {
     tenant: Option<String>,
     /// 在另造的上下文里回调：`deadline` 是 50 毫秒后到期、等它到期再回调，`cancel` 是已被取消的，`short` 是 300 毫秒后到期、立即回调。
     abandon: Option<String>,
+    /// 以类型化的回调（`Host::invoke_json`）调用：`nan` 发一个写不出的请求，其余发 `{"quantity":2.5}`。
+    typed: Option<String>,
+}
+
+/// 类型化回调的请求与响应，也是信封里的 JSON 数据。
+#[derive(Debug, Deserialize, Serialize)]
+struct Quantity {
+    quantity: f64,
 }
 
 #[derive(Serialize)]
@@ -552,6 +561,11 @@ fn orders_plugin(recorder: &Arc<Recorder>, log: &Buffer) -> Plugin {
                         Some("short") => Context::builder().timeout(Duration::from_millis(300)).build(),
                         _ => with_tenant(ctx, request.tenant),
                     };
+                    if let Some(typed) = request.typed.as_deref() {
+                        let quantity = if typed == "nan" { f64::NAN } else { 2.5 };
+                        let echoed: Quantity = host.invoke_json(&callback, &request.operation, &Quantity { quantity }).await?;
+                        return Ok(Relayed { payload: echoed.quantity.to_string() });
+                    }
                     let payload = host.invoke(&callback, &request.operation, "{}").await?;
                     Ok(Relayed { payload: String::from_utf8(payload).unwrap() })
                 })
@@ -1509,13 +1523,17 @@ impl HostRpc for FakeHostService {
     async fn invoke(&self, request: Request<v1::InvokeRequest>) -> std::result::Result<Response<v1::InvokeResponse>, Status> {
         let (session, timeout) = (header(request.metadata(), plugin::SESSION_METADATA_KEY), header(request.metadata(), "grpc-timeout"));
         let request = request.into_inner();
-        let operation = request.operation.clone();
+        let (operation, sent) = (request.operation.clone(), request.payload.clone());
         self.0.invokes.lock().unwrap().push((session, timeout, request));
         if let Some(status) = scripted_status(&operation) {
             return Err(status);
         }
         let failed = |error: Option<v1::Error>| Ok(Response::new(v1::InvokeResponse { status: Some(v1::Status { ok: false, error }), payload: Vec::new() }));
+        let answered = |payload: Vec<u8>| Ok(Response::new(v1::InvokeResponse { status: Some(v1::Status { ok: true, error: None }), payload }));
         match operation.as_str() {
+            // 原样送回收到的载荷
+            "host.mirror" => answered(sent),
+            "host.wrong" => answered(br#"{"quantity":"two"}"#.to_vec()),
             "host.echo" => {
                 Ok(Response::new(v1::InvokeResponse { status: Some(v1::Status { ok: true, error: None }), payload: br#"{"echoed":true}"#.to_vec() }))
             }
@@ -1825,6 +1843,67 @@ async fn host_results_are_read_by_the_rules() {
                           "details": {"id": ID, "phase": "publish", "reason": "the host returned 1 results for 2 envelopes"}});
     assert_eq!(short, json!({"outcomes": [mismatch, mismatch]}));
     stop(&mut client, running).await;
+}
+
+/// 类型化的回调（`Host::invoke_json`）：请求按 `json::to_vec` 写、响应按 `json::from_slice` 读。发出之前的核对先于编码；请求写不出时
+/// 不发请求，响应读不成目标类型时只报出错位置的路径，两者都是 `plugins.process.failed`（`phase` 为操作 ID）；宿主的业务失败原样返回。
+#[tokio::test]
+async fn typed_callbacks_write_the_request_and_read_the_response() {
+    let host = Arc::new(FakeHost::default());
+    let address = fake_host(&host).await;
+    let (recorder, log) = (Arc::new(Recorder::default()), Buffer::default());
+    let (running, mut client) = serving(&recorder, &log, launch_with(&address)).await;
+    let typed = |operation: &str, kind: &str| json!({"operation": operation, "typed": kind}).to_string();
+    let failed = |operation: &str, reason: &str| {
+        ("PLUGINS_UNEXPECTED_001".to_owned(), "plugins.process.failed".to_owned(), json!({"id": ID, "phase": operation, "reason": reason}))
+    };
+
+    let relayed = payload(&invoke(&mut client, "orders.relay", &typed("host.mirror", "ok"), None).await);
+    assert_eq!(relayed, json!({"payload": "2.5"}));
+    assert_eq!(host.invokes.lock().unwrap().last().unwrap().2.payload, br#"{"quantity":2.5}"#);
+
+    // 请求写不出（非有限的浮点）：不发请求
+    let sent = host.invokes.lock().unwrap().len();
+    let unwritable = invoke(&mut client, "orders.relay", &typed("host.mirror", "nan"), None).await;
+    assert_eq!(keyed(unwritable.status.as_ref()), failed("host.mirror", "the request cannot be written as JSON"));
+    assert_eq!(host.invokes.lock().unwrap().len(), sent, "an unwritable request is not sent");
+
+    // 响应读不成目标类型：缺少成员报所在对象的路径，类型不符报成员的路径，不带值
+    for (operation, path) in [("host.echo", "$"), ("host.wrong", "$.quantity")] {
+        let mismatch = invoke(&mut client, "orders.relay", &typed(operation, "ok"), None).await;
+        let reason = format!("the response does not match the expected type at '{path}'");
+        assert_eq!(keyed(mismatch.status.as_ref()), failed(operation, &reason));
+    }
+    // 宿主的业务失败与 gRPC 状态的映射同 Host::invoke
+    let conflict = invoke(&mut client, "orders.relay", &typed("host.conflict", "ok"), None).await;
+    assert_eq!(keyed(conflict.status.as_ref()), ("ORDERS_CONFLICT_001".to_owned(), "orders.conflict".to_owned(), json!({"id": "o1"})));
+    let unknown = invoke(&mut client, "orders.relay", &typed("host.missing", "ok"), None).await;
+    assert_eq!(keyed(unknown.status.as_ref()).1, "kernel.operation.unknown");
+    stop(&mut client, running).await;
+
+    // 发出之前的核对先于编码：没有可用的回调端点时，写不出的请求报的也是 plugins.host.unavailable
+    let (recorder, log) = (Arc::new(Recorder::default()), Buffer::default());
+    let (running, mut client) = serving(&recorder, &log, Launch::new(TOKEN)).await;
+    let unavailable = invoke(&mut client, "orders.relay", &typed("host.mirror", "nan"), None).await;
+    assert_eq!(keyed(unavailable.status.as_ref()).1, "plugins.host.unavailable");
+    stop(&mut client, running).await;
+}
+
+/// 信封的数据按 JSON 读写：`with_json_data` 用 `json::to_vec`（非有限的浮点写不出），`data_as` 用 `json::from_slice`（先过共同的读取
+/// 检查，报出错的位置）；`datacontenttype` 不变。
+#[test]
+fn envelope_data_reads_and_writes_json() {
+    let envelope = || Envelope::new("orders.events", "e1", "urn:test", "orders.created");
+    let written = envelope().with_json_data(&Quantity { quantity: 2.5 }).unwrap();
+    assert_eq!((written.data.as_slice(), written.data_content_type.as_str()), (br#"{"quantity":2.5}"#.as_slice(), "application/json"));
+    assert_eq!(written.data_as::<Quantity>().unwrap().quantity, 2.5);
+    assert_eq!(written.data_as::<Value>().unwrap(), json!({"quantity": 2.5}));
+    assert!(envelope().with_json_data(&Quantity { quantity: f64::INFINITY }).is_err(), "a non-finite number cannot be written");
+
+    assert_eq!(envelope().data_as::<Quantity>().unwrap_err(), ReadError::Syntax, "no data is not JSON");
+    assert_eq!(envelope().with_data(r#"{"quantity":"two"}"#).data_as::<Quantity>().unwrap_err().path(), "$.quantity");
+    let duplicate = envelope().with_data(r#"{"quantity":1,"quantity":2}"#).data_as::<Quantity>().unwrap_err();
+    assert_eq!(duplicate, ReadError::Duplicate { path: "$.quantity".to_owned() });
 }
 
 #[tokio::test]

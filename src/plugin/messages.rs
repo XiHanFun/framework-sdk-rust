@@ -59,6 +59,8 @@ pub(crate) const REASON_NOT_AN_OBJECT: &str = "the configuration is not a JSON o
 pub(crate) const REASON_NO_ENDPOINT: &str = "no supported callback endpoint";
 /// `reason`：宿主的 `Status.ok` 为假却没有 `error`（`invocation.md` §3）。
 pub(crate) const REASON_NO_ERROR: &str = "the host reported a failure without an error";
+/// `reason`：类型化的回调（`Host::invoke_json`）的请求写不成 JSON；诊断文本里不带值。
+pub(crate) const REASON_REQUEST_NOT_JSON: &str = "the request cannot be written as JSON";
 /// `reason`：钩子以 panic 结束（`lifecycle.md` §7.6：没有异常的语言写 `panic`，panic 的内容只进 stderr）。
 pub(crate) const REASON_PANIC: &str = "panic";
 

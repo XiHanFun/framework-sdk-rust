@@ -39,8 +39,20 @@ impl<T: Serialize + ?Sized, const STRICT: bool> Serialize for Wrap<'_, T, STRICT
     }
 }
 
-/// 把类型化的响应写成 JSON：非有限的浮点（及序列化不支持的值）报错。
-pub(crate) fn to_vec_strict<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
+/// 把请求或响应对象写成载荷的 JSON（RFC-0011 规则 2 与规则 10「编码」）：调用器编码响应用的就是它。
+///
+/// 这是类型化的写法：非有限的浮点（及序列化不支持的值，如键不是字符串的映射）写不出、报错，不写成 `null` 或字符串；单精度与
+/// 64 位整数照原样写。要把非有限的浮点写成字符串的是值模型的写法 [`Model`]。回调宿主的请求、信封的数据都可以用它写，读回来用
+/// [`from_slice`](super::from_slice)。
+///
+/// ```
+/// use xihan_framework::primitives::json;
+///
+/// assert_eq!(json::to_vec(&[1.5, 2.0]).unwrap(), b"[1.5,2.0]");
+/// assert!(json::to_vec(&f64::NAN).is_err());
+/// assert_eq!(json::from_slice::<Vec<f64>>(&json::to_vec(&[1.5, 2.0]).unwrap()).unwrap(), [1.5, 2.0]);
+/// ```
+pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&Wrap::<T, true>(value))
 }
 

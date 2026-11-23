@@ -562,6 +562,30 @@ fn framework_errors_propagate_with_the_question_mark() {
     assert_eq_type::<Error>();
 }
 
+/// `json::to_vec` 是类型化的写法（RFC-0011 规则 2 与规则 10「编码」），调用器编码响应用的就是它：非有限的浮点与序列化不支持的值
+/// 写不出、报错，64 位整数与单精度照原样，读回来是同一个值。
+#[test]
+fn typed_values_are_written_strictly() {
+    #[derive(Debug, PartialEq, Deserialize, serde::Serialize)]
+    struct Line {
+        sku: String,
+        quantity: u64,
+        price: f64,
+    }
+    let line = |price: f64| Line { sku: "a\"b".to_owned(), quantity: 9_007_199_254_740_993, price };
+    let text = json::to_vec(&line(2.0)).unwrap();
+    assert_eq!(String::from_utf8(text.clone()).unwrap(), r#"{"sku":"a\"b","quantity":9007199254740993,"price":2.0}"#);
+    assert_eq!(json::from_slice::<Line>(&text).unwrap(), line(2.0));
+    for unwritable in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        assert!(json::to_vec(&line(unwritable)).is_err(), "{unwritable} cannot be written");
+        // 值模型的写法（json::Model）把它写成字符串，不是这里的事
+        assert!(serde_json::to_string(&json::Model(&unwritable)).unwrap().starts_with('"'));
+    }
+    assert_eq!(json::to_vec(&0.1f32).unwrap(), b"0.1", "single precision is written as it is");
+    assert_eq!(json::to_vec("text").unwrap(), b"\"text\"", "unsized values are written too");
+    assert!(json::to_vec(&std::collections::BTreeMap::from([((1, 2), 3)])).is_err(), "a map whose keys are not strings cannot be written");
+}
+
 #[derive(Deserialize)]
 struct TemplateVectors {
     keys: KeyCases,

@@ -265,7 +265,7 @@ trait Response: Send {
 impl<T: Serialize + Send + 'static> Response for T {
     /// 按类型写出：非有限的浮点写不出、报错，不写成 `null` 或字符串（RFC-0011 规则 2）。
     fn encode(&self) -> std::result::Result<Vec<u8>, serde_json::Error> {
-        json::to_vec_strict(self)
+        json::to_vec(self)
     }
 
     fn as_any(&self) -> &dyn Any {

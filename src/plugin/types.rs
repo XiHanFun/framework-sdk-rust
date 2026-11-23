@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::host::Host;
@@ -127,6 +128,22 @@ impl Envelope {
     pub fn with_data(mut self, data: impl Into<Vec<u8>>) -> Self {
         self.data = data.into();
         self
+    }
+
+    /// 把 `data` 按 [`json::to_vec`] 写成数据（类型化的写法）；`datacontenttype` 不变，缺省就是 `application/json`。
+    ///
+    /// 写不出（非有限的浮点、序列化不支持的值）时返回 `serde_json` 的错误，信封随之丢弃。
+    pub fn with_json_data<T: Serialize + ?Sized>(mut self, data: &T) -> std::result::Result<Self, serde_json::Error> {
+        self.data = json::to_vec(data)?;
+        Ok(self)
+    }
+
+    /// 把数据按 JSON 读成 `T`（同 [`json::from_slice`]：先过共同的 JSON 读取检查，数字按值模型），不看 `datacontenttype`。
+    ///
+    /// 没有数据或数据不是 JSON 为 [`ReadError::Syntax`]，有重复成员为 [`ReadError::Duplicate`]，与 `T` 不符时 [`ReadError::path`]
+    /// 是出错的位置。
+    pub fn data_as<T: DeserializeOwned>(&self) -> std::result::Result<T, ReadError> {
+        json::from_slice(&self.data)
     }
 
     /// 设置 `subject`。
