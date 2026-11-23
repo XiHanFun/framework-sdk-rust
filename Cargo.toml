@@ -57,6 +57,8 @@ required-features = ["plugin"]
 
 [package.metadata.docs.rs]
 all-features = true
+# docs.rs 上以 cfg(docsrs) 构建文档：src/lib.rs 据此打开 doc_cfg，给只在 feature plugin 下的模块标上「需要 feature plugin」
+rustdoc-args = ["--cfg", "docsrs"]
 
 [lints.rust]
 unsafe_code = "forbid"

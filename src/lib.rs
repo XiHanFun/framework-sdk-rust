@@ -8,6 +8,8 @@
 //! 打开 cargo feature `plugin` 时另有进程外插件运行时 `plugin`（RFC-0017），它基于 tonic 与 tokio。
 
 #![forbid(unsafe_code)]
+// 只在 docs.rs 上（cfg(docsrs)，那里用 nightly）打开：让文档标出哪些项要打开 feature 才有
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 use std::future::Future;
 use std::pin::Pin;
@@ -18,6 +20,7 @@ pub mod manifest;
 pub mod operation;
 pub mod pipeline;
 #[cfg(feature = "plugin")]
+#[cfg_attr(docsrs, doc(cfg(feature = "plugin")))]
 pub mod plugin;
 pub mod primitives;
 
