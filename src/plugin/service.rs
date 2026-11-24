@@ -186,7 +186,13 @@ impl Plugin for PluginService {
                 bindings: request
                     .bindings
                     .into_iter()
-                    .map(|binding| Binding { name: binding.name, resource_type: binding.r#type, value: binding.value })
+                    // 绑定连同属性原样交出：不折叠属性名的大小写、不核对文法与上限，主值为空也不是错误（lifecycle.md §7.2）
+                    .map(|binding| Binding {
+                        name: binding.name,
+                        resource_type: binding.r#type,
+                        value: binding.value,
+                        properties: binding.properties.into_iter().collect(),
+                    })
                     .collect(),
                 work_directory: request.work_directory.into(),
                 host: Arc::clone(&runtime.host),

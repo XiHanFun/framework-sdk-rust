@@ -1,11 +1,12 @@
 //! 进程外插件运行时（RFC-0017，ADR-0237）：回放向量 `plugin/handshake-lines.json`、`plugin/host-addresses.json`、
-//! `plugin/protocol-versions.json` 与 `plugin/callback-status.json`（经假的宿主端到端；`deadlines.json`、`plugin-messages.json` 与
-//! 回调映射的全部用例在 crate 内的单元测试回放），再以扮演宿主的 gRPC 客户端核对：启动前的核对、握手、会话令牌、调用次序、配置节、
-//! 就绪、健康、停止与收尾、调用与投递的核对顺序、上下文还原、错误的写出与读入、回调的本地核对、元数据与状态映射。
+//! `plugin/protocol-versions.json`、`plugin/binding-properties.json`（插件一侧的 `reading`，ADR-0285）与 `plugin/callback-status.json`
+//! （经假的宿主端到端；`deadlines.json`、`plugin-messages.json` 与回调映射的全部用例在 crate 内的单元测试回放），再以扮演宿主的 gRPC
+//! 客户端核对：启动前的核对、握手、会话令牌、调用次序、配置节、绑定与属性、就绪、健康、停止与收尾、调用与投递的核对顺序、上下文还原、
+//! 错误的写出与读入、回调的本地核对、元数据与状态映射。
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use std::task::{Context as TaskContext, Poll};
 use std::time::{Duration, Instant};
 
 use hyper_util::rt::TokioIo;
+use prost::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -33,7 +35,7 @@ use xihan_framework::pipeline;
 use xihan_framework::plugin::v1::host_server::{Host as HostRpc, HostServer};
 use xihan_framework::plugin::v1::plugin_client::PluginClient;
 use xihan_framework::plugin::{
-    self, Configuration, Endpoint, Envelope, Event, Health, HealthItem, HealthStatus, Hooks, Launch, Logger, MessageCatalog, Network, Plugin, Running,
+    self, Binding, Configuration, Endpoint, Envelope, Event, Health, HealthItem, HealthStatus, Hooks, Launch, Logger, MessageCatalog, Network, Plugin, Running,
     Subscription, SubscriptionMode, event_handler_fn, v1,
 };
 use xihan_framework::primitives::json::ReadError;
@@ -312,6 +314,10 @@ enum HealthMode {
 /// 插件这一侧记下的事与钩子的应答方式。
 struct Recorder {
     configuration: Mutex<Option<(String, Vec<String>, PathBuf)>>,
+    /// 配置钩子拿到的绑定。
+    bindings: Mutex<Vec<Binding>>,
+    /// 配置钩子拿到的配置的调试输出。
+    debug: Mutex<String>,
     settings: Mutex<Option<Settings>>,
     deliveries: Mutex<Vec<String>>,
     stops: Mutex<Vec<String>>,
@@ -325,6 +331,8 @@ impl Default for Recorder {
     fn default() -> Self {
         Self {
             configuration: Mutex::default(),
+            bindings: Mutex::default(),
+            debug: Mutex::default(),
             settings: Mutex::default(),
             deliveries: Mutex::default(),
             stops: Mutex::default(),
@@ -366,6 +374,8 @@ impl Hooks for TestHooks {
             }
             let settings: Settings = configuration.decode().map_err(|error| Error::literal("ORDERS_VALIDATION_009", error.to_string()))?;
             *self.0.settings.lock().unwrap() = Some(settings);
+            *self.0.bindings.lock().unwrap() = configuration.bindings.clone();
+            *self.0.debug.lock().unwrap() = format!("{configuration:?}");
             *self.0.configuration.lock().unwrap() =
                 Some((configuration.section.clone(), configuration.granted_permissions.clone(), configuration.work_directory.clone()));
             Ok(())
@@ -1057,6 +1067,141 @@ async fn configuration_sections_are_read_like_the_host_writes_them() {
         running.shutdown();
         running.wait().await.unwrap();
     }
+}
+
+/// 向量 `binding-properties.json`：只取插件一侧的 `reading`，其余（`names`、`limits`、`delivery` 与 Wasm 载体的 `json`）是宿主一侧的。
+#[derive(Deserialize)]
+struct BindingProperties {
+    reading: Vec<BindingReading>,
+}
+
+/// `reading` 的一例：宿主写出的 `ConfigureRequest` 字节（十六进制）与 SDK 交给作者的绑定。
+#[derive(Deserialize)]
+struct BindingReading {
+    name: String,
+    hex: String,
+    bindings: Vec<DeliveredBinding>,
+}
+
+/// 作者拿到的一个绑定，换成便于比较的形状（`plugin::Binding` 是 `#[non_exhaustive]`，测试里造不出来）。
+#[derive(Debug, Deserialize, PartialEq)]
+struct DeliveredBinding {
+    name: String,
+    #[serde(rename = "type")]
+    resource_type: String,
+    value: String,
+    properties: BTreeMap<String, String>,
+}
+
+/// 十六进制文本解成字节。
+fn unhex(text: &str) -> Vec<u8> {
+    assert!(text.is_ascii() && text.len() % 2 == 0, "{text:?} is not hexadecimal");
+    (0..text.len()).step_by(2).map(|index| u8::from_str_radix(&text[index..index + 2], 16).unwrap()).collect()
+}
+
+/// 起一个插件并握手，停在 `Configure` 之前。
+async fn resolved(recorder: &Arc<Recorder>, log: &Buffer) -> (Running, Client) {
+    let running = orders_plugin(recorder, log).start(Launch::new(TOKEN)).await.unwrap();
+    let mut client = connect(running.endpoint()).await;
+    client.handshake(handshake_request(vec![1])).await.unwrap();
+    (running, client)
+}
+
+#[tokio::test]
+async fn bindings_follow_the_reading_vectors() {
+    let vectors: BindingProperties = common::vector("plugin/binding-properties.json");
+    assert!(!vectors.reading.is_empty());
+    for case in &vectors.reading {
+        let (recorder, log) = (Arc::new(Recorder::default()), Buffer::default());
+        let (running, mut client) = resolved(&recorder, &log).await;
+        // 宿主写出的字节由生成的消息类型解码，再走配置这条路：绑定按先后逐项比较，属性表按属性名比较
+        let request = v1::ConfigureRequest::decode(unhex(&case.hex).as_slice()).unwrap_or_else(|error| panic!("{}: {error}", case.name));
+        let configured = client.configure(request).await.unwrap().into_inner();
+        assert!(configured.status.unwrap().ok, "{}", case.name);
+        let delivered: Vec<DeliveredBinding> = recorder
+            .bindings
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|binding| DeliveredBinding {
+                name: binding.name.clone(),
+                resource_type: binding.resource_type.clone(),
+                value: binding.value.clone(),
+                properties: binding.properties.clone(),
+            })
+            .collect();
+        assert_eq!(delivered, case.bindings, "{}", case.name);
+        running.shutdown();
+        running.wait().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn binding_properties_are_handed_over_as_sent_and_never_printed() {
+    // 主值与每个属性值都当作凭据：哪个调试出口都不能带
+    let secrets = ["postgres://app:hunter2@db.internal/app", "app-user-7f3a", "OTHER-USER-55aa", "s3cret-9d1c", "dot-secret-21bb", "space-secret-08cd"];
+    let property = |name: &str, value: &str| (name.to_owned(), value.to_owned());
+    let mut request = configure_request("{}", &[]);
+    request.bindings = vec![
+        v1::Binding {
+            name: "db".to_owned(),
+            r#type: "connection:relational".to_owned(),
+            value: secrets[0].to_owned(),
+            // 只差大小写的两项、空值，以及不合下发文法的名字：SDK 不折叠、不改写、不核对
+            properties: HashMap::from([
+                property("username", secrets[1]),
+                property("Username", secrets[2]),
+                property("password", secrets[3]),
+                property("empty", ""),
+                property(".hidden", secrets[4]),
+                property("user name", secrets[5]),
+            ]),
+        },
+        // 主值为空不是错误；属性多过宿主一侧的上限（64 个），那是宿主的事
+        v1::Binding {
+            name: "many".to_owned(),
+            r#type: "queue".to_owned(),
+            value: String::new(),
+            properties: (0..100).map(|index| (format!("p{index}"), format!("many-secret-{index}"))).collect(),
+        },
+        // 较早的宿主不发 properties：读到的是空表
+        v1::Binding { name: "cache".to_owned(), r#type: "cache:distributed".to_owned(), value: "redis.internal:6379".to_owned(), ..Default::default() },
+    ];
+    let (recorder, log) = (Arc::new(Recorder::default()), Buffer::default());
+    let (running, mut client) = resolved(&recorder, &log).await;
+    let configured = client.configure(request).await.unwrap().into_inner();
+    assert!(configured.status.unwrap().ok);
+
+    let bindings = recorder.bindings.lock().unwrap().clone();
+    assert_eq!(bindings.iter().map(|binding| binding.name.as_str()).collect::<Vec<_>>(), ["db", "many", "cache"]);
+    let db = &bindings[0];
+    assert_eq!((db.resource_type.as_str(), db.value.as_str()), ("connection:relational", secrets[0]));
+    let value = |name: &str| db.properties.get(name).map(String::as_str);
+    assert_eq!(
+        [value("username"), value("Username"), value("password"), value("empty"), value(".hidden"), value("user name"), value("USERNAME")],
+        [Some(secrets[1]), Some(secrets[2]), Some(secrets[3]), Some(""), Some(secrets[4]), Some(secrets[5]), None]
+    );
+    assert_eq!(db.properties.len(), 6);
+    assert_eq!((bindings[1].value.as_str(), bindings[1].properties.len()), ("", 100));
+    assert_eq!(bindings[1].properties.get("p99").map(String::as_str), Some("many-secret-99"));
+    assert_eq!((bindings[2].value.as_str(), bindings[2].properties.is_empty()), ("redis.internal:6379", true));
+
+    // 调试输出只带绑定名、类型与属性名：绑定自己的、配置的（钩子里记下的）与运行时的日志都不带主值与属性值
+    assert_eq!(
+        format!("{db:?}"),
+        r#"Binding { name: "db", resource_type: "connection:relational", property_names: [".hidden", "Username", "empty", "password", "user name", "username"], .. }"#
+    );
+    let configuration = recorder.debug.lock().unwrap().clone();
+    for expected in ["db", "connection:relational", "password", "many", "p99", "cache:distributed"] {
+        assert!(configuration.contains(expected), "the debug output of the configuration carries {expected:?}: {configuration}");
+    }
+    for text in [format!("{db:?}"), format!("{db:#?}"), format!("{bindings:?}"), configuration, log.text()] {
+        for secret in secrets.iter().copied().chain(["many-secret-", "redis.internal:6379"]) {
+            assert!(!text.contains(secret), "{secret:?} must not be printed: {text}");
+        }
+    }
+    running.shutdown();
+    running.wait().await.unwrap();
 }
 
 #[tokio::test]

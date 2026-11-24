@@ -168,7 +168,7 @@ pub struct ConfigureRequest {
     pub work_directory: ::prost::alloc::string::String,
 }
 /// 一个已解析的资源绑定。
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Binding {
     /// 绑定名。
     #[prost(string, tag = "1")]
@@ -179,6 +179,14 @@ pub struct Binding {
     /// 连接串或地址。
     #[prost(string, tag = "3")]
     pub value: ::prost::alloc::string::String,
+    /// 绑定的其余属性，键是属性名（区分大小写）、值是属性值；没有其余属性时为空。来源只给了属性、没有主值的绑定照常下发，
+    /// `value` 为空。属性名的文法、数量与大小的上限见 lifecycle.md §2；属性值可能是凭据，宿主与插件都不得写进日志。
+    /// 较早的宿主不发这个字段，较早的插件忽略它。
+    #[prost(map = "string, string", tag = "4")]
+    pub properties: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// 配置结果。
 #[derive(Clone, PartialEq, ::prost::Message)]

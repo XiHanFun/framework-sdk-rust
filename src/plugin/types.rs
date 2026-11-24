@@ -301,16 +301,35 @@ impl Health {
     }
 }
 
-/// 一个已解析的资源绑定（`plugin.proto` 的 `Binding`）：只含清单声明的绑定。
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// 一个已解析的资源绑定（`plugin.proto` 的 `Binding`，`lifecycle.md` §2、§7.2）：只含清单声明的绑定。
+///
+/// 主值与属性值可能是凭据，不要写进日志、错误与其他诊断输出：`Debug` 只带绑定名、类型与属性名，不带主值与属性值。
+#[derive(Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Binding {
-    /// 绑定名。
+    /// 绑定名：清单里的名字。
     pub name: String,
     /// 资源类型（`connection:relational`、`cache:distributed`、`queue`、`blob`）。
     pub resource_type: String,
-    /// 连接串或地址。
+    /// 主值：连接串或地址。来源只给了属性、没有给主值时为空，不是错误。
     pub value: String,
+    /// 其余属性：属性名到属性值。
+    ///
+    /// 属性名区分大小写、原样交出（`accessKey` 与 `AccessKey` 是两项）；没有属性时是空表（按较早的规范实现的宿主不发这个字段，读到的
+    /// 也是空表），值为空的属性照样在表里，各项的先后没有含义（这里按属性名的字节序）。运行时不核对属性名的文法与上限，那是宿主的事。
+    pub properties: BTreeMap<String, String>,
+}
+
+impl fmt::Debug for Binding {
+    // 主值与属性值可能是凭据：只写绑定名、类型与属性名，省掉的成员以 `..` 标出
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Binding")
+            .field("name", &self.name)
+            .field("resource_type", &self.resource_type)
+            .field("property_names", &self.properties.keys().collect::<Vec<_>>())
+            .finish_non_exhaustive()
+    }
 }
 
 /// `Configure` 下发的内容（`lifecycle.md` §2、§7.2）。
@@ -323,7 +342,7 @@ pub struct Configuration {
     pub section: String,
     /// 宿主授予的权限，等于清单 `permissions`；回调前的权限核对以它为准。
     pub granted_permissions: Vec<String>,
-    /// 只含清单声明的绑定。
+    /// 已解析的绑定连同属性，按宿主下发的先后；只含清单声明的绑定。
     pub bindings: Vec<Binding>,
     /// 宿主为插件创建的可写工作目录（宿主停止时不删除）。
     pub work_directory: PathBuf,
@@ -361,12 +380,12 @@ impl Configuration {
 }
 
 impl fmt::Debug for Configuration {
-    // 绑定的值常是连接串，不写进调试输出
+    // 配置节与绑定的主值、属性值可能是凭据，不写进调试输出：配置节省掉，绑定按 Binding 的 Debug 只带绑定名、类型与属性名
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("Configuration")
             .field("granted_permissions", &self.granted_permissions)
-            .field("bindings", &self.bindings.iter().map(|binding| &binding.name).collect::<Vec<_>>())
+            .field("bindings", &self.bindings)
             .field("work_directory", &self.work_directory)
             .finish_non_exhaustive()
     }
