@@ -104,7 +104,15 @@ pub const EXPOSE_AI: &str = "ai";
 /// 冻结为这五个，与 .NET 的 `Expose.All` 一样（ADR-0136）：以后规范新增的协议不进这个常量，已经发布的操作不会因此自动暴露到新协议上。
 pub const EXPOSE_ALL: [&str; 5] = [EXPOSE_HTTP, EXPOSE_GRPC, EXPOSE_MCP, EXPOSE_COMMAND_LINE, EXPOSE_AI];
 
-/// 判断操作 ID 是否符合 `<resource>.<verb>`：`^[a-z][a-z0-9]*(-[a-z0-9]+)*\.[a-z][a-z0-9]*(-[a-z0-9]+)*$`。
+/// 操作 ID 的最大长度（`conventions/operation-ids.md`、RFC-0011「操作 ID」；与 .NET 的 `OperationId.MaxLength` 相同）。
+///
+/// 文法只含 ASCII 字符，字符数就是字节数。
+pub const ID_MAX_LENGTH: usize = crate::grammar::OPERATION_ID_MAX_LENGTH;
+
+/// 判断操作 ID 是否符合 `<resource>.<verb>`：`^[a-z][a-z0-9]*(-[a-z0-9]+)*\.[a-z][a-z0-9]*(-[a-z0-9]+)*$`，且整个 ID 不超过
+/// [`ID_MAX_LENGTH`] 个字符。
+///
+/// 操作契约、登记表与清单的 `contributes.operations` 用同一条规则；向量 `primitives/operation-ids.json`。
 pub fn is_id(id: &str) -> bool {
     crate::grammar::operation_id(id)
 }
@@ -409,7 +417,7 @@ impl Registry {
     {
         let id = contract.id.clone();
         if !is_id(&id) {
-            return Err(invalid(format!("The operation ID '{id}' must match <resource>.<verb>.")));
+            return Err(invalid(format!("The operation ID '{id}' must match <resource>.<verb> and be at most {ID_MAX_LENGTH} characters long.")));
         }
         if contract.permission.is_some() && contract.policy.is_some() {
             return Err(invalid(format!("The operation '{id}' must declare either a permission or a policy.")));
@@ -974,5 +982,9 @@ mod tests {
         ] {
             assert!(!is_id(id), "{id}");
         }
+        // 上限按整个 ID 计：正好 ID_MAX_LENGTH 个字符的合法，多一个就不合法
+        let longest = format!("orders.{}", "a".repeat(ID_MAX_LENGTH - "orders.".len()));
+        assert!(longest.len() == ID_MAX_LENGTH && is_id(&longest));
+        assert!(!is_id(&format!("{longest}a")));
     }
 }

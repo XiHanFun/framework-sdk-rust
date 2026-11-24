@@ -9,7 +9,7 @@
 | `handshake.md` §3 | 版本协商与握手内容（清单原文、一元操作声明、订阅、消息目录） | `service.rs`、`catalog.rs` | `plugin/protocol-versions.json`（`tests/plugin.rs`） |
 | `lifecycle.md` §7 | 次序表、配置节、就绪、健康与健康推送、停止宽限、stdin 与 SIGTERM 收尾 | `service.rs`、`runtime.rs`、`types.rs` | `tests/plugin.rs`、黑盒运行器 |
 | `invocation.md` §1 | `Invoke`、`HandleEvent`、`InvokeStream` 的核对顺序 | `service.rs` | `tests/plugin.rs`、黑盒运行器 |
-| `invocation.md` §2 | `InvocationMetadata` 与调用上下文的互转、截止时间的写法 | `convert.rs`、`time.rs` | `plugin/deadlines.json`（`src/plugin/time.rs`） |
+| `invocation.md` §2、RFC-0003 规则 8（截止时间文本的文法） | `InvocationMetadata` 与调用上下文的互转、截止时间的读法与写法 | `convert.rs`、`time.rs` | `plugin/deadlines.json`（`src/plugin/time.rs`） |
 | `invocation.md` §3 | 错误写进 `Status` 与读入宿主写来的 `Error` | `convert.rs` | `plugin/error-reading.json`（`src/plugin/convert.rs`） |
 | `invocation.md` §5 | `Host.Invoke`、`Host.Publish`：发出前的本地核对、gRPC 状态映射 | `host.rs` | `plugin/callback-status.json`（`tests/plugin.rs`、`src/plugin/host.rs`） |
 | `invocation.md` §6 | stderr 的 JSON 行日志 | `log.rs` | `tests/plugin.rs` |

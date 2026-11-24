@@ -501,7 +501,9 @@ fn reading_error(key: &str, name: &str, value: &str) -> FrameworkError {
 /// 3. 形状：按 Schema 逐项核对，第一处问题为 [`MESSAGE_INVALID`]，`reason` 是该处的路径；根不是对象时为 `$`。成员按在文本里出现的
 ///    顺序，每个成员依次查 Schema 之外的成员（成员名区分大小写）→ `null` → 类型 → 取值，对象与数组进到里面再查；对象的成员查完后
 ///    按 Schema 里 `required` 的顺序报缺少的成员。接口版本是不带前导零的正整数、不超过 2147483647，只有 `requires[].version` 可以带
-///    一个 `^`；`activation` 至少一项；`contributes.permissions` 不得重复，路径是第二次出现的项。
+///    一个 `^`；`contributes.operations` 的每一项按操作 ID 的规则，含不超过 128 个字符（[`operation::is_id`](crate::operation::is_id)）；
+///    `activation` 至少一项，`onEvent:` 的模式可以带下划线、`onOperation:` 的不行；`contributes.permissions` 不得重复，路径是第二次
+///    出现的项。
 /// 4. 跨字段约束：同 [`Manifest::validate`] 的顺序与消息键，参数只有 `id`。
 ///
 /// 只有 Wasm 插件能贡献中间件是宿主在发现插件时的核对（`PLUGINS_VALIDATION_001`），读取不管。

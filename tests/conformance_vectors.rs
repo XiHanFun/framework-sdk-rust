@@ -14,7 +14,7 @@ const CLAIMED_PROFILES: [&str; 2] = ["core", "plugin"];
 /// 本 SDK 的测试回放的向量文件（相对 `spec/conformance/vectors/`，以 `/` 分隔），行尾注释是回放它的测试。
 ///
 /// `plugin/` 下的在打开 feature `plugin` 时回放；新增回放时加进来，不再回放时删掉。
-const REPLAYED: [&str; 19] = [
+const REPLAYED: [&str; 20] = [
     "manifest/manifests.json",                 // tests/manifest.rs
     "operations/payload-reasons.json",         // tests/operation.rs
     "pipeline/ordering.json",                  // tests/pipeline.rs
@@ -32,6 +32,7 @@ const REPLAYED: [&str; 19] = [
     "primitives/kernel-messages.json",         // tests/common（primitives、invocation、manifest、operation）
     "primitives/lifecycle-transitions.json",   // tests/primitives.rs
     "primitives/message-templates.json",       // tests/primitives.rs
+    "primitives/operation-ids.json",           // tests/operation.rs
     "primitives/trace-context.json",           // tests/invocation.rs
     "primitives/wire-encoding.json",           // tests/primitives.rs
 ];

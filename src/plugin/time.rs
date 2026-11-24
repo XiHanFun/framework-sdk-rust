@@ -1,5 +1,5 @@
-//! 截止时间的两种线上写法：`InvocationMetadata.deadline` 的文本（`invocation.md` §2，向量 `plugin/deadlines.json`），与 gRPC 的
-//! `grpc-timeout` 头。
+//! 截止时间的两种线上写法：`InvocationMetadata.deadline` 的文本（文法在 RFC-0003 规则 8，与 HTTP 载体的 `xihan-deadline` 头共用；
+//! 写法与取较早者在 `invocation.md` §2，向量 `plugin/deadlines.json`），与 gRPC 的 `grpc-timeout` 头。
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -49,7 +49,7 @@ impl UtcTime {
     }
 }
 
-/// 按 `invocation.md` §2 的文法严格读 `deadline`，返回 UTC 时刻（纳秒精度）：
+/// 按截止时间文本的文法（RFC-0003 规则 8）严格读 `deadline`，返回 UTC 时刻（纳秒精度）：
 /// `^[0-9]{4}-[0-9]{2}-[0-9]{2}[Tt][0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]{1,9})?([Zz]|[+-][0-9]{2}:[0-9]{2})\z`，年 `0001`–`9999`、
 /// 月日按公历（含闰年）、时 `00`–`23`、分与秒 `00`–`59`（不认闰秒）、偏移的时 `00`–`23` 与分 `00`–`59`，换算成 UTC 之后（不计小数）
 /// 在 `0001-01-01T00:00:00` 到 `9999-12-31T23:59:59` 之间。读不出（含空串）为 `None`，调用方当作没有截止时间。

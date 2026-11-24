@@ -1,5 +1,5 @@
-//! 操作（RFC-0011）：回放向量 `operations/payload-reasons.json` 与 `primitives/kernel-messages.json`，以及登记、调用器、内置步骤、
-//! 容量、短路、嵌套调用与 `'static` 调用。
+//! 操作（RFC-0011）：回放向量 `operations/payload-reasons.json`、`primitives/operation-ids.json` 与 `primitives/kernel-messages.json`，
+//! 以及登记、调用器、内置步骤、容量、短路、嵌套调用与 `'static` 调用。
 
 mod common;
 
@@ -160,6 +160,51 @@ fn registry_rejects_duplicates_and_bad_ids() {
     assert_eq!((list[1].request_type(), list[1].response_type()), ("CreateOrder", "()"));
     assert_eq!(registry.len(), 2);
     assert!(operation::is_id("order-lines.list") && !operation::is_id("orders"));
+}
+
+/// operation-ids.json：操作 ID 的合法与非法样例，含 128 个字符的上限两侧。
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OperationIdVectors {
+    max_length: usize,
+    valid: Vec<String>,
+    invalid: Vec<String>,
+}
+
+/// 操作 ID 的文法与 128 个字符的上限（`conventions/operation-ids.md`、RFC-0011「操作 ID」，ADR-0276）：判定与登记表用同一条规则。
+#[test]
+fn operation_ids_follow_the_vectors() {
+    let vectors: OperationIdVectors = common::vector("primitives/operation-ids.json");
+    assert!(!vectors.valid.is_empty() && !vectors.invalid.is_empty());
+    assert_eq!(operation::ID_MAX_LENGTH, vectors.max_length);
+    let registry = Registry::new();
+    let handler = || operation::handler_fn(|_ctx, _request: CreateOrder| Box::pin(async { Ok(()) }));
+    for id in &vectors.valid {
+        assert!(operation::is_id(id), "{id:?} must be valid");
+        registry.add(Contract::new(id.as_str()), handler()).unwrap_or_else(|error| panic!("{id:?} must be registered: {}", error.message()));
+    }
+    assert_eq!(registry.len(), vectors.valid.len());
+    for id in &vectors.invalid {
+        assert!(!operation::is_id(id), "{id:?} must be invalid");
+        let error = registry.add(Contract::new(id.as_str()), handler()).unwrap_err();
+        assert_eq!(
+            (error.code(), error.message()),
+            (
+                ERROR_CODE_INVALID_ARGUMENT,
+                format!("The operation ID '{id}' must match <resource>.<verb> and be at most {} characters long.", vectors.max_length).as_str()
+            ),
+            "{id:?}"
+        );
+    }
+    assert_eq!(registry.len(), vectors.valid.len(), "rejected registrations are not kept");
+
+    // 向量要把上限的两侧都带上：正好在上限上的合法，别处都合文法、只多一个字符的不合法
+    assert!(vectors.valid.iter().any(|id| id.len() == vectors.max_length));
+    assert!(vectors.invalid.iter().any(|id| id.len() == vectors.max_length + 1));
+    // 上限按整个 ID 计，与哪一段长无关
+    let long = "a".repeat(vectors.max_length - 2);
+    assert!(operation::is_id(&format!("{long}.b")) && !operation::is_id(&format!("{long}a.b")));
+    assert!(operation::is_id(&format!("a.{long}")) && !operation::is_id(&format!("a.{long}b")));
 }
 
 /// 暴露的协议（`plugin.proto` 的 `OperationDeclaration.expose`）：空表示不对外发布，是 `Contract::new` 的缺省；写了就只能是五个协议名，

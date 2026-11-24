@@ -54,12 +54,19 @@ pub(crate) fn kebab(text: &str) -> bool {
     parts.next().is_some_and(|head| word(head, lower, lower_digit)) && parts.all(|part| all(part, lower_digit))
 }
 
-/// 操作 ID `<resource>.<verb>`：`^[a-z][a-z0-9]*(-[a-z0-9]+)*\.[a-z][a-z0-9]*(-[a-z0-9]+)*$`（RFC-0011）。
+/// 操作 ID 的最大长度（`conventions/operation-ids.md`、RFC-0011「操作 ID」，ADR-0276；与 .NET 的 `OperationId.MaxLength` 相同）。
 ///
-/// 操作契约与清单的 `contributes.operations` 用同一个文法（RFC-0002 解析规则 2）。
+/// 文法只含 ASCII 字符，字符数就是字节数；公开为 [`operation::ID_MAX_LENGTH`](crate::operation::ID_MAX_LENGTH)。
+pub(crate) const OPERATION_ID_MAX_LENGTH: usize = 128;
+
+/// 操作 ID `<resource>.<verb>`：`^[a-z][a-z0-9]*(-[a-z0-9]+)*\.[a-z][a-z0-9]*(-[a-z0-9]+)*$`，整个 ID 不超过
+/// [`OPERATION_ID_MAX_LENGTH`] 个字符（RFC-0011）。
+///
+/// 操作契约与清单的 `contributes.operations` 用同一条规则（RFC-0002 解析规则 2）：超过上限的 ID 别处都合文法也不合法。
 pub(crate) fn operation_id(id: &str) -> bool {
+    // 先看长度：合文法的 ID 只有 ASCII，字节数就是字符数；带多字节字符的本来就不合文法，按字节数多算了也不改变结果
     // 动词段里再有点即不合法：kebab 不收点
-    id.split_once('.').is_some_and(|(resource, verb)| kebab(resource) && kebab(verb))
+    id.len() <= OPERATION_ID_MAX_LENGTH && id.split_once('.').is_some_and(|(resource, verb)| kebab(resource) && kebab(verb))
 }
 
 /// 接口版本 `[1-9][0-9]*`：不带前导零、符号与空白，在 32 位有符号整数范围内（不超过 2147483647，ADR-0236）。

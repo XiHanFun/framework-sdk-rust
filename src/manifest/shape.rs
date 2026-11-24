@@ -179,10 +179,14 @@ pub(super) fn is_semver(version: &str) -> bool {
     core_valid && pre_release.is_none_or(|text| all(text, identifier)) && build.is_none_or(|text| all(text, identifier))
 }
 
-/// 激活事件 `^(onStartup|onOperation:[a-z0-9.*-]+|onEvent:[a-z0-9.*-]+)$`。
+/// 激活事件 `^(onStartup|onOperation:[a-z0-9.*-]+|onEvent:[a-z0-9._*-]+)$`（RFC-0002 解析规则 2 第 3 步，`plugin/lifecycle.md` §3）。
+///
+/// `onOperation:` 的模式是操作 ID 的字符加 `*`，`onEvent:` 的模式是主题的字符加 `*`：主题可以带下划线（RFC-0009），
+/// 所以只有 `onEvent:` 的模式收下划线（ADR-0276）。
 pub(super) fn is_activation_event(event: &str) -> bool {
-    let pattern = |text: &str| all(text, |byte| lower_digit(byte) || matches!(byte, b'.' | b'*' | b'-'));
-    event == super::ACTIVATION_ON_STARTUP || event.strip_prefix("onOperation:").is_some_and(pattern) || event.strip_prefix("onEvent:").is_some_and(pattern)
+    let operations = |text: &str| all(text, |byte| lower_digit(byte) || matches!(byte, b'.' | b'*' | b'-'));
+    let topics = |text: &str| all(text, |byte| lower_digit(byte) || matches!(byte, b'.' | b'_' | b'*' | b'-'));
+    event == super::ACTIVATION_ON_STARTUP || event.strip_prefix("onOperation:").is_some_and(operations) || event.strip_prefix("onEvent:").is_some_and(topics)
 }
 
 /// 插件权限 `^(net\.outbound|fs\.read|fs\.write|capability):.+$`；`.` 不匹配换行。
@@ -237,11 +241,24 @@ mod tests {
         for version in ["", "1.0", "1.0.0.0", "1.0.0-", "1.0.0+", "v1.0.0", "1.0.0-é", "1..0", "1.0.0\n"] {
             assert!(!is_semver(version), "{version}");
         }
-        for event in ["onStartup", "onOperation:orders.*", "onEvent:a-b.c"] {
+        // 只有 onEvent: 的模式收下划线：主题有这个字符，操作 ID 没有
+        for event in ["onStartup", "onOperation:orders.*", "onEvent:a-b.c", "onEvent:order_events.*", "onEvent:_", "onEvent:*"] {
             assert!(is_activation_event(event), "{event}");
         }
-        for event in ["", "onBoot", "onOperation:", "onEvent:Orders", "onStartup:x", "onStartup\n"] {
-            assert!(!is_activation_event(event), "{event}");
+        for event in [
+            "",
+            "onBoot",
+            "onOperation:",
+            "onEvent:",
+            "onEvent:Orders",
+            "onEvent:Order_Placed",
+            "onOperation:order_lines.*",
+            "onEvent:order events",
+            "onEvent:order_events\n",
+            "onStartup:x",
+            "onStartup\n",
+        ] {
+            assert!(!is_activation_event(event), "{event:?}");
         }
         for permission in ["net.outbound:api.example.com", "fs.read:/tmp", "capability:kernel.pipeline", "fs.write::", "fs.read:a\rb"] {
             assert!(is_permission(permission), "{permission}");
