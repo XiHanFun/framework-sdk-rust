@@ -2070,3 +2070,79 @@ async fn cancelled_calls_signal_the_token() {
     stop(&mut client, running).await;
     assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
 }
+
+// ---------------------------------------------------------------------------
+// 信封的属性（invocation.md §4）
+// ---------------------------------------------------------------------------
+
+/// 只订阅 `orders.events` 的插件：投递的信封依次记进 `seen`。
+fn recording_plugin(seen: &Arc<Mutex<Vec<Envelope>>>) -> Plugin {
+    let seen = Arc::clone(seen);
+    Plugin::new(MANIFEST)
+        .with_subscription(
+            Subscription::new("orders.events"),
+            event_handler_fn(move |_: &Context, event: Event| {
+                seen.lock().unwrap().push(event.envelope);
+                Box::pin(async { Ok(()) })
+            }),
+        )
+        .with_network(Network::Tcp)
+        .with_logger(Logger::new(Buffer::default()))
+}
+
+/// 只登记 `orders.publish` 的插件：把 `envelopes` 经 `Host::publish` 发出，载荷是逐项结果。
+fn publishing_plugin(envelopes: Vec<Envelope>) -> Plugin {
+    let registry = Arc::new(Registry::new());
+    registry
+        .add(
+            Contract::new("orders.publish"),
+            operation::handler_fn(move |ctx: &Context, _: Empty| {
+                let envelopes = envelopes.clone();
+                Box::pin(async move {
+                    let host = plugin::host(ctx).expect("the runtime puts the host client into every call");
+                    Ok(Published { outcomes: host.publish(ctx, envelopes).await.into_iter().map(outcome).collect() })
+                })
+            }),
+        )
+        .unwrap();
+    Plugin::new(MANIFEST).with_operations(registry).with_network(Network::Tcp).with_logger(Logger::new(Buffer::default()))
+}
+
+/// 一次带 `data_schema` 的投递。
+fn delivery_with(data_schema: &str) -> v1::HandleEventRequest {
+    let mut request = delivery("e1", "orders.events", "orders.created", "competing");
+    if let Some(envelope) = request.envelope.as_mut() {
+        envelope.data_schema = data_schema.to_owned();
+    }
+    request
+}
+
+#[tokio::test]
+async fn delivered_envelopes_carry_the_data_schema_as_sent() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let running = recording_plugin(&seen).start(Launch::new(TOKEN)).await.unwrap();
+    let mut client = connect(running.endpoint()).await;
+    open(&mut client, &[]).await;
+    // 空串是没有；带空白、不是 URI 的也原样交出，不裁剪、不核对（ADR-0305）
+    for data_schema in ["", "https://schemas.example.com/orders/v1.json", " not a uri ", "\t"] {
+        assert!(client.handle_event(delivery_with(data_schema)).await.unwrap().into_inner().status.unwrap().ok, "{data_schema:?}");
+    }
+    let delivered: Vec<Option<String>> = seen.lock().unwrap().iter().map(|envelope| envelope.data_schema.clone()).collect();
+    assert_eq!(delivered, [None, Some("https://schemas.example.com/orders/v1.json".to_owned()), Some(" not a uri ".to_owned()), Some("\t".to_owned())]);
+    stop(&mut client, running).await;
+}
+
+#[tokio::test]
+async fn published_envelopes_carry_the_data_schema_as_given() {
+    let host = Arc::new(FakeHost::default());
+    let address = fake_host(&host).await;
+    let envelope = |id: &str| Envelope::new("orders.events", id, "urn:test", "orders.created");
+    let envelopes = vec![envelope("e0").with_data_schema("urn:example:orders:v1"), envelope("e1"), envelope("e2").with_data_schema(" not a uri ")];
+    let running = publishing_plugin(envelopes).start(launch_with(&address)).await.unwrap();
+    let mut client = connect(running.endpoint()).await;
+    open(&mut client, &[plugin::PERMISSION_MESSAGING]).await;
+    assert_eq!(payload(&invoke(&mut client, "orders.publish", "{}", None).await), json!({"outcomes": ["ok", "ok", "ok"]}));
+    let written: Vec<String> = host.publishes.lock().unwrap().last().unwrap().2.envelopes.iter().map(|envelope| envelope.data_schema.clone()).collect();
+    assert_eq!(written, ["urn:example:orders:v1", "", " not a uri "]);
+    stop(&mut client, running).await;
+}

@@ -376,6 +376,9 @@ pub struct Envelope {
         ::prost::alloc::string::String,
         ::prost::alloc::string::String,
     >,
+    /// `dataschema`（URI，取值规则见 RFC-0009「信封」）；可空。同一协议版本里的新增字段，较早的对端忽略它（invocation.md §4）。
+    #[prost(string, tag = "11")]
+    pub data_schema: ::prost::alloc::string::String,
 }
 /// 插件 → 宿主：发布消息。
 #[derive(Clone, PartialEq, ::prost::Message)]

@@ -149,19 +149,20 @@ pub(crate) fn metadata_of(ctx: &Context) -> v1::InvocationMetadata {
     }
 }
 
-/// 协议的信封 → 信封；空的 `subject` 与 `time` 是没有。
+/// 协议的信封 → 信封；空的 `subject`、`time` 与 `data_schema` 是没有，其余原样。
 pub(crate) fn envelope_of(envelope: v1::Envelope) -> Envelope {
     let mut decoded = Envelope::new(envelope.topic, envelope.id, envelope.source, envelope.r#type);
     decoded.spec_version = envelope.spec_version;
     decoded.subject = Some(envelope.subject).filter(|subject| !subject.is_empty());
     decoded.time = Some(envelope.time).filter(|time| !time.is_empty());
     decoded.data_content_type = envelope.data_content_type;
+    decoded.data_schema = Some(envelope.data_schema).filter(|data_schema| !data_schema.is_empty());
     decoded.data = envelope.data;
     decoded.extensions = envelope.extensions.into_iter().collect();
     decoded
 }
 
-/// 信封 → 协议的信封；空的 `specversion` 与 `datacontenttype` 写成缺省的 `1.0` 与 `application/json`。
+/// 信封 → 协议的信封；空的 `specversion` 与 `datacontenttype` 写成缺省的 `1.0` 与 `application/json`，没有 `dataschema` 写空串。
 pub(crate) fn proto_envelope(envelope: Envelope) -> v1::Envelope {
     v1::Envelope {
         topic: envelope.topic,
@@ -174,6 +175,7 @@ pub(crate) fn proto_envelope(envelope: Envelope) -> v1::Envelope {
         data_content_type: if envelope.data_content_type.is_empty() { "application/json".to_owned() } else { envelope.data_content_type },
         data: envelope.data,
         extensions: envelope.extensions.into_iter().collect(),
+        data_schema: envelope.data_schema.unwrap_or_default(),
     }
 }
 

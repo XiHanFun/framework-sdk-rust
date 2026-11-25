@@ -100,6 +100,10 @@ pub struct Envelope {
     pub time: Option<String>,
     /// `datacontenttype`；缺省 `application/json`。
     pub data_content_type: String,
+    /// `dataschema`（数据遵循的模式，URI）；`None` 与空串都是没有（`invocation.md` §4，ADR-0305）。
+    ///
+    /// 原样写给宿主、原样交给处理器：SDK 不裁剪、不核对 URI 语法，只有空白的值由宿主拒绝那一项。
+    pub data_schema: Option<String>,
     /// `data`。
     pub data: Vec<u8>,
     /// 扩展属性，如携带租户的 `xihantenant`（[`TENANT_EXTENSION`](super::TENANT_EXTENSION)）。
@@ -118,6 +122,7 @@ impl Envelope {
             subject: None,
             time: None,
             data_content_type: "application/json".to_owned(),
+            data_schema: None,
             data: Vec::new(),
             extensions: BTreeMap::new(),
         }
@@ -150,6 +155,13 @@ impl Envelope {
     #[must_use]
     pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
         self.subject = Some(subject.into());
+        self
+    }
+
+    /// 设置 `dataschema`，原样写给宿主。
+    #[must_use]
+    pub fn with_data_schema(mut self, data_schema: impl Into<String>) -> Self {
+        self.data_schema = Some(data_schema.into());
         self
     }
 
