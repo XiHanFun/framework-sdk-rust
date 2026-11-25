@@ -14,13 +14,14 @@ const CLAIMED_PROFILES: [&str; 2] = ["core", "plugin"];
 /// 本 SDK 的测试回放的向量文件（相对 `spec/conformance/vectors/`，以 `/` 分隔），行尾注释是回放它的测试。
 ///
 /// `plugin/` 下的在打开 feature `plugin` 时回放；新增回放时加进来，不再回放时删掉。
-const REPLAYED: [&str; 21] = [
+const REPLAYED: [&str; 22] = [
     "manifest/manifests.json",                 // tests/manifest.rs
     "operations/payload-reasons.json",         // tests/operation.rs
     "pipeline/ordering.json",                  // tests/pipeline.rs
     "plugin/binding-properties.json",          // tests/plugin.rs（reading；names、limits、delivery 与 json 是宿主一侧的）
     "plugin/callback-status.json",             // tests/plugin.rs、src/plugin/host.rs
     "plugin/deadlines.json",                   // src/plugin/time.rs
+    "plugin/envelope-times.json",              // src/plugin/time.rs（host 档；信封的 time 是 SystemTime 之后自测读写，ADR-0293）
     "plugin/error-reading.json",               // src/plugin/convert.rs
     "plugin/handshake-lines.json",             // tests/plugin.rs
     "plugin/host-addresses.json",              // tests/plugin.rs

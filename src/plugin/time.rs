@@ -1,5 +1,6 @@
 //! 截止时间的两种线上写法：`InvocationMetadata.deadline` 的文本（文法在 RFC-0003 规则 8，与 HTTP 载体的 `xihan-deadline` 头共用；
-//! 写法与取较早者在 `invocation.md` §2，向量 `plugin/deadlines.json`），与 gRPC 的 `grpc-timeout` 头。
+//! 写法与取较早者在 `invocation.md` §2，向量 `plugin/deadlines.json`），与 gRPC 的 `grpc-timeout` 头；以及信封的 `time`
+//! （`invocation.md` §4，读法与截止时间同一条文法，写法是 SDK 共用的 `Z` 结尾、去掉小数末尾 0 的 RFC 3339，向量 `plugin/envelope-times.json`）。
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -11,6 +12,12 @@ const NANOS: u32 = 1_000_000_000;
 const MIN_SECONDS: i64 = -62_135_596_800;
 /// `deadline` 允许的最晚时刻 `9999-12-31T23:59:59Z`（不计小数），Unix 纪元起的秒数。
 const MAX_SECONDS: i64 = 253_402_300_799;
+/// 本平台 [`SystemTime`] 的精度（纳秒）：Windows 是 100 纳秒（`FILETIME`），其余平台是 1 纳秒。
+#[cfg(windows)]
+const SYSTEM_TIME_RESOLUTION: u32 = 100;
+/// 本平台 [`SystemTime`] 的精度（纳秒）：Windows 是 100 纳秒（`FILETIME`），其余平台是 1 纳秒。
+#[cfg(not(windows))]
+const SYSTEM_TIME_RESOLUTION: u32 = 1;
 
 /// 一个 UTC 时刻：Unix 纪元起的秒数与纳秒（`0`–`999_999_999`）。
 ///
@@ -31,6 +38,19 @@ impl UtcTime {
         }
         let before = Duration::from_secs(self.seconds.unsigned_abs()) - Duration::from_nanos(u64::from(self.nanos));
         UNIX_EPOCH.checked_sub(before).unwrap_or(UNIX_EPOCH)
+    }
+
+    /// 换成本平台的 [`SystemTime`]，时刻不变：精度比纳秒粗的平台（Windows 是 100 纳秒）把多出的小数截断、不进位
+    /// （`invocation.md` §4）；本平台表示不了（Windows 上 1601 年之前）为 `None`。
+    pub(crate) fn to_exact_system_time(self) -> Option<SystemTime> {
+        let nanos = self.nanos - self.nanos % SYSTEM_TIME_RESOLUTION;
+        // 纪元之前的时刻先退整秒、再加截断过的小数：直接减去「整秒减小数」的时长时，平台按自己的精度截断那段时长，结果朝纪元进位
+        let whole = if self.seconds >= 0 {
+            UNIX_EPOCH.checked_add(Duration::from_secs(self.seconds.unsigned_abs()))
+        } else {
+            UNIX_EPOCH.checked_sub(Duration::from_secs(self.seconds.unsigned_abs()))
+        };
+        whole?.checked_add(Duration::from_nanos(u64::from(nanos)))
     }
 
     /// 从 [`SystemTime`] 换过来。
@@ -102,6 +122,24 @@ pub(crate) fn format_deadline(time: UtcTime) -> String {
     let (days, of_day) = (time.seconds.div_euclid(DAY), time.seconds.rem_euclid(DAY));
     let (year, month, day) = civil_from_days(days);
     format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{:07}+00:00", of_day / 3600, of_day % 3600 / 60, of_day % 60, time.nanos / 100)
+}
+
+/// 写出信封的 `time`（`invocation.md` §4）：UTC、以 `Z` 结尾，秒的小数部分去掉末尾的 0、全为 0 时不写小数点，如
+/// `2026-11-25T03:25:00.5Z`；各语言的 SDK 对同一时刻写出同一份文本（精度以内）。
+///
+/// 不核对范围：年份不在 `0001`–`9999` 之间的时刻照样写出（`10000-…`、`0000-…`），由宿主逐项核对时拒绝那一项，
+/// 不改变它与其余核对的先后（ADR-0293）。
+pub(crate) fn format_envelope_time(time: UtcTime) -> String {
+    let (days, of_day) = (time.seconds.div_euclid(DAY), time.seconds.rem_euclid(DAY));
+    let (year, month, day) = civil_from_days(days);
+    let mut text = format!("{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}", of_day / 3600, of_day % 3600 / 60, of_day % 60);
+    if time.nanos != 0 {
+        let fraction = format!("{:09}", time.nanos);
+        text.push('.');
+        text.push_str(fraction.trim_end_matches('0'));
+    }
+    text.push('Z');
+    text
 }
 
 /// 生效的截止时间（`invocation.md` §2）：`metadata` 按 [`parse_deadline`] 读、读不出当作没有，与 gRPC 调用自身的截止时间取较早的一个；
@@ -245,6 +283,101 @@ mod tests {
         assert_eq!(format_deadline(UtcTime { seconds: MIN_SECONDS - DAY, nanos: 0 }), "0001-01-01T00:00:00.0000000+00:00");
         // 表示不了的更早时刻作为截止时间同样已经过去
         assert!(parse_deadline("0001-01-01T00:00:00Z").unwrap().to_system_time() <= UNIX_EPOCH);
+    }
+
+    /// 作者给的时刻与 SDK 写出的 `time`：换算成 UTC、以 `Z` 结尾，秒的小数部分去掉末尾的 0、全为 0 时不写小数点；
+    /// 各语言的 SDK 对同一时刻写出同一份文本（精度以内）。这里按纳秒写，经 [`SystemTime`] 时再按本平台的精度截断。
+    const WRITTEN: [(&str, &str); 13] = [
+        ("2026-11-25T03:25:00Z", "2026-11-25T03:25:00Z"),
+        ("2026-11-25T03:25:00.5Z", "2026-11-25T03:25:00.5Z"),
+        ("2026-11-25T03:25:00.120Z", "2026-11-25T03:25:00.12Z"),
+        ("2026-11-25T03:25:00.001Z", "2026-11-25T03:25:00.001Z"),
+        ("2026-11-25T03:25:00.123456Z", "2026-11-25T03:25:00.123456Z"),
+        ("2026-11-25T03:25:00.123456789Z", "2026-11-25T03:25:00.123456789Z"),
+        ("2026-11-25T03:25:00.0000001Z", "2026-11-25T03:25:00.0000001Z"),
+        ("2026-11-25T11:25:00.25+08:00", "2026-11-25T03:25:00.25Z"),
+        ("2026-11-24T22:25:00-05:00", "2026-11-25T03:25:00Z"),
+        ("2026-11-25T00:00:00+14:00", "2026-11-24T10:00:00Z"),
+        ("0001-01-01T00:00:00Z", "0001-01-01T00:00:00Z"),
+        ("9999-12-31T23:59:59.999Z", "9999-12-31T23:59:59.999Z"),
+        ("9999-12-31T23:59:59.999999999Z", "9999-12-31T23:59:59.999999999Z"),
+    ];
+
+    /// 读规范子模块里的向量 `plugin/envelope-times.json`。
+    fn envelope_times() -> Value {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/spec/conformance/vectors/plugin/envelope-times.json");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}; run `git submodule update --init`"));
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// 时刻经本平台的 [`SystemTime`] 往返：小数按平台的精度截断，表示不了的为 `None`。
+    fn through_system_time(time: UtcTime) -> Option<UtcTime> {
+        time.to_exact_system_time().map(UtcTime::from_system_time)
+    }
+
+    /// 截到本平台的精度。
+    fn truncated(time: UtcTime) -> UtcTime {
+        UtcTime { seconds: time.seconds, nanos: time.nanos - time.nanos % SYSTEM_TIME_RESOLUTION }
+    }
+
+    #[test]
+    fn envelope_times_are_written_in_utc_without_trailing_zeros() {
+        for (instant, text) in WRITTEN {
+            let time = parse_deadline(instant).unwrap_or_else(|| panic!("{instant}"));
+            assert_eq!(format_envelope_time(time), text, "{instant}");
+            // 写出的文本合文法、读回同一时刻
+            assert_eq!(parse_deadline(text), Some(time), "{text}");
+            // 经 SystemTime 写出时按本平台的精度截断：Windows 上最多七位
+            if let Some(system) = through_system_time(time) {
+                assert_eq!(system, truncated(time), "{instant}");
+                assert_eq!(parse_deadline(&format_envelope_time(system)), Some(system), "{instant}");
+            }
+        }
+        // SDK 不在本地核对：年份越界的时刻照样写出，由宿主拒绝那一项
+        assert_eq!(format_envelope_time(UtcTime { seconds: MAX_SECONDS + 1, nanos: 0 }), "10000-01-01T00:00:00Z");
+        assert_eq!(format_envelope_time(UtcTime { seconds: MIN_SECONDS - DAY, nanos: 500_000_000 }), "0000-12-31T00:00:00.5Z");
+        assert_eq!(format_envelope_time(UtcTime::from_system_time(UNIX_EPOCH - Duration::new(1, 500_000_000))), "1969-12-31T23:59:58.5Z");
+    }
+
+    #[test]
+    fn envelope_times_follow_the_vectors() {
+        let vectors = envelope_times();
+        for case in vectors["valid"].as_array().unwrap() {
+            let text = case["text"].as_str().unwrap();
+            let Some(utc) = case["utc"].as_str() else {
+                assert_eq!(text, "", "only the empty text is no time");
+                continue;
+            };
+            let parsed = parse_deadline(text).unwrap_or_else(|| panic!("{text} must be read"));
+            assert_eq!(utc_text(parsed), utc, "{text}");
+            assert_eq!(parse_deadline(&format_envelope_time(parsed)), Some(parsed), "{text}");
+        }
+        for text in vectors["invalid"].as_array().unwrap() {
+            let text = text.as_str().unwrap();
+            assert_eq!(parse_deadline(text), None, "{text:?}");
+        }
+        for case in vectors["written"].as_array().unwrap() {
+            let text = case["text"].as_str().unwrap();
+            match case["instant"].as_str() {
+                Some(instant) => assert_eq!(parse_deadline(text), parse_deadline(instant), "{text}"),
+                None => assert_eq!(text, "", "no time is written as an empty string"),
+            }
+        }
+    }
+
+    #[test]
+    fn envelope_times_convert_to_system_time_exactly() {
+        // 纪元之前不足一个精度单位的小数截断，时刻往前、不朝纪元进位
+        let before = parse_deadline("1969-12-31T23:59:59.00000005Z").unwrap();
+        assert_eq!(through_system_time(before), Some(truncated(before)));
+        assert_eq!(before.to_exact_system_time(), Some(UNIX_EPOCH - Duration::from_secs(1) + Duration::from_nanos(u64::from(truncated(before).nanos))));
+        let latest = parse_deadline("9999-12-31T23:59:59.999999999Z").unwrap();
+        assert_eq!(through_system_time(latest), Some(truncated(latest)));
+        // 0001 年：Windows 的 SystemTime 从 1601 年起，表示不了；其余平台照常
+        let earliest = parse_deadline("0001-01-01T00:00:00Z").unwrap();
+        assert_eq!(through_system_time(earliest), if cfg!(windows) { None } else { Some(earliest) });
+        let windows_epoch = parse_deadline("1601-01-01T00:00:00Z").unwrap();
+        assert_eq!(through_system_time(windows_epoch), Some(windows_epoch));
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! `plugin/protocol-versions.json`、`plugin/binding-properties.json`（插件一侧的 `reading`，ADR-0285）与 `plugin/callback-status.json`
 //! （经假的宿主端到端；`deadlines.json`、`plugin-messages.json` 与回调映射的全部用例在 crate 内的单元测试回放），再以扮演宿主的 gRPC
 //! 客户端核对：启动前的核对、握手、会话令牌、调用次序、配置节、绑定与属性、就绪、健康、停止与收尾、调用与投递的核对顺序、上下文还原、
-//! 错误的写出与读入、回调的本地核对、元数据与状态映射。
+//! 错误的写出与读入、回调的本地核对、元数据与状态映射，以及信封的 `time` 与 `dataschema` 在投递与发布两个方向上的读写。
 
 mod common;
 
@@ -14,7 +14,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context as TaskContext, Poll};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use hyper_util::rt::TokioIo;
 use prost::Message;
@@ -2144,5 +2144,66 @@ async fn published_envelopes_carry_the_data_schema_as_given() {
     assert_eq!(payload(&invoke(&mut client, "orders.publish", "{}", None).await), json!({"outcomes": ["ok", "ok", "ok"]}));
     let written: Vec<String> = host.publishes.lock().unwrap().last().unwrap().2.envelopes.iter().map(|envelope| envelope.data_schema.clone()).collect();
     assert_eq!(written, ["urn:example:orders:v1", "", " not a uri "]);
+    stop(&mut client, running).await;
+}
+
+/// 一次带 `time` 的投递，主题可以没有订阅。
+fn delivery_at(topic: &str, time: &str) -> v1::HandleEventRequest {
+    let mut request = delivery("e1", topic, "orders.created", "competing");
+    if let Some(envelope) = request.envelope.as_mut() {
+        envelope.time = time.to_owned();
+    }
+    request
+}
+
+#[tokio::test]
+async fn delivered_envelopes_carry_the_time_as_a_system_time() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let running = recording_plugin(&seen).start(Launch::new(TOKEN)).await.unwrap();
+    let mut client = connect(running.endpoint()).await;
+    open(&mut client, &[]).await;
+    // 带偏移的换算成 UTC；空串是没有
+    for time in ["2026-11-25T11:25:00.5000000+08:00", "", "2026-11-25T03:25:00.123456789Z"] {
+        assert!(client.handle_event(delivery_at("orders.events", time)).await.unwrap().into_inner().status.unwrap().ok, "{time:?}");
+    }
+    // 读不出的是 InvalidArgument，主题没有订阅也一样：time 在找订阅之前核对
+    for topic in ["orders.events", "orders.other"] {
+        for time in ["2026-12-31T23:59:60Z", "2026-11-25T03:25:00", "2026-11-25T03:25:00.1234567890Z", "0001-01-01T00:00:00+00:01"] {
+            assert_eq!(client.handle_event(delivery_at(topic, time)).await.unwrap_err().code(), Code::InvalidArgument, "{topic} {time}");
+        }
+    }
+    // 0001 年合文法：Windows 的 SystemTime 表示不了，同样是 InvalidArgument；其余平台照常交出
+    let earliest = client.handle_event(delivery_at("orders.events", "0001-01-01T00:00:00Z")).await;
+    assert_eq!(earliest.is_err(), cfg!(windows), "{earliest:?}");
+    let at = |seconds: u64, nanos: u32| Some(UNIX_EPOCH + Duration::new(seconds, nanos));
+    // Windows 的 SystemTime 是 100 纳秒，九位小数截到七位
+    let fine = if cfg!(windows) { 123_456_700 } else { 123_456_789 };
+    let mut expected = vec![at(1_795_577_100, 500_000_000), None, at(1_795_577_100, fine)];
+    if !cfg!(windows) {
+        expected.push(UNIX_EPOCH.checked_sub(Duration::from_secs(62_135_596_800)));
+    }
+    let delivered: Vec<Option<SystemTime>> = seen.lock().unwrap().iter().map(|envelope| envelope.time).collect();
+    assert_eq!(delivered, expected);
+    stop(&mut client, running).await;
+}
+
+#[tokio::test]
+async fn published_envelopes_carry_the_time_in_utc() {
+    let host = Arc::new(FakeHost::default());
+    let address = fake_host(&host).await;
+    let envelope = |id: &str| Envelope::new("orders.events", id, "urn:test", "orders.created");
+    let envelopes = vec![
+        envelope("e0").with_time(UNIX_EPOCH + Duration::new(1_795_577_100, 250_000_000)),
+        envelope("e1"),
+        envelope("e2").with_time(UNIX_EPOCH + Duration::from_secs(1_795_577_100)),
+        // 年份越界的时刻 SDK 不核对，照写给宿主
+        envelope("e3").with_time(UNIX_EPOCH + Duration::from_secs(253_402_300_800)),
+    ];
+    let running = publishing_plugin(envelopes).start(launch_with(&address)).await.unwrap();
+    let mut client = connect(running.endpoint()).await;
+    open(&mut client, &[plugin::PERMISSION_MESSAGING]).await;
+    assert_eq!(payload(&invoke(&mut client, "orders.publish", "{}", None).await), json!({"outcomes": ["ok", "ok", "ok", "ok"]}));
+    let written: Vec<String> = host.publishes.lock().unwrap().last().unwrap().2.envelopes.iter().map(|envelope| envelope.time.clone()).collect();
+    assert_eq!(written, ["2026-11-25T03:25:00.25Z", "", "2026-11-25T03:25:00Z", "10000-01-01T00:00:00Z"]);
     stop(&mut client, running).await;
 }

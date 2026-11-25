@@ -5,7 +5,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -96,8 +96,14 @@ pub struct Envelope {
     pub spec_version: String,
     /// `subject`。
     pub subject: Option<String>,
-    /// `time`（RFC 3339）。
-    pub time: Option<String>,
+    /// `time`：信封的时刻，`None` 是没有（RFC-0009「信封」第 3 条，`invocation.md` §4）。
+    ///
+    /// 发布时换算成 UTC 写成 RFC 3339：以 `Z` 结尾，秒的小数部分去掉末尾的 0、全为 0 时不写小数点，最多九位（Windows 的
+    /// [`SystemTime`] 是 100 纳秒，最多七位）。SDK 不在本地核对：年份不在 `0001`–`9999` 之间的时刻照样写出，由宿主以
+    /// `messaging.envelope.invalid_time` 拒绝那一项。投递时宿主写来的文本按规范的文法读（不认闰秒 `60`，小数一到九位，带偏移的换算成
+    /// UTC），比本平台 `SystemTime` 更细的小数截断、不进位；读不出、或本平台的 `SystemTime` 表示不了（Windows 上 1601 年之前）的投递
+    /// 以 gRPC `InvalidArgument` 拒绝，不交给处理器。
+    pub time: Option<SystemTime>,
     /// `datacontenttype`；缺省 `application/json`。
     pub data_content_type: String,
     /// `dataschema`（数据遵循的模式，URI）；`None` 与空串都是没有（`invocation.md` §4，ADR-0305）。
@@ -155,6 +161,13 @@ impl Envelope {
     #[must_use]
     pub fn with_subject(mut self, subject: impl Into<String>) -> Self {
         self.subject = Some(subject.into());
+        self
+    }
+
+    /// 设置 `time`。
+    #[must_use]
+    pub fn with_time(mut self, time: SystemTime) -> Self {
+        self.time = Some(time);
         self
     }
 

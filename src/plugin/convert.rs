@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::time::SystemTime;
 
 use super::messages::{PHASE_INVOKE, REASON_NO_ERROR, failed};
-use super::time::{UtcTime, effective_deadline, format_deadline};
+use super::time::{UtcTime, effective_deadline, format_deadline, format_envelope_time, parse_deadline};
 use super::types::{Envelope, Health};
 use super::v1;
 use crate::grammar::is_blank;
@@ -149,20 +149,35 @@ pub(crate) fn metadata_of(ctx: &Context) -> v1::InvocationMetadata {
     }
 }
 
-/// 协议的信封 → 信封；空的 `subject`、`time` 与 `data_schema` 是没有，其余原样。
-pub(crate) fn envelope_of(envelope: v1::Envelope) -> Envelope {
+/// 宿主写来的协议的信封 → 信封；空的 `subject`、`time` 与 `data_schema` 是没有，其余原样。
+///
+/// `time` 按截止时间同一条文法读成 UTC 时刻，再换成本平台的 [`SystemTime`]（更细的小数截断，`invocation.md` §4）；读不出或本平台
+/// 表示不了时为 `Err`，内容是 `InvalidArgument` 的说明。
+pub(crate) fn envelope_of(envelope: v1::Envelope) -> std::result::Result<Envelope, String> {
+    let time = match envelope.time.as_str() {
+        "" => None,
+        text => {
+            let parsed = parse_deadline(text).ok_or_else(|| format!("The envelope time '{text}' does not follow the timestamp grammar."))?;
+            Some(
+                parsed
+                    .to_exact_system_time()
+                    .ok_or_else(|| format!("The envelope time '{text}' is earlier than SystemTime can represent on this platform."))?,
+            )
+        }
+    };
     let mut decoded = Envelope::new(envelope.topic, envelope.id, envelope.source, envelope.r#type);
     decoded.spec_version = envelope.spec_version;
     decoded.subject = Some(envelope.subject).filter(|subject| !subject.is_empty());
-    decoded.time = Some(envelope.time).filter(|time| !time.is_empty());
+    decoded.time = time;
     decoded.data_content_type = envelope.data_content_type;
     decoded.data_schema = Some(envelope.data_schema).filter(|data_schema| !data_schema.is_empty());
     decoded.data = envelope.data;
     decoded.extensions = envelope.extensions.into_iter().collect();
-    decoded
+    Ok(decoded)
 }
 
-/// 信封 → 协议的信封；空的 `specversion` 与 `datacontenttype` 写成缺省的 `1.0` 与 `application/json`，没有 `dataschema` 写空串。
+/// 信封 → 协议的信封；空的 `specversion` 与 `datacontenttype` 写成缺省的 `1.0` 与 `application/json`，`time` 按
+/// [`format_envelope_time`] 写，没有 `time` 与 `dataschema` 写空串。
 pub(crate) fn proto_envelope(envelope: Envelope) -> v1::Envelope {
     v1::Envelope {
         topic: envelope.topic,
@@ -171,7 +186,7 @@ pub(crate) fn proto_envelope(envelope: Envelope) -> v1::Envelope {
         r#type: envelope.event_type,
         spec_version: if envelope.spec_version.is_empty() { "1.0".to_owned() } else { envelope.spec_version },
         subject: envelope.subject.unwrap_or_default(),
-        time: envelope.time.unwrap_or_default(),
+        time: envelope.time.map(|time| format_envelope_time(UtcTime::from_system_time(time))).unwrap_or_default(),
         data_content_type: if envelope.data_content_type.is_empty() { "application/json".to_owned() } else { envelope.data_content_type },
         data: envelope.data,
         extensions: envelope.extensions.into_iter().collect(),

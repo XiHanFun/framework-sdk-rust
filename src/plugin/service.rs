@@ -366,7 +366,8 @@ impl Plugin for PluginService {
         }
     }
 
-    /// 投递一条消息（`invocation.md` §4），依次：没有信封或方式不是空、`competing`、`broadcast` 为 `InvalidArgument`；按（主题，方式，
+    /// 投递一条消息（`invocation.md` §4），依次：没有信封、方式不是空、`competing`、`broadcast`，或信封的 `time` 读不出为
+    /// `InvalidArgument`；按（主题，方式，
     /// 类型）找订阅，一个也没有为 `KERNEL_NOTFOUND_001` + `plugins.event.unsubscribed`；不在可服务状态为 `PLUGINS_UNAVAILABLE_001`；
     /// 然后还原上下文，匹配的订阅按声明顺序依次交给各自的处理器，第一个失败即结果，处理器 panic 为 `KERNEL_UNEXPECTED_001` +
     /// `kernel.invocation.unhandled_exception`。
@@ -380,7 +381,8 @@ impl Plugin for PluginService {
         let Some(mode) = SubscriptionMode::parse(&request.mode) else {
             return Err(Status::invalid_argument(format!("The delivery mode '{}' is neither 'competing' nor 'broadcast'.", request.mode)));
         };
-        let envelope = envelope_of(envelope);
+        // 宿主写来的 time 按规范一律合文法；读不出是宿主写来的内容不合法，与没有信封同一处置，不找订阅、不交给处理器
+        let envelope = envelope_of(envelope).map_err(Status::invalid_argument)?;
         let handlers: Vec<Arc<dyn EventHandler>> =
             runtime.subscriptions.iter().filter(|(subscription, _)| subscription.matches(&envelope, mode)).map(|(_, handler)| Arc::clone(handler)).collect();
         if handlers.is_empty() {
