@@ -88,7 +88,7 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
   2. `git -C spec fetch`，`git -C spec checkout <提交>`。
   3. 重新生成协议代码 `cargo run --manifest-path tools/protogen/Cargo.toml`，生成物一并提交（CI 重新生成并核对）。
   4. 跑全部门禁；`conformance_vectors.rs` 会指出认领的档里新增的向量，`plugin_conformance.rs` 会跑到运行器的新用例（`CASES` 与运行器的用例表一致）。
-  5. 只升指针时提交 `chore(spec): 规范指针升到 <短哈希>（ADR-NNNN：…）`；与实现改动同属一个闭环时并进实现的提交，说明里写「规范指针升到 <短哈希>」。
+  5. 只升指针时提交 `build(spec): 规范指针升到 <短哈希>（ADR-NNNN）`；与实现改动同属一个闭环时并进实现的提交，说明写实现的结果并注 ADR，不另写指针哈希。
 - 发预发布或正式版时 `spec/` 必须正好在规范标签上：正式版只钉规范的正式版标签，预发布可以钉 rc 标签（RFC-0024）。
 
 ## 代码规范
@@ -140,6 +140,7 @@ framework-sdk-rust 是 [XiHan Spec](https://github.com/XiHanFun/framework-spec) 
 ## Git 与提交
 
 - 使用 Conventional Commits：`<type>(<scope>): <中文说明>`；scope 用模块名 `primitives`、`manifest`、`invocation`、`pipeline`、`operation`、`plugin`，或 `conformance`、`spec`、`docs`、`build`、`ci`。
+- 提交信息只写一行标题，不写正文。说明一句话讲这次改动的结果，不超过 40 个字（汉字、字母、数字、标点各算一个，末尾的 `（ADR-NNNN）` 不计）；不再用「：」「；」往下展开，不罗列文件、成员、取值与改前改后，不写测试数量与门禁结果，这些细节写进 文档页、ADR 或 PR 描述。细则见 `commit-msg` 技能。
 - 每项能力或独立修复单独提交；实现、测试与 README 属于同一闭环时放在同一提交，文档页在 XiHan.Framework 另行提交。
 - 保留用户已有和无关改动，只暂存自己的文件；不 reset、checkout 或清理它们。
 - 提交前检查 `git diff --check` 与相关门禁。
