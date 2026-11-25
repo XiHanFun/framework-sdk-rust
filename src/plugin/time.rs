@@ -12,12 +12,17 @@ const NANOS: u32 = 1_000_000_000;
 const MIN_SECONDS: i64 = -62_135_596_800;
 /// `deadline` 允许的最晚时刻 `9999-12-31T23:59:59Z`（不计小数），Unix 纪元起的秒数。
 const MAX_SECONDS: i64 = 253_402_300_799;
-/// 本平台 [`SystemTime`] 的精度（纳秒）：Windows 是 100 纳秒（`FILETIME`），其余平台是 1 纳秒。
+/// 把纳秒截到本平台 [`SystemTime`] 的精度：Windows 是 100 纳秒（`FILETIME`），不足 100 纳秒的部分截掉、不进位。
 #[cfg(windows)]
-const SYSTEM_TIME_RESOLUTION: u32 = 100;
-/// 本平台 [`SystemTime`] 的精度（纳秒）：Windows 是 100 纳秒（`FILETIME`），其余平台是 1 纳秒。
+const fn truncate_to_system_time(nanos: u32) -> u32 {
+    nanos - nanos % 100
+}
+
+/// 把纳秒截到本平台 [`SystemTime`] 的精度：Windows 以外的平台是 1 纳秒，原样返回。
 #[cfg(not(windows))]
-const SYSTEM_TIME_RESOLUTION: u32 = 1;
+const fn truncate_to_system_time(nanos: u32) -> u32 {
+    nanos
+}
 
 /// 一个 UTC 时刻：Unix 纪元起的秒数与纳秒（`0`–`999_999_999`）。
 ///
@@ -43,7 +48,7 @@ impl UtcTime {
     /// 换成本平台的 [`SystemTime`]，时刻不变：精度比纳秒粗的平台（Windows 是 100 纳秒）把多出的小数截断、不进位
     /// （`invocation.md` §4）；本平台表示不了（Windows 上 1601 年之前）为 `None`。
     pub(crate) fn to_exact_system_time(self) -> Option<SystemTime> {
-        let nanos = self.nanos - self.nanos % SYSTEM_TIME_RESOLUTION;
+        let nanos = truncate_to_system_time(self.nanos);
         // 纪元之前的时刻先退整秒、再加截断过的小数：直接减去「整秒减小数」的时长时，平台按自己的精度截断那段时长，结果朝纪元进位
         let whole = if self.seconds >= 0 {
             UNIX_EPOCH.checked_add(Duration::from_secs(self.seconds.unsigned_abs()))
@@ -317,7 +322,7 @@ mod tests {
 
     /// 截到本平台的精度。
     fn truncated(time: UtcTime) -> UtcTime {
-        UtcTime { seconds: time.seconds, nanos: time.nanos - time.nanos % SYSTEM_TIME_RESOLUTION }
+        UtcTime { seconds: time.seconds, nanos: truncate_to_system_time(time.nanos) }
     }
 
     #[test]
