@@ -349,4 +349,62 @@ mod tests {
         assert_eq!(context_of(None, None, &CancellationToken::new()).deadline(), None);
         assert_eq!(context_of(None, grpc, &CancellationToken::new()).deadline(), grpc);
     }
+
+    /// 本平台 [`SystemTime`] 的精度在向量 `plugin/sdk-envelope-times.json` 里的名字：Windows 是 100 纳秒（`FILETIME`），其余平台是纳秒。
+    const PRECISION: &str = if cfg!(windows) { "hundredNanoseconds" } else { "nanoseconds" };
+
+    /// 读规范子模块里的向量 `plugin/sdk-envelope-times.json`。
+    fn sdk_envelope_times() -> Value {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/spec/conformance/vectors/plugin/sdk-envelope-times.json");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}; run `git submodule update --init`"));
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// 向量里写成 UTC 的时刻是否早于 1601 年：Windows 的 [`SystemTime`] 从 1601-01-01 起，表示不了更早的时刻。
+    fn before_windows_epoch(utc: &str) -> bool {
+        utc[..4].parse::<u32>().unwrap() < 1601
+    }
+
+    /// 宿主写来的、只带 `time` 的协议信封。
+    fn timed(time: &str) -> v1::Envelope {
+        v1::Envelope { topic: "orders.events".to_owned(), id: "e1".to_owned(), spec_version: "1.0".to_owned(), time: time.to_owned(), ..Default::default() }
+    }
+
+    /// 回放 `plugin/sdk-envelope-times.json` 本平台精度的一列（`invocation.md` §4「SDK 读宿主写来的」「SDK 写给宿主的」，ADR-0306、ADR-0310）：
+    /// `writing` 的时刻按投递的读法 [`envelope_of`] 构造成 [`SystemTime`]，经发布的写法 [`proto_envelope`] 写出、与 `text` 逐字比较；
+    /// `reading` 经 [`envelope_of`] 读出、与 `utc` 是同一时刻；`unreadable` 读不出（投递以 `InvalidArgument` 拒绝另由 tests/plugin.rs 核对）。
+    #[test]
+    fn sdk_envelope_times_follow_the_vectors() {
+        let vectors = sdk_envelope_times();
+        assert_eq!(vectors["precisions"][PRECISION], if cfg!(windows) { 7 } else { 9 });
+        for case in vectors["writing"].as_array().unwrap() {
+            let (name, text) = (case["name"].as_str().unwrap(), case["text"][PRECISION].as_str().unwrap());
+            let envelope = match case["instant"].as_str() {
+                None => Envelope::new("orders.events", "e1", "urn:test", "orders.created"),
+                Some(instant) => match envelope_of(timed(instant)) {
+                    Ok(envelope) => envelope,
+                    // 跳过：Windows 上换算成 UTC 早于 1601 年的时刻（0001 年的两条）构造不出 SystemTime，作者给不出这样的时刻，没有可写的
+                    Err(_) if cfg!(windows) && before_windows_epoch(text) => continue,
+                    Err(reason) => panic!("{name}: {instant} must be read: {reason}"),
+                },
+            };
+            assert_eq!(proto_envelope(envelope).time, text, "{name}");
+        }
+        for case in vectors["reading"].as_array().unwrap() {
+            let (name, text, utc) = (case["name"].as_str().unwrap(), case["text"].as_str().unwrap(), case["utc"][PRECISION].as_str().unwrap());
+            let read = envelope_of(timed(text)).map(|envelope| envelope.time);
+            if cfg!(windows) && before_windows_epoch(utc) {
+                // Windows 上读出的时刻早于 1601 年（「最早的时刻之后 100 纳秒」）：SystemTime 表示不了，按读不出核对，投递以 InvalidArgument 拒绝
+                assert!(read.is_err(), "{name}: {text} cannot be represented on Windows, got {read:?}");
+                continue;
+            }
+            // utc 已经截到本平台的精度，换成 SystemTime 时不再截断
+            let expected = parse_deadline(utc).and_then(UtcTime::to_exact_system_time).unwrap_or_else(|| panic!("{name}: {utc}"));
+            assert_eq!(read, Ok(Some(expected)), "{name}: {text}");
+        }
+        for case in vectors["unreadable"].as_array().unwrap() {
+            let (name, text) = (case["name"].as_str().unwrap(), case["text"].as_str().unwrap());
+            assert!(envelope_of(timed(text)).is_err(), "{name}: {text:?} must not be read");
+        }
+    }
 }

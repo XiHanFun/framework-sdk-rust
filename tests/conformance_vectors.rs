@@ -14,19 +14,20 @@ const CLAIMED_PROFILES: [&str; 2] = ["core", "plugin"];
 /// 本 SDK 的测试回放的向量文件（相对 `spec/conformance/vectors/`，以 `/` 分隔），行尾注释是回放它的测试。
 ///
 /// `plugin/` 下的在打开 feature `plugin` 时回放；新增回放时加进来，不再回放时删掉。
-const REPLAYED: [&str; 22] = [
+const REPLAYED: [&str; 23] = [
     "manifest/manifests.json",                 // tests/manifest.rs
     "operations/payload-reasons.json",         // tests/operation.rs
     "pipeline/ordering.json",                  // tests/pipeline.rs
     "plugin/binding-properties.json",          // tests/plugin.rs（reading；names、limits、delivery 与 json 是宿主一侧的）
     "plugin/callback-status.json",             // tests/plugin.rs、src/plugin/host.rs
     "plugin/deadlines.json",                   // src/plugin/time.rs
-    "plugin/envelope-times.json",              // src/plugin/time.rs（host 档；信封的 time 是 SystemTime 之后自测读写，ADR-0293）
+    "plugin/envelope-times.json",              // src/plugin/time.rs（valid 与 invalid 是 SDK 的读入，written 是宿主的写法，ADR-0310）
     "plugin/error-reading.json",               // src/plugin/convert.rs
     "plugin/handshake-lines.json",             // tests/plugin.rs
     "plugin/host-addresses.json",              // tests/plugin.rs
     "plugin/plugin-messages.json",             // src/plugin/catalog.rs、src/plugin/messages.rs
     "plugin/protocol-versions.json",           // tests/plugin.rs
+    "plugin/sdk-envelope-times.json",          // src/plugin/convert.rs（Windows 取 100 纳秒、其余取纳秒，unreadable 另经 tests/plugin.rs 投递）
     "primitives/baggage-keys.json",            // tests/primitives.rs
     "primitives/capability-requirements.json", // tests/manifest.rs
     "primitives/error-codes.json",             // tests/primitives.rs

@@ -2166,10 +2166,13 @@ async fn delivered_envelopes_carry_the_time_as_a_system_time() {
     for time in ["2026-11-25T11:25:00.5000000+08:00", "", "2026-11-25T03:25:00.123456789Z"] {
         assert!(client.handle_event(delivery_at("orders.events", time)).await.unwrap().into_inner().status.unwrap().ok, "{time:?}");
     }
-    // 读不出的是 InvalidArgument，主题没有订阅也一样：time 在找订阅之前核对
+    // 读不出的是 InvalidArgument，主题没有订阅也一样：time 在找订阅之前核对；sdk-envelope-times.json 的 unreadable 每条都经投递核对（ADR-0310）
+    let vectors: Value = common::vector("plugin/sdk-envelope-times.json");
+    let mut unreadable = vec!["2026-12-31T23:59:60Z", "2026-11-25T03:25:00", "2026-11-25T03:25:00.1234567890Z", "0001-01-01T00:00:00+00:01"];
+    unreadable.extend(vectors["unreadable"].as_array().unwrap().iter().map(|case| case["text"].as_str().unwrap()));
     for topic in ["orders.events", "orders.other"] {
-        for time in ["2026-12-31T23:59:60Z", "2026-11-25T03:25:00", "2026-11-25T03:25:00.1234567890Z", "0001-01-01T00:00:00+00:01"] {
-            assert_eq!(client.handle_event(delivery_at(topic, time)).await.unwrap_err().code(), Code::InvalidArgument, "{topic} {time}");
+        for &time in &unreadable {
+            assert_eq!(client.handle_event(delivery_at(topic, time)).await.unwrap_err().code(), Code::InvalidArgument, "{topic} {time:?}");
         }
     }
     // 0001 年合文法：Windows 的 SystemTime 表示不了，同样是 InvalidArgument；其余平台照常交出
