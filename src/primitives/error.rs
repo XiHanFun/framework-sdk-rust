@@ -12,6 +12,7 @@ use super::error_code::{
     error_code_domain, error_code_kind, is_error_code, validate_error_code,
 };
 use super::framework::{FrameworkError, invalid_argument};
+use super::json::serialize_checked;
 use super::messages::{Details, describe, is_message_key, resolve_with_builtin};
 
 /// 没有细节时用来格式化的空参数表。
@@ -284,15 +285,18 @@ struct ErrorOut<'a> {
 
 impl Serialize for Error {
     /// 写出线上编码：`message` 是 [`Error::message`]，没有的键、空细节与内部错误省略。
+    ///
+    /// 写出的整段文本要过共同检查（RFC-0001「写出与转交」，ADR-0320）：从错误的根算起嵌套超过 64 层（细节或内部错误太深）时写不出，
+    /// 序列化以 `PRIMITIVES_VALIDATION_001` 的错误失败、不交出文本；嵌在结果里的错误由结果从它的根一并核对。
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        ErrorOut {
+        let out = ErrorOut {
             code: &self.code,
             message: self.message(),
             message_key: self.message_key.as_deref(),
             details: self.details.as_ref().filter(|details| !details.is_empty()),
             inner: self.inner.as_deref(),
-        }
-        .serialize(serializer)
+        };
+        serialize_checked(&out, "the error", serializer)
     }
 }
 

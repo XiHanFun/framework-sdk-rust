@@ -1,11 +1,15 @@
 //! 按值模型写出（RFC-0001「Result」、RFC-0010「模板」的值模型）。
 
+use std::cell::Cell;
+
 use serde::Serialize;
 use serde::ser::Error as _;
 use serde::ser::{
     SerializeMap, SerializeSeq, SerializeStruct, SerializeStructVariant, SerializeTuple, SerializeTupleStruct, SerializeTupleVariant, Serializer,
 };
 use serde_json::Value;
+
+use crate::primitives::ERROR_CODE_INVALID_ARGUMENT;
 
 /// 按值模型写出任意可序列化的值：单精度浮点先换成最接近的双精度（0.1 写 `0.10000000149011612`），`i128` / `u128` 超出 64 位的
 /// 是双精度浮点，非有限的浮点写成字符串 `NaN`、`Infinity`、`-Infinity`，其余照原样交给内层的序列化器。
@@ -61,6 +65,42 @@ pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, serde_json::E
 /// 序列化失败（如映射的键不是字符串）时返回 `serde_json` 的错误。
 pub fn to_value<T: Serialize + ?Sized>(value: &T) -> Result<Value, serde_json::Error> {
     Model(value).serialize(serde_json::value::Serializer)
+}
+
+thread_local! {
+    /// 正在为外层的线上编码核对与写出：嵌在里面的 Result 与 Error 不再各自核对，外层核对的整段文本已经包括它们
+    static WITHIN_CHECKED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// 离开外层的核对时恢复原来的标记；写出途中 panic 也恢复。
+struct CheckedScope(bool);
+
+impl Drop for CheckedScope {
+    fn drop(&mut self) {
+        WITHIN_CHECKED.set(self.0);
+    }
+}
+
+/// 按线上编码写出一个 Result 或 Error（RFC-0001「写出与转交」，ADR-0320）：先写成 JSON 文本过共同检查（[`check`](super::check)），
+/// 通过了才交给 `serializer` 写出；没过即写不出，返回 `PRIMITIVES_VALIDATION_001` 的序列化错误、不交出文本。
+///
+/// Rust 的字符串总是合法的 UTF-8，写不出的是嵌套超过 64 层（从这个结果或错误的根算起）与 `RawValue`（含 [`Json`](super::Json)）
+/// 原样写进去的文本里的重复成员、孤立代理项的转义：序列化器不数层数、不核对成员名，`RawValue` 的原文它只照抄，所以在缓冲里写一遍
+/// 再读。嵌在里面的 Result 与 Error 由最外层一并核对，不再各写一遍。
+pub(crate) fn serialize_checked<T, S>(value: &T, what: &str, serializer: S) -> Result<S::Ok, S::Error>
+where
+    T: Serialize + ?Sized,
+    S: Serializer,
+{
+    let outer = WITHIN_CHECKED.replace(true);
+    let _scope = CheckedScope(outer);
+    if !outer {
+        let text = serde_json::to_vec(value).map_err(S::Error::custom)?;
+        if let Err(problem) = super::check(&text) {
+            return Err(S::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: {what} cannot be written as JSON text: {problem}.")));
+        }
+    }
+    value.serialize(serializer)
 }
 
 /// 非有限浮点的文本，与模板里的写法相同。

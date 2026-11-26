@@ -8,7 +8,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use super::error::Error;
 use super::error_code::ERROR_CODE_INVALID_ARGUMENT;
-use super::json::Model;
+use super::json::{Model, serialize_checked};
 
 /// 成功或失败（RFC-0001 Result / Result&lt;T&gt;）：成功带值，失败带 [`Error`]。
 ///
@@ -33,6 +33,9 @@ pub type Maybe<T> = Option<T>;
 ///   直接交给 `serde_json` 时只查得出同一层的重复，值里面的重复取最后一个。
 /// - 数字按值模型往返（RFC-0010「模板」）：64 位范围内的整数原样，整数值的浮点写出时仍是浮点（`2.0`、`-0.0`、`1e17`）；
 ///   值经 [`json::Model`](super::json::Model) 写出，单精度先换成双精度，非有限的浮点写成字符串 `NaN`、`Infinity`、`-Infinity`。
+/// - 写出的整段文本要过共同检查（RFC-0001「写出与转交」，ADR-0320）：从结果的根算起（成功值的最外层是第 2 层）嵌套超过 64 层，
+///   或 `RawValue`（含 [`json::Json`](super::json::Json)）原样写进去的文本有重复成员、孤立代理项的转义时写不出，序列化以
+///   `PRIMITIVES_VALIDATION_001` 的错误失败、不交出文本，对方读不进的文本不写出去。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WireResult<T>(pub Result<T>);
 
@@ -60,8 +63,26 @@ fn is_unit<T: 'static>() -> bool {
     TypeId::of::<T>() == TypeId::of::<()>()
 }
 
-/// 按线上编码写出一个结果。
+/// 按线上编码写出一个结果：整段文本先过共同检查（[`json::serialize_checked`](super::json::serialize_checked)，ADR-0320）。
 fn serialize_result<T, S>(result: &Result<T>, serializer: S) -> std::result::Result<S::Ok, S::Error>
+where
+    T: Serialize + 'static,
+    S: Serializer,
+{
+    serialize_checked(&Unchecked(result), "the result", serializer)
+}
+
+/// 不做整段文本核对的线上编码：[`serialize_result`] 核对与写出的都是它。
+struct Unchecked<'a, T>(&'a Result<T>);
+
+impl<T: Serialize + 'static> Serialize for Unchecked<'_, T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        write_result(self.0, serializer)
+    }
+}
+
+/// 按线上编码逐个成员写出一个结果。
+fn write_result<T, S>(result: &Result<T>, serializer: S) -> std::result::Result<S::Ok, S::Error>
 where
     T: Serialize + 'static,
     S: Serializer,

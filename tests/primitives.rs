@@ -369,6 +369,48 @@ fn result_wire_encoding() {
     assert!(bound.is_err(), "and_then propagates failures");
 }
 
+/// 套 `depth` 层数组，最里面是 0。
+fn nested(depth: usize) -> serde_json::Value {
+    (0..depth).fold(json!(0), |value, _| json!([value]))
+}
+
+/// 线上编码写不出时 `serde_json` 报的错误：带 `PRIMITIVES_VALIDATION_001`，不交出文本。
+fn assert_not_written<T: serde::Serialize>(what: &str, value: &T) {
+    match serde_json::to_string(value) {
+        Ok(text) => panic!("{what}: must not be written, got {text}"),
+        Err(error) => assert!(error.to_string().contains(ERROR_CODE_INVALID_ARGUMENT), "{what}: {error}"),
+    }
+}
+
+#[test]
+fn wire_encoding_that_is_not_json_text_is_not_written() {
+    // RFC-0001「写出与转交」（ADR-0320）：Rust 的字符串总是合法的 UTF-8，写不出的是嵌套超过 64 层（从结果或错误的根算起）与
+    // RawValue 原样写进去的重复成员、孤立代理项的转义；写出的整段文本过共同检查
+    let raw = |text: &str| serde_json::value::RawValue::from_string(text.to_owned()).unwrap();
+    // 错误单独写是 64 层（根、细节、62 层数组），放进结果里多一层
+    let deep_error = Error::literal("ORDERS_CONFLICT_001", "stale").with_detail("deep", nested(62));
+    assert!(serde_json::to_string(&deep_error).is_ok(), "the error alone is 64 levels deep");
+    assert_not_written("an error 65 levels from its root", &Error::literal("ORDERS_CONFLICT_001", "stale").with_detail("deep", nested(63)));
+    assert_not_written("an inner error 65 levels deep", &Error::literal("ORDERS_CONFLICT_001", "stale").with_inner(deep_error.clone()));
+    assert_not_written("an error 65 levels from the root of the result", &WireResult::<u32>(Err(deep_error.clone())));
+    assert_not_written("a value 65 levels from the root", &WireResult(Ok(nested(64))));
+    assert_not_written("raw duplicate members", &WireResult(Ok(raw(r#"{"a":1,"a":2}"#))));
+    assert_not_written("a raw lone surrogate escape", &WireResult(Ok(raw(r#"["\udc00"]"#))));
+    assert_not_written("a raw value too deep", &WireResult(Ok(vec![raw(&format!("{}0{}", "[".repeat(63), "]".repeat(63)))])));
+
+    let deepest = format!("{}0{}", "[".repeat(63), "]".repeat(63));
+    assert_eq!(serde_json::to_string(&WireResult(Ok(nested(63)))).unwrap(), format!(r#"{{"ok":true,"value":{deepest}}}"#));
+    assert_eq!(serde_json::to_string(&WireResult(Ok(raw(r#""😀""#)))).unwrap(), r#"{"ok":true,"value":"😀"}"#);
+    // 嵌在结构体里的结果照样核对，层数从结果的根算起
+    #[derive(serde::Serialize)]
+    struct Envelope {
+        #[serde(with = "primitives::wire_result")]
+        outcome: Result<serde_json::Value>,
+    }
+    assert_not_written("a result in a struct", &Envelope { outcome: Ok(nested(64)) });
+    assert!(serde_json::to_string(&Envelope { outcome: Ok(nested(63)) }).is_ok());
+}
+
 #[derive(Deserialize)]
 struct WireVectors {
     results: WireCases<ResultCase>,

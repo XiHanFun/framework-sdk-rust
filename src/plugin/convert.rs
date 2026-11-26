@@ -14,7 +14,8 @@ use crate::primitives::json::{self, MAX_DEPTH, Node, Number};
 use crate::primitives::{Details, Error, is_baggage_key_registered, is_error_code, is_message_key};
 
 /// 错误 → 协议的 `Error`（`invocation.md` §3「写出」）：`code`、`message_key` 原样；带消息键的错误 `text` 留空，由宿主按目录翻译成
-/// 调用方的语言（RFC-0010），不按任何区域在这里渲染；只有自由文本错误写 `text`；`details` 是 JSON 对象文本，没有时为空；内部错误递归。
+/// 调用方的语言（RFC-0010），不按任何区域在这里渲染；只有自由文本错误写 `text`；`details` 是 JSON 对象文本，没有或写不出（没过共同检查）
+/// 时为空；内部错误递归。
 pub(crate) fn to_proto_error(error: &Error) -> v1::Error {
     let text = match error.message_key() {
         Some(_) => String::new(),
@@ -24,7 +25,14 @@ pub(crate) fn to_proto_error(error: &Error) -> v1::Error {
         code: error.code().to_owned(),
         message_key: error.message_key().unwrap_or_default().to_owned(),
         text,
-        details: error.details().filter(|details| !details.is_empty()).and_then(|details| serde_json::to_string(details).ok()).unwrap_or_default(),
+        // 细节写不出时这个错误不带细节、其余照写（RFC-0001「写出与转交」，ADR-0320）：细节是值树，字符串总是合法的 UTF-8、成员名不重复，
+        // 写不出的只有嵌套超过 64 层；宿主读到这样的细节也当作没有，两边看到的相同
+        details: error
+            .details()
+            .filter(|details| !details.is_empty())
+            .and_then(|details| serde_json::to_string(details).ok())
+            .filter(|text| json::check(text.as_bytes()).is_ok())
+            .unwrap_or_default(),
         inner: error.inner().map(|inner| Box::new(to_proto_error(inner))),
     }
 }
@@ -229,6 +237,26 @@ mod tests {
         assert_eq!((decoded.code(), decoded.message_key(), decoded.text()), ("ECHO_VALIDATION_001", Some("echo.text.empty"), None));
         assert_eq!(decoded.details().unwrap()["length"], json!(0));
         assert_eq!(decoded.inner().unwrap().message(), "inner");
+    }
+
+    #[test]
+    fn details_that_cannot_be_written_are_left_out() {
+        // invocation.md §3「写出」（ADR-0320）：细节写出的文本没过共同检查（嵌套超过 64 层）时这个错误不带细节，其余字段照写；
+        // 内部错误的细节各自核对，正好 64 层照常写出
+        let nested = |depth: usize| (0..depth).fold(json!(0), |value, _| json!([value]));
+        let inner = Error::literal("KERNEL_UNEXPECTED_001", "boom").with_detail("id", "i1");
+        let proto = to_proto_error(&Error::unexpected("ORDERS_UNEXPECTED_001", "orders.failed").with_detail("deep", nested(64)).with_inner(inner));
+        assert_eq!(
+            (proto.code.as_str(), proto.message_key.as_str(), proto.text.as_str(), proto.details.as_str()),
+            ("ORDERS_UNEXPECTED_001", "orders.failed", "", "")
+        );
+        assert_eq!(proto.inner.as_deref().map(|inner| (inner.text.as_str(), inner.details.as_str())), Some(("boom", r#"{"id":"i1"}"#)));
+        let outer = to_proto_error(
+            &Error::literal("ORDERS_CONFLICT_001", "stale").with_inner(Error::literal("KERNEL_UNEXPECTED_001", "boom").with_detail("deep", nested(64))),
+        );
+        assert_eq!((outer.text.as_str(), outer.inner.as_deref().map(|inner| inner.details.as_str())), ("stale", Some("")));
+        let deepest = to_proto_error(&Error::literal("ORDERS_CONFLICT_001", "stale").with_detail("deep", nested(63)));
+        assert_eq!(deepest.details, format!(r#"{{"deep":{}0{}}}"#, "[".repeat(63), "]".repeat(63)));
     }
 
     #[test]
