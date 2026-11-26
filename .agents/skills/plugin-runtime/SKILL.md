@@ -36,7 +36,7 @@ cargo run --manifest-path tools/protogen/Cargo.toml
 
 ```bash
 cd spec/conformance
-go run ./cmd/xihan-conformance plugin --dir <插件目录> --config '{"greeting":"hello"}' --sample 'echoes.create={"text":"conformance"}' --exclude echoes.crash
+go run ./cmd/xihan-conformance plugin --dir <插件目录> --config '{"greeting":"hello"}' --sample 'echoes.create={"text":"conformance"}' --exclude echoes.crash --envelopes events.list
 ```
 
 要 Go（版本见 `spec/conformance/go.mod`）；缺 Go 时测试失败，只有设 `XIHAN_CONFORMANCE_REQUIRED=0` 才打印原因并提前返回。CI 在 ubuntu 与 windows 上都跑，两个平台都要过。

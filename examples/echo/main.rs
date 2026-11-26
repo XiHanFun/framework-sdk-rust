@@ -73,11 +73,21 @@ struct PublishResponse {
 #[derive(Clone, Deserialize, Serialize)]
 struct Empty {}
 
-/// `events.list` 的响应：收到的事件 ID，与每次投递的「ID 方式」。
+/// `events.list` 的响应：收到的事件 ID，每次投递的「ID 方式」，与按收到先后列出的信封（黑盒运行器的用例 `event-envelope` 读它，
+/// `invocation.md` §7）。
 #[derive(Serialize)]
 struct ListResponse {
     ids: Vec<String>,
     deliveries: Vec<String>,
+    envelopes: Vec<ReceivedEnvelope>,
+}
+
+/// 处理器在一次投递里拿到的信封：ID 与 `dataschema`（没有时写 `null`）。
+#[derive(Clone, Serialize)]
+struct ReceivedEnvelope {
+    id: String,
+    #[serde(rename = "dataSchema")]
+    data_schema: Option<String>,
 }
 
 /// 配置节 `XiHan:Echo`。
@@ -90,7 +100,7 @@ struct Settings {
 #[derive(Default)]
 struct Echo {
     greeting: Mutex<Option<String>>,
-    deliveries: Mutex<Vec<(String, SubscriptionMode)>>,
+    deliveries: Mutex<Vec<(String, SubscriptionMode, Option<String>)>>,
 }
 
 impl Echo {
@@ -99,14 +109,18 @@ impl Echo {
     }
 
     fn record(&self, event: &Event) {
-        self.deliveries.lock().unwrap_or_else(PoisonError::into_inner).push((event.envelope.id.clone(), event.mode));
+        self.deliveries.lock().unwrap_or_else(PoisonError::into_inner).push((event.envelope.id.clone(), event.mode, event.envelope.data_schema.clone()));
     }
 
     fn list(&self) -> ListResponse {
         let deliveries = self.deliveries.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut ids: Vec<String> = deliveries.iter().map(|(id, _)| id.clone()).collect();
+        let mut ids: Vec<String> = deliveries.iter().map(|(id, _, _)| id.clone()).collect();
         ids.dedup();
-        ListResponse { ids, deliveries: deliveries.iter().map(|(id, mode)| format!("{id} {mode}")).collect() }
+        ListResponse {
+            ids,
+            deliveries: deliveries.iter().map(|(id, mode, _)| format!("{id} {mode}")).collect(),
+            envelopes: deliveries.iter().map(|(id, _, data_schema)| ReceivedEnvelope { id: id.clone(), data_schema: data_schema.clone() }).collect(),
+        }
     }
 }
 

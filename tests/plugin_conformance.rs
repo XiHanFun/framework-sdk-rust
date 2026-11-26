@@ -10,7 +10,7 @@ use std::process::Command;
 use serde::Deserialize;
 
 /// 运行器的全部用例（`spec/conformance/README.md` 的用例表）。
-const CASES: [&str; 14] = [
+const CASES: [&str; 15] = [
     "handshake",
     "refusal",
     "session",
@@ -20,6 +20,7 @@ const CASES: [&str; 14] = [
     "declared-operations",
     "unavailable",
     "event",
+    "event-envelope",
     "unsubscribed",
     "stream",
     "configuration",
@@ -59,7 +60,18 @@ fn echo_passes_the_black_box_runner() {
         .current_dir(&conformance)
         .args(["run", "./cmd/xihan-conformance", "plugin", "--dir"])
         .arg(&directory)
-        .args(["--json", "--quiet", "--config", r#"{"greeting":"hello"}"#, "--sample", r#"echoes.create={"text":"conformance"}"#, "--exclude", "echoes.crash"])
+        .args([
+            "--json",
+            "--quiet",
+            "--config",
+            r#"{"greeting":"hello"}"#,
+            "--sample",
+            r#"echoes.create={"text":"conformance"}"#,
+            "--exclude",
+            "echoes.crash",
+            "--envelopes",
+            "events.list",
+        ])
         .output()
         .expect("the black-box runner could not be started");
     let _ = std::fs::remove_dir_all(&directory);
