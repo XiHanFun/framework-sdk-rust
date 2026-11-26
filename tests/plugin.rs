@@ -1523,6 +1523,51 @@ async fn invocations_restore_the_context_and_carry_errors() {
     stop(&mut client, running).await;
 }
 
+/// 类型化应答写出的文本过共同检查（`invocation.md` §1，ADR-0319）：嵌套超过 64 层或有重复的成员名即 `Status.error` 为
+/// KERNEL_UNEXPECTED_001 + kernel.invocation.unhandled_exception，没有参数、不带 inner、载荷为空，不交给宿主去拒绝；恰好 64 层照常写出。
+#[tokio::test]
+async fn responses_that_fail_the_json_text_check_are_unhandled_failures() {
+    #[derive(Default, Deserialize)]
+    #[serde(default)]
+    struct Shape {
+        depth: usize,
+        duplicate: bool,
+    }
+    let registry = Arc::new(Registry::new());
+    registry
+        .add(
+            Contract::new("orders.create"),
+            operation::handler_fn(|_: &Context, shape: Shape| {
+                Box::pin(async move {
+                    if shape.duplicate {
+                        return Ok(serde_json::value::RawValue::from_string(r#"{"a":1,"a":2}"#.to_owned()).unwrap());
+                    }
+                    let nested = (0..shape.depth).fold(json!(0), |inner, _| json!([inner]));
+                    Ok(serde_json::value::to_raw_value(&nested).unwrap())
+                })
+            }),
+        )
+        .unwrap();
+    let running = Plugin::new(MANIFEST).with_operations(registry).with_network(Network::Tcp).with_logger(Logger::new(Buffer::default()));
+    let running = running.start(Launch::new(TOKEN)).await.unwrap();
+    let mut client = connect(running.endpoint()).await;
+    open(&mut client, &[]).await;
+    for request in [r#"{"depth":65}"#, r#"{"duplicate":true}"#] {
+        let response = invoke(&mut client, "orders.create", request, None).await;
+        assert_eq!(
+            keyed(response.status.as_ref()),
+            ("KERNEL_UNEXPECTED_001".to_owned(), "kernel.invocation.unhandled_exception".to_owned(), Value::Null),
+            "{request}"
+        );
+        assert!(failure(response.status.as_ref()).inner.is_none(), "{request}");
+        assert!(response.payload.is_empty(), "{request}");
+    }
+    let deepest = invoke(&mut client, "orders.create", r#"{"depth":64}"#, None).await;
+    assert!(deepest.status.as_ref().unwrap().ok);
+    assert_eq!(String::from_utf8(deepest.payload).unwrap(), format!("{}0{}", "[".repeat(64), "]".repeat(64)));
+    stop(&mut client, running).await;
+}
+
 #[tokio::test]
 async fn streams_are_refused_after_the_first_frame() {
     let (recorder, log) = (Arc::new(Recorder::default()), Buffer::default());

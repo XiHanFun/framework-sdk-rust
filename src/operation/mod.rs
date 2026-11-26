@@ -1,8 +1,8 @@
 //! 操作契约与 XGI 消息（RFC-0011）：业务以操作为单位声明，调用器让它经过完整管道并在 handle 阶段执行。
 //!
 //! JSON 是 XGI 的规范编码：请求载荷先过共同的 JSON 读取检查（`primitives::json` 的读取器，不是 `serde_json::from_slice`），再按请求类型的
-//! `Deserialize` 解码，数字按值模型；响应在管道结束之后按类型的 `Serialize` 写出，非有限的浮点写不出、报错。类型化入口
-//! [`Invoker::invoke_typed`] 不经 JSON。
+//! `Deserialize` 解码，数字按值模型；响应在管道结束之后按类型的 `Serialize` 写出，非有限的浮点写不出、报错，写出的整段文本还要过
+//! 共同的 JSON 读取检查（嵌套不超过 64 层、没有重复的成员名，ADR-0319），没过同样写不出。类型化入口 [`Invoker::invoke_typed`] 不经 JSON。
 //!
 //! ```
 //! use std::sync::Arc;
@@ -283,9 +283,18 @@ impl<T: Serialize + Send + 'static> Response for T {
 
 /// 把响应写成载荷（RFC-0011 规则 10「编码」）：写不出（非有限的浮点、序列化不支持的值）或序列化时 panic，都以
 /// `KERNEL_UNEXPECTED_001` + `kernel.invocation.unhandled_exception` 结束，panic 的内容是框架错误时它进 `inner`，不抛给调用方。
+///
+/// 写出的整段文本还要过 RFC-0001「JSON 文本」的共同检查（[`json::check`]，ADR-0319）：嵌套超过 64 层（从响应的根算起，原样嵌进去的
+/// `RawValue` 与 [`json::Json`] 也算）、任何一层有重复的成员名（自定义的 `Serialize` 两次写同名、`#[serde(flatten)]` 的映射键与字段同名、
+/// `RawValue` 原样交出的）、`RawValue` 里孤立代理项的转义，都同样写不出，不带 `inner`。
 fn encode(response: &dyn Response) -> Result<Vec<u8>> {
     match panic::catch_unwind(AssertUnwindSafe(|| response.encode())) {
-        Ok(Ok(payload)) => Ok(payload),
+        // serde_json 的序列化器不数层数、不核对成员名，RawValue 的原文它也只照抄：写完之后对整段文本再读一遍。
+        // 写的一方只有这一处能看到完整的文本，代价是多一次读取（读出一棵值树再丢掉），与写出本身同阶
+        Ok(Ok(payload)) => match json::check(&payload) {
+            Ok(()) => Ok(payload),
+            Err(_) => Err(unhandled()),
+        },
         Ok(Err(_)) => Err(unhandled()),
         Err(payload) => Err(unhandled_panic(payload.as_ref())),
     }

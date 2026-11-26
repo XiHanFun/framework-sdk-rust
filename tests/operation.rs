@@ -625,6 +625,117 @@ fn unwritable_responses_become_unhandled_failures() {
     assert!(typed.ratio.is_nan());
 }
 
+/// 层层套着的数组，最里面是 `T`。
+#[derive(Clone, Serialize)]
+#[serde(untagged)]
+enum Nested<T> {
+    /// 最里面的值。
+    Leaf(T),
+    /// 只有一项的数组。
+    List(Vec<Nested<T>>),
+}
+
+/// 把 `inner` 套进 `depth` 层数组。
+fn nested<T>(depth: usize, inner: T) -> Nested<T> {
+    (0..depth).fold(Nested::Leaf(inner), |value, _| Nested::List(vec![value]))
+}
+
+/// `depth` 层数组的文本，最里面是 0。
+fn nested_text(depth: usize) -> String {
+    format!("{}0{}", "[".repeat(depth), "]".repeat(depth))
+}
+
+/// 自己写两次成员 `a` 的响应。
+#[derive(Clone)]
+struct Twice;
+
+impl Serialize for Twice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap as _;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("a", &1)?;
+        map.serialize_entry("a", &2)?;
+        map.end()
+    }
+}
+
+/// 展开的映射里有与字段同名的键。
+#[derive(Clone, Serialize)]
+struct Flattened {
+    /// 与映射里的键同名的字段。
+    a: i64,
+    /// 展开到同一层的成员。
+    #[serde(flatten)]
+    extra: BTreeMap<String, i64>,
+}
+
+/// 登记一个总是返回 `response` 的操作。
+fn add_returning<R: Serialize + Clone + Send + Sync + 'static>(registry: &Registry, id: &str, response: R) {
+    registry
+        .add(
+            Contract::new(id),
+            operation::handler_fn(move |_ctx, _request: CreateOrder| {
+                let response = response.clone();
+                Box::pin(async move { Ok(response) })
+            }),
+        )
+        .unwrap();
+}
+
+/// 原样交出 `text` 的 `RawValue`。
+fn raw(text: &str) -> Box<serde_json::value::RawValue> {
+    serde_json::value::RawValue::from_string(text.to_owned()).unwrap()
+}
+
+/// 写出的整段文本要过 RFC-0001「JSON 文本」的共同检查（RFC-0011 规则 10「编码」，ADR-0319）：嵌套超过 64 层（从响应的根算起，
+/// 原样嵌进去的 `RawValue` 与 `Json` 也算）、任何一层有重复的成员名（自定义的 `Serialize`、`#[serde(flatten)]` 的映射与 `RawValue`
+/// 都写得出）、`RawValue` 里孤立代理项的转义，都以 KERNEL_UNEXPECTED_001 + kernel.invocation.unhandled_exception 结束，不带 inner、
+/// 没有载荷；恰好 64 层照常写出。
+#[test]
+fn responses_that_fail_the_json_text_check_are_not_written() {
+    let registry = Registry::new();
+    add_returning(&registry, "texts.deep", nested(65, 0));
+    add_returning(&registry, "texts.deep-raw", nested(10, raw(&nested_text(60))));
+    add_returning(&registry, "texts.deep-json", nested(10, json::Json::from_text(&nested_text(60)).unwrap()));
+    add_returning(&registry, "texts.raw-duplicate", raw(r#"{"a":1,"a":2}"#));
+    add_returning(&registry, "texts.raw-surrogate", raw(r#"{"a":"\ud800"}"#));
+    add_returning(&registry, "texts.twice", Twice);
+    add_returning(&registry, "texts.twice-nested", vec![BTreeMap::from([("b".to_owned(), Twice)])]);
+    add_returning(&registry, "texts.flattened", Flattened { a: 1, extra: BTreeMap::from([("a".to_owned(), 2)]) });
+    add_returning(&registry, "texts.deep-enough", nested(64, 0));
+    add_returning(&registry, "texts.deep-enough-raw", nested(10, raw(&nested_text(54))));
+    add_returning(&registry, "texts.deep-enough-json", nested(10, json::Json::from_text(&nested_text(54)).unwrap()));
+    add_returning(&registry, "texts.flattened-apart", Flattened { a: 1, extra: BTreeMap::from([("b".to_owned(), 2)]) });
+    let registry = Arc::new(registry);
+    let invoker = Invoker::new(Arc::clone(&registry), &Builder::new()).unwrap();
+    let ctx = Context::background();
+    for id in [
+        "texts.deep",
+        "texts.deep-raw",
+        "texts.deep-json",
+        "texts.raw-duplicate",
+        "texts.raw-surrogate",
+        "texts.twice",
+        "texts.twice-nested",
+        "texts.flattened",
+    ] {
+        for outcome in [common::block_on(invoker.invoke(&ctx, Request::new(id, "{}"))), common::block_on(registry.get(id).unwrap().execute(&ctx, b"{}"))] {
+            let error = outcome.expect_err(id);
+            common::assert_kernel_error(&error, operation::MESSAGE_UNHANDLED_PANIC);
+            assert!(error.inner().is_none(), "{id}: a response that is not JSON text has no inner error");
+        }
+    }
+    for (id, expected) in [
+        ("texts.deep-enough", nested_text(64)),
+        ("texts.deep-enough-raw", nested_text(64)),
+        ("texts.deep-enough-json", nested_text(64)),
+        ("texts.flattened-apart", r#"{"a":1,"b":2}"#.to_owned()),
+    ] {
+        let payload = common::block_on(invoker.invoke(&ctx, Request::new(id, "{}"))).unwrap();
+        assert_eq!(String::from_utf8(payload).unwrap(), expected, "{id}");
+    }
+}
+
 /// 任意 JSON 的成员原样保留读到的值（RFC-0011 规则 2，ADR-0236）：处理器原样返回，响应载荷与原文的 JSON 值相等，
 /// 1e400 不变成 null 或无穷，超出双精度的整数保持精确，2.0 与 2 的区别保留。
 #[test]
