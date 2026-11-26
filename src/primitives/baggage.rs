@@ -33,6 +33,8 @@ pub fn is_baggage_key_registered(key: &str) -> bool {
 /// 这些值会写进日志、审计与消息信封，换行能伪造日志行。[`invocation::ContextBuilder::baggage`](crate::invocation::ContextBuilder::baggage)
 /// 按外部输入丢弃不合的成员，[`invocation::Context::with_baggage`](crate::invocation::Context::with_baggage) 遇到不合的值即 panic
 /// （两者都只看已登记键，幂等键除外：它由 Idempotency 阶段以校验错误拒绝），上下文里只有通过的值。
+///
+/// 规范还要求值不含孤立的代理项（RFC-0001「孤立的代理项」，ADR-0321）：`&str` 总是合法的 UTF-8，组不出孤立的代理项，不用另判。
 pub fn is_baggage_value_acceptable(value: &str) -> bool {
     !value.is_empty() && value.encode_utf16().count() <= BAGGAGE_MAX_VALUE_LENGTH && !value.chars().any(char::is_control)
 }

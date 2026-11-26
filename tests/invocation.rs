@@ -189,7 +189,11 @@ fn cancellation_errors_follow_kernel_messages() {
 #[test]
 fn baggage_values_follow_the_conventions() {
     let values = common::baggage_values();
-    for value in &values.acceptable {
+    // 以码元列出的样例里组得成字符串的（成对的代理项）照收；孤立的代理项组不成 Rust 的字符串，到不了上下文（ADR-0321）
+    let mut acceptable = values.acceptable.clone();
+    acceptable.extend(values.acceptable_utf16.iter().map(|case| case.text().unwrap_or_else(|error| panic!("{}: {error}", case.name))));
+    assert!(values.unacceptable_utf16.iter().all(|case| case.text().is_err()));
+    for value in &acceptable {
         let ctx = Context::builder().baggage(BAGGAGE_TENANT, value.as_str()).build();
         assert_eq!(ctx.tenant(), Some(value.as_str()), "{value:?} must be kept");
         assert_eq!(Context::background().with_baggage(BAGGAGE_CORRELATION, value.as_str()).correlation(), Some(value.as_str()));

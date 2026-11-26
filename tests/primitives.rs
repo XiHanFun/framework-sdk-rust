@@ -74,6 +74,15 @@ fn baggage_keys_follow_the_vectors() {
     for value in &vectors.values.unacceptable {
         assert!(!primitives::is_baggage_value_acceptable(value), "{value:?} must be unacceptable");
     }
+    // 孤立的代理项（RFC-0001「孤立的代理项」，ADR-0321）：Rust 的字符串组不出它，判定不用改；成对的代理项是一个字符，照收
+    assert!(!vectors.values.acceptable_utf16.is_empty() && !vectors.values.unacceptable_utf16.is_empty());
+    for case in &vectors.values.acceptable_utf16 {
+        let value = case.text().unwrap_or_else(|error| panic!("{}: {error}", case.name));
+        assert!(primitives::is_baggage_value_acceptable(&value), "{}: {value:?} must be acceptable", case.name);
+    }
+    for case in &vectors.values.unacceptable_utf16 {
+        assert!(case.text().is_err(), "{}: a lone surrogate cannot be a Rust string", case.name);
+    }
 }
 
 #[test]

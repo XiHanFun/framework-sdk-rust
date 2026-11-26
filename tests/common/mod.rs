@@ -100,11 +100,34 @@ pub fn assert_kernel_error(error: &xihan_framework::primitives::Error, key: &str
     assert_eq!(error.message(), text, "the en-US message of {key}");
 }
 
-/// 向量 `baggage-keys.json` 的 `values`：已登记键的值能否进入调用上下文。
+/// 向量 `baggage-keys.json` 的 `values`：已登记键的值能否进入调用上下文。JSON 字符串写不出孤立的代理项，这样的样例在
+/// `acceptableUtf16` 与 `unacceptableUtf16` 里以 UTF-16 码元列出（ADR-0321）。
 #[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BaggageValues {
     pub acceptable: Vec<String>,
     pub unacceptable: Vec<String>,
+    pub acceptable_utf16: Vec<Utf16Case>,
+    pub unacceptable_utf16: Vec<Utf16Case>,
+}
+
+/// 以 UTF-16 码元（四位十六进制）写出的一条文本样例。
+#[derive(serde::Deserialize)]
+pub struct Utf16Case {
+    pub name: String,
+    pub utf16: Vec<String>,
+}
+
+impl Utf16Case {
+    /// 按码元组成字符串：有孤立的代理项时组不成，是 `Err`（Rust 的字符串总是合法的 UTF-8）。
+    pub fn text(&self) -> Result<String, std::string::FromUtf16Error> {
+        let units: Vec<u16> = self
+            .utf16
+            .iter()
+            .map(|unit| u16::from_str_radix(unit, 16).unwrap_or_else(|_| panic!("{}: '{unit}' is not a UTF-16 code unit", self.name)))
+            .collect();
+        String::from_utf16(&units)
+    }
 }
 
 #[derive(serde::Deserialize)]
