@@ -32,7 +32,7 @@
 - **调整** 清单 `activation` 里 `onEvent:` 的模式可以带下划线（ADR-0276）
 - **调整** docs.rs 上标出 `plugin` 模块要打开 feature `plugin`；包的 `homepage` 改成文档站
 - **调整** `examples/echo` 的 `events.list` 回显处理器拿到的信封（`envelopes`），黑盒运行器的用例 `event-envelope` 通过（ADR-0327）
-- **调整** 规范指针升到规范 `6bd152b`
+- **调整** 规范指针升到规范 `73a82f1`
 
 ## v0.2.0-rc.1（2026-11-21）
 
