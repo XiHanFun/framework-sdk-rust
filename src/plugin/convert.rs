@@ -344,6 +344,38 @@ mod tests {
         assert_eq!(replayed, 2);
     }
 
+    /// 回放向量 `plugin/error-text-writing.json`（`invocation.md` §3「写出 `Error` 的文案」，ADR-0339、ADR-0346）：Rust 的 `String` 总是合法的
+    /// UTF-8，替换发生在外来的字节或码元变成 `String` 的那一步，`bytes` 经 [`String::from_utf8_lossy`]、`utf16` 经 [`String::from_utf16_lossy`]
+    /// （两者都按最大子部分换成 U+FFFD），再经 [`to_proto_error`] 原样写出，顶层与内部错误的 `text` 都等于期望值。`codePoints` 是 Python 的 `str`，
+    /// Rust 的 `char` 放不进代理项码点，不回放。
+    #[test]
+    fn error_text_follows_the_writing_vectors() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/spec/conformance/vectors/plugin/error-text-writing.json");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}; run `git submodule update --init`"));
+        let vectors: Value = serde_json::from_str(&text).unwrap();
+        let written = |text: String| {
+            let proto = to_proto_error(&Error::literal("ORDERS_CONFLICT_001", text.clone()).with_inner(Error::literal("KERNEL_UNEXPECTED_001", text)));
+            let inner = proto.inner.map(|inner| inner.text).unwrap_or_default();
+            (proto.text, inner)
+        };
+        let bytes = vectors["bytes"].as_array().unwrap();
+        for case in bytes {
+            let hex = case["hex"].as_str().unwrap();
+            let raw: Vec<u8> = (0..hex.len()).step_by(2).map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap()).collect();
+            let expected = case["expected"].as_str().unwrap();
+            let (text, inner) = written(String::from_utf8_lossy(&raw).into_owned());
+            assert_eq!((text.as_str(), inner.as_str()), (expected, expected), "{}", case["name"]);
+        }
+        let utf16 = vectors["utf16"].as_array().unwrap();
+        for case in utf16 {
+            let units: Vec<u16> = case["utf16"].as_array().unwrap().iter().map(|unit| u16::from_str_radix(unit.as_str().unwrap(), 16).unwrap()).collect();
+            let expected = case["expected"].as_str().unwrap();
+            let (text, inner) = written(String::from_utf16_lossy(&units));
+            assert_eq!((text.as_str(), inner.as_str()), (expected, expected), "{}", case["name"]);
+        }
+        assert!(!bytes.is_empty() && !utf16.is_empty());
+    }
+
     #[test]
     fn metadata_restores_the_context() {
         let token = CancellationToken::new();
