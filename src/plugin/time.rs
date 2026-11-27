@@ -290,23 +290,12 @@ mod tests {
         assert!(parse_deadline("0001-01-01T00:00:00Z").unwrap().to_system_time() <= UNIX_EPOCH);
     }
 
-    /// 作者给的时刻与 SDK 写出的 `time`：换算成 UTC、以 `Z` 结尾，秒的小数部分去掉末尾的 0、全为 0 时不写小数点；
-    /// 各语言的 SDK 对同一时刻写出同一份文本（精度以内）。这里按纳秒写，经 [`SystemTime`] 时再按本平台的精度截断。
-    const WRITTEN: [(&str, &str); 13] = [
-        ("2026-11-25T03:25:00Z", "2026-11-25T03:25:00Z"),
-        ("2026-11-25T03:25:00.5Z", "2026-11-25T03:25:00.5Z"),
-        ("2026-11-25T03:25:00.120Z", "2026-11-25T03:25:00.12Z"),
-        ("2026-11-25T03:25:00.001Z", "2026-11-25T03:25:00.001Z"),
-        ("2026-11-25T03:25:00.123456Z", "2026-11-25T03:25:00.123456Z"),
-        ("2026-11-25T03:25:00.123456789Z", "2026-11-25T03:25:00.123456789Z"),
-        ("2026-11-25T03:25:00.0000001Z", "2026-11-25T03:25:00.0000001Z"),
-        ("2026-11-25T11:25:00.25+08:00", "2026-11-25T03:25:00.25Z"),
-        ("2026-11-24T22:25:00-05:00", "2026-11-25T03:25:00Z"),
-        ("2026-11-25T00:00:00+14:00", "2026-11-24T10:00:00Z"),
-        ("0001-01-01T00:00:00Z", "0001-01-01T00:00:00Z"),
-        ("9999-12-31T23:59:59.999Z", "9999-12-31T23:59:59.999Z"),
-        ("9999-12-31T23:59:59.999999999Z", "9999-12-31T23:59:59.999999999Z"),
-    ];
+    /// 读规范子模块里的向量 `plugin/sdk-envelope-times.json`。
+    fn sdk_envelope_times() -> Value {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/spec/conformance/vectors/plugin/sdk-envelope-times.json");
+        let text = std::fs::read_to_string(path).unwrap_or_else(|error| panic!("cannot read {path}: {error}; run `git submodule update --init`"));
+        serde_json::from_str(&text).unwrap()
+    }
 
     /// 读规范子模块里的向量 `plugin/envelope-times.json`。
     fn envelope_times() -> Value {
@@ -325,9 +314,15 @@ mod tests {
         UtcTime { seconds: time.seconds, nanos: truncate_to_system_time(time.nanos) }
     }
 
+    /// 写出的 `time`：换算成 UTC、以 `Z` 结尾，秒的小数部分去掉末尾的 0、全为 0 时不写小数点。用例是 `plugin/sdk-envelope-times.json`
+    /// 的 `writing` 纳秒一列（ADR-0310、ADR-0340，以前是手写的 13 条）：[`UtcTime`] 精确到纳秒，各平台都核对这一列；经 [`SystemTime`]
+    /// 按本平台精度写出的一列另由 `convert.rs` 的 `sdk_envelope_times_follow_the_vectors` 回放。
     #[test]
     fn envelope_times_are_written_in_utc_without_trailing_zeros() {
-        for (instant, text) in WRITTEN {
+        for case in sdk_envelope_times()["writing"].as_array().unwrap() {
+            // 没有时间写空串由 convert.rs 的回放核对：UtcTime 总是一个时刻
+            let Some(instant) = case["instant"].as_str() else { continue };
+            let text = case["text"]["nanoseconds"].as_str().unwrap();
             let time = parse_deadline(instant).unwrap_or_else(|| panic!("{instant}"));
             assert_eq!(format_envelope_time(time), text, "{instant}");
             // 写出的文本合文法、读回同一时刻

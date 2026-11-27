@@ -27,7 +27,7 @@ const REPLAYED: [&str; 23] = [
     "plugin/host-addresses.json",              // tests/plugin.rs
     "plugin/plugin-messages.json",             // src/plugin/catalog.rs、src/plugin/messages.rs
     "plugin/protocol-versions.json",           // tests/plugin.rs
-    "plugin/sdk-envelope-times.json",          // src/plugin/convert.rs（Windows 取 100 纳秒、其余取纳秒，unreadable 另经 tests/plugin.rs 投递）
+    "plugin/sdk-envelope-times.json",          // src/plugin/convert.rs（本平台的精度，unreadable 另经 tests/plugin.rs 投递）、time.rs（纳秒）
     "primitives/baggage-keys.json",            // tests/primitives.rs
     "primitives/capability-requirements.json", // tests/manifest.rs
     "primitives/error-codes.json",             // tests/primitives.rs
