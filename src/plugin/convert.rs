@@ -150,6 +150,9 @@ pub(crate) fn context_of(metadata: Option<&v1::InvocationMetadata>, grpc_deadlin
 
 /// 调用上下文 → `InvocationMetadata`（回调宿主时，`invocation.md` §5）：当前 Span 的 traceparent、按 §2 写法的截止时间（UTC、七位小数、
 /// `+00:00`）、上下文里已登记的 Baggage；`trace_state` 为空（上下文没有它，§2）。
+///
+/// 回调之前不核对 Baggage 的值编不编得成 UTF-8（`invocation.md` §5 截止时间之后的那一项，ADR-0347）：值是 `String`，总是合法的 UTF-8，
+/// 放不进孤立的代理项，prost 原样写出，不会写不出、也不会被换成 U+FFFD；规范要以 UTF-16、码点或字节存放字符串的实现核对的，Rust 的类型里放不进来。
 pub(crate) fn metadata_of(ctx: &Context) -> v1::InvocationMetadata {
     let baggage: HashMap<String, String> = ctx.without_unregistered_baggage().baggage().iter().map(|(key, value)| (key.clone(), value.clone())).collect();
     v1::InvocationMetadata {

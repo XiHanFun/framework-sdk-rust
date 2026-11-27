@@ -188,7 +188,8 @@ impl Host {
         }
     }
 
-    /// 发出之前的核对（`invocation.md` §5），依次：回调端点，权限，租户，上下文的截止时间与取消；通过时返回客户端。
+    /// 发出之前的核对（`invocation.md` §5），依次：回调端点，权限，租户，上下文的截止时间与取消；通过时返回客户端。规范在截止时间之后
+    /// 还有元数据的一项（ADR-0347），Rust 的 Baggage 值总是合法的 UTF-8，没有这一步（见 `metadata_of`）。
     fn check(&self, ctx: &Context, rpc: Rpc<'_>) -> Result<HostClient<Channel>> {
         let Some(client) = &self.client else {
             return Err(host_unavailable(&self.plugin, REASON_NO_ENDPOINT));
