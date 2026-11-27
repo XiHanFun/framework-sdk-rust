@@ -16,6 +16,9 @@ use crate::primitives::{Details, Error, is_baggage_key_registered, is_error_code
 /// 错误 → 协议的 `Error`（`invocation.md` §3「写出」）：`code`、`message_key` 原样；带消息键的错误 `text` 留空，由宿主按目录翻译成
 /// 调用方的语言（RFC-0010），不按任何区域在这里渲染；只有自由文本错误写 `text`；`details` 是 JSON 对象文本，没有或写不出（没过共同检查）
 /// 时为空；内部错误递归。
+///
+/// `text` 照写，不做 U+FFFD 替换（`invocation.md` §3「写出 `Error` 的文案」，ADR-0339）：它取自 [`Error`] 的文案或错误码，两者都是
+/// `String`，总是合法的 UTF-8，没有编不成 UTF-8 的部分；规范要以字节或 UTF-16 存放字符串的语言按最大子部分换掉的，Rust 的类型里放不进来。
 pub(crate) fn to_proto_error(error: &Error) -> v1::Error {
     let text = match error.message_key() {
         Some(_) => String::new(),
