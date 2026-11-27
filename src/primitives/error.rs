@@ -287,7 +287,8 @@ impl Serialize for Error {
     /// 写出线上编码：`message` 是 [`Error::message`]，没有的键、空细节与内部错误省略。
     ///
     /// 写出的整段文本要过共同检查（RFC-0001「写出与转交」，ADR-0320）：从错误的根算起嵌套超过 64 层（细节或内部错误太深）时写不出，
-    /// 序列化以 `PRIMITIVES_VALIDATION_001` 的错误失败、不交出文本；嵌在结果里的错误由结果从它的根一并核对。
+    /// 序列化以 `PRIMITIVES_VALIDATION_001` 的错误失败、不交出文本；嵌在结果里的错误由结果从它的根一并核对，经
+    /// [`json::to_vec`](super::json::to_vec) 写出时由它写完之后一并核对，不再先写一遍（ADR-0340）。
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let out = ErrorOut {
             code: &self.code,

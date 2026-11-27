@@ -143,7 +143,8 @@ impl Envelope {
 
     /// 把 `data` 按 [`json::to_vec`] 写成数据（类型化的写法）；`datacontenttype` 不变，缺省就是 `application/json`。
     ///
-    /// 写不出（非有限的浮点、序列化不支持的值）时返回 `serde_json` 的错误，信封随之丢弃。
+    /// 写不出（非有限的浮点、序列化不支持的值，写出的文本嵌套超过 64 层、有重复成员或 `RawValue` 里有孤立代理项的转义，ADR-0340）时
+    /// 返回 `serde_json` 的错误，信封随之丢弃。
     pub fn with_json_data<T: Serialize + ?Sized>(mut self, data: &T) -> std::result::Result<Self, serde_json::Error> {
         self.data = json::to_vec(data)?;
         Ok(self)

@@ -637,6 +637,133 @@ fn typed_values_are_written_strictly() {
     assert!(json::to_vec(&std::collections::BTreeMap::from([((1, 2), 3)])).is_err(), "a map whose keys are not strings cannot be written");
 }
 
+/// 两次写出同一个成员名的自定义 `Serialize`。
+struct Twice;
+
+impl serde::Serialize for Twice {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(2))?;
+        map.serialize_entry("a", &1)?;
+        map.serialize_entry("a", &2)?;
+        map.end()
+    }
+}
+
+/// `#[serde(flatten)]` 的映射键可以与字段同名。
+#[derive(serde::Serialize)]
+struct Flattened {
+    a: u32,
+    #[serde(flatten)]
+    extra: std::collections::BTreeMap<String, u32>,
+}
+
+/// 原样交出 `text` 的 `RawValue`。
+fn raw_value(text: &str) -> Box<serde_json::value::RawValue> {
+    serde_json::value::RawValue::from_string(text.to_owned()).unwrap()
+}
+
+/// `json::to_vec` 写出的整段文本过 RFC-0001「JSON 文本」的共同检查（ADR-0340，与调用器编码响应相同）：嵌套超过 64 层（从值的根算起，
+/// `RawValue` 也算）、任何一层有重复的成员名、`RawValue` 里孤立代理项的转义都写不出，返回带 `PRIMITIVES_VALIDATION_001` 的错误；
+/// 恰好 64 层照常写出。`Host::invoke_json` 与 `Envelope::with_json_data` 经它写出
+#[test]
+fn typed_values_that_fail_the_json_text_check_are_not_written() {
+    let unwritable: [(&str, std::result::Result<Vec<u8>, serde_json::Error>); 7] = [
+        ("65 levels", json::to_vec(&nested(65))),
+        ("65 levels through a raw value", json::to_vec(&vec![raw_value(&format!("{}0{}", "[".repeat(64), "]".repeat(64)))])),
+        ("a custom serializer writing a name twice", json::to_vec(&Twice)),
+        ("a duplicate nested in an array", json::to_vec(&vec![std::collections::BTreeMap::from([("b", Twice)])])),
+        ("a flattened key equal to a field", json::to_vec(&Flattened { a: 1, extra: std::collections::BTreeMap::from([("a".to_owned(), 2)]) })),
+        ("raw duplicate members", json::to_vec(&raw_value(r#"{"a":1,"a":2}"#))),
+        ("a raw lone surrogate escape", json::to_vec(&raw_value(r#"{"a":"\ud800"}"#))),
+    ];
+    for (what, written) in unwritable {
+        match written {
+            Ok(text) => panic!("{what}: must not be written, got {}", String::from_utf8_lossy(&text)),
+            Err(error) => assert!(error.to_string().contains(ERROR_CODE_INVALID_ARGUMENT), "{what}: {error}"),
+        }
+    }
+    let deepest = format!("{}0{}", "[".repeat(64), "]".repeat(64));
+    assert_eq!(String::from_utf8(json::to_vec(&nested(64)).unwrap()).unwrap(), deepest, "64 levels are written");
+    assert_eq!(json::to_vec(&Flattened { a: 1, extra: std::collections::BTreeMap::from([("b".to_owned(), 2)]) }).unwrap(), br#"{"a":1,"b":2}"#);
+    assert_eq!(json::to_vec(&raw_value(r#"{"t":"\ud83d\ude00"}"#)).unwrap(), br#"{"t":"\ud83d\ude00"}"#, "a surrogate pair escape is text");
+}
+
+thread_local! {
+    /// [`Counted`] 在这个线程上被写出的次数。
+    static WRITES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 每写出一次就记一次的值：看得出线上编码在写出之前有没有先在缓冲里多写一遍。
+struct Counted;
+
+impl serde::Serialize for Counted {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+        WRITES.set(WRITES.get() + 1);
+        serializer.serialize_str("counted")
+    }
+}
+
+/// 经 `json::to_vec` 写出 `WireResult` 与 `Error` 时只写一遍（ADR-0340）：以前每次顶层写出先在缓冲里写一遍过共同检查、再写出；
+/// 现在由 `to_vec` 写完之后核对整段文本。交给别的序列化器时照旧先核对，两条路径对同一个值的结果相同：写得出的字节相同，写不出的都报错
+#[test]
+fn wire_encoding_through_to_vec_is_written_once_with_the_same_result() {
+    // 失败的结果写出 Error::message，按进程默认的消息设置解析：与改设置的测试串行，两条路径写出的文案才相同
+    let _guard = default_messages();
+    let writes = |write: &dyn Fn()| {
+        WRITES.set(0);
+        write();
+        WRITES.get()
+    };
+    assert_eq!(writes(&|| drop(serde_json::to_vec(&WireResult(Ok(Counted))).unwrap())), 2, "another serializer checks in a buffer first");
+    assert_eq!(writes(&|| drop(json::to_vec(&WireResult(Ok(Counted))).unwrap())), 1, "json::to_vec writes once");
+    assert_eq!(writes(&|| drop(json::to_vec(&vec![WireResult(Ok(Counted))]).unwrap())), 1, "a nested result is written once too");
+
+    let raw = |text: &str| raw_value(text);
+    let deep_error = Error::literal("ORDERS_CONFLICT_001", "stale").with_detail("deep", nested(62));
+    #[derive(serde::Serialize)]
+    struct Envelope {
+        #[serde(with = "primitives::wire_result")]
+        outcome: Result<serde_json::Value>,
+    }
+    // 同一个值经两条路径写出的结果：(值, json::to_vec, serde_json::to_vec)
+    let same = |what: &str, by_to_vec: std::result::Result<Vec<u8>, serde_json::Error>, by_serde: std::result::Result<Vec<u8>, serde_json::Error>| match (
+        by_to_vec, by_serde,
+    ) {
+        (Ok(left), Ok(right)) => assert_eq!(left, right, "{what}"),
+        (Err(left), Err(right)) => {
+            assert!(left.to_string().contains(ERROR_CODE_INVALID_ARGUMENT), "{what}: {left}");
+            assert!(right.to_string().contains(ERROR_CODE_INVALID_ARGUMENT), "{what}: {right}");
+        }
+        (left, right) => panic!("{what}: json::to_vec gave {left:?}, serde_json gave {right:?}"),
+    };
+    macro_rules! both {
+        ($what:expr, $value:expr) => {{
+            let value = $value;
+            same($what, json::to_vec(&value), serde_json::to_vec(&value));
+        }};
+    }
+    both!("a value", WireResult(Ok(json!({"id": "o1", "n": 2.0, "f": f64::NAN}))));
+    both!("a unit success", WireResult::<()>(Ok(())));
+    both!("a failure", WireResult::<u32>(Err(Error::new("ORDERS_NOTFOUND_001", "orders.missing").with_detail("id", "o1"))));
+    both!("a value 64 levels from the root", WireResult(Ok(nested(63))));
+    both!("a value 65 levels from the root", WireResult(Ok(nested(64))));
+    both!("an error 64 levels deep", deep_error.clone());
+    both!("an error 65 levels deep", Error::literal("ORDERS_CONFLICT_001", "stale").with_detail("deep", nested(63)));
+    both!("an error 65 levels from the root of the result", WireResult::<u32>(Err(deep_error.clone())));
+    both!("an inner error 65 levels deep", Error::literal("ORDERS_CONFLICT_001", "stale").with_inner(deep_error.clone()));
+    both!("raw duplicate members", WireResult(Ok(raw(r#"{"a":1,"a":2}"#))));
+    both!("a raw lone surrogate escape", WireResult(Ok(raw(r#"["\udc00"]"#))));
+    both!("a raw value too deep", WireResult(Ok(vec![raw(&format!("{}0{}", "[".repeat(63), "]".repeat(63)))])));
+    both!("a duplicate inside the value", WireResult(Ok(Twice)));
+    both!("a result in a struct", Envelope { outcome: Ok(nested(62)) });
+    both!("a result in a struct too deep from its own root", Envelope { outcome: Ok(nested(64)) });
+    // json::to_vec 的层数从整个值的根算起：结果自己是 64 层、外面再包一层的，别的序列化器照写，json::to_vec 写不出
+    let wrapped = Envelope { outcome: Ok(nested(63)) };
+    assert!(serde_json::to_vec(&wrapped).is_ok(), "the result alone is 64 levels deep");
+    assert!(json::to_vec(&wrapped).is_err(), "json::to_vec counts from the root of the whole value");
+}
+
 #[derive(Deserialize)]
 struct TemplateVectors {
     keys: KeyCases,

@@ -450,7 +450,7 @@ struct Relay {
     tenant: Option<String>,
     /// 在另造的上下文里回调：`deadline` 是 50 毫秒后到期、等它到期再回调，`cancel` 是已被取消的，`short` 是 300 毫秒后到期、立即回调。
     abandon: Option<String>,
-    /// 以类型化的回调（`Host::invoke_json`）调用：`nan` 发一个写不出的请求，其余发 `{"quantity":2.5}`。
+    /// 以类型化的回调（`Host::invoke_json`）调用：`nan` 与 `deep`（嵌套 65 层）发一个写不出的请求，其余发 `{"quantity":2.5}`。
     typed: Option<String>,
 }
 
@@ -572,8 +572,14 @@ fn orders_plugin(recorder: &Arc<Recorder>, log: &Buffer) -> Plugin {
                         _ => with_tenant(ctx, request.tenant),
                     };
                     if let Some(typed) = request.typed.as_deref() {
-                        let quantity = if typed == "nan" { f64::NAN } else { 2.5 };
-                        let echoed: Quantity = host.invoke_json(&callback, &request.operation, &Quantity { quantity }).await?;
+                        let echoed: Quantity = if typed == "deep" {
+                            // 写出的文本过共同检查：嵌套超过 64 层写不出（ADR-0340）
+                            let deep = (0..65).fold(serde_json::json!(0), |value, _| serde_json::json!([value]));
+                            host.invoke_json(&callback, &request.operation, &deep).await?
+                        } else {
+                            let quantity = if typed == "nan" { f64::NAN } else { 2.5 };
+                            host.invoke_json(&callback, &request.operation, &Quantity { quantity }).await?
+                        };
                         return Ok(Relayed { payload: echoed.quantity.to_string() });
                     }
                     let payload = host.invoke(&callback, &request.operation, "{}").await?;
@@ -2052,10 +2058,12 @@ async fn typed_callbacks_write_the_request_and_read_the_response() {
     assert_eq!(relayed, json!({"payload": "2.5"}));
     assert_eq!(host.invokes.lock().unwrap().last().unwrap().2.payload, br#"{"quantity":2.5}"#);
 
-    // 请求写不出（非有限的浮点）：不发请求
+    // 请求写不出（非有限的浮点；嵌套超过 64 层，写出的文本过共同检查，ADR-0340）：不发请求
     let sent = host.invokes.lock().unwrap().len();
-    let unwritable = invoke(&mut client, "orders.relay", &typed("host.mirror", "nan"), None).await;
-    assert_eq!(keyed(unwritable.status.as_ref()), failed("host.mirror", "the request cannot be written as JSON"));
+    for kind in ["nan", "deep"] {
+        let unwritable = invoke(&mut client, "orders.relay", &typed("host.mirror", kind), None).await;
+        assert_eq!(keyed(unwritable.status.as_ref()), failed("host.mirror", "the request cannot be written as JSON"), "{kind}");
+    }
     assert_eq!(host.invokes.lock().unwrap().len(), sent, "an unwritable request is not sent");
 
     // 响应读不成目标类型：缺少成员报所在对象的路径，类型不符报成员的路径，不带值
@@ -2079,8 +2087,8 @@ async fn typed_callbacks_write_the_request_and_read_the_response() {
     stop(&mut client, running).await;
 }
 
-/// 信封的数据按 JSON 读写：`with_json_data` 用 `json::to_vec`（非有限的浮点写不出），`data_as` 用 `json::from_slice`（先过共同的读取
-/// 检查，报出错的位置）；`datacontenttype` 不变。
+/// 信封的数据按 JSON 读写：`with_json_data` 用 `json::to_vec`（非有限的浮点与没过共同检查的文本写不出），`data_as` 用 `json::from_slice`
+/// （先过共同的读取检查，报出错的位置）；`datacontenttype` 不变。
 #[test]
 fn envelope_data_reads_and_writes_json() {
     let envelope = || Envelope::new("orders.events", "e1", "urn:test", "orders.created");
@@ -2089,6 +2097,10 @@ fn envelope_data_reads_and_writes_json() {
     assert_eq!(written.data_as::<Quantity>().unwrap().quantity, 2.5);
     assert_eq!(written.data_as::<Value>().unwrap(), json!({"quantity": 2.5}));
     assert!(envelope().with_json_data(&Quantity { quantity: f64::INFINITY }).is_err(), "a non-finite number cannot be written");
+    // 写出的文本过共同检查（ADR-0340）：嵌套超过 64 层写不出，恰好 64 层照常
+    let nested = |depth: usize| (0..depth).fold(json!(0), |value, _| json!([value]));
+    assert!(envelope().with_json_data(&nested(65)).is_err(), "65 levels cannot be written");
+    assert_eq!(envelope().with_json_data(&nested(64)).unwrap().data_as::<Value>().unwrap(), nested(64));
 
     assert_eq!(envelope().data_as::<Quantity>().unwrap_err(), ReadError::Syntax, "no data is not JSON");
     assert_eq!(envelope().with_data(r#"{"quantity":"two"}"#).data_as::<Quantity>().unwrap_err().path(), "$.quantity");

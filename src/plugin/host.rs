@@ -135,8 +135,8 @@ impl Host {
     }
 
     /// 同 [`Host::invoke`]，请求与响应是类型化的对象，与 [`Invoker`](crate::operation::Invoker) 的入口对称：请求按
-    /// [`json::to_vec`] 写成载荷（类型化的写法，非有限的浮点写不出），响应载荷按 [`json::from_slice`] 读成 `Res`（先过共同的 JSON
-    /// 读取检查，数字按值模型）。
+    /// [`json::to_vec`] 写成载荷（类型化的写法：非有限的浮点写不出，写出的文本嵌套超过 64 层、有重复成员或 `RawValue` 里有孤立代理项
+    /// 的转义也写不出，ADR-0340），响应载荷按 [`json::from_slice`] 读成 `Res`（先过共同的 JSON 读取检查，数字按值模型）。
     ///
     /// 发出之前的核对（回调端点、权限、租户、截止时间与取消，见 [`Host`]）先于编码。之后请求写不出时不发请求，响应读不成 `Res` 时
     /// 丢掉响应，两者都是插件一侧的失败 `PLUGINS_UNEXPECTED_001` + `plugins.process.failed`：`phase` 为操作 ID，`reason` 分别是

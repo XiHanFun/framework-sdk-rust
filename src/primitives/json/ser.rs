@@ -46,8 +46,14 @@ impl<T: Serialize + ?Sized, const STRICT: bool> Serialize for Wrap<'_, T, STRICT
 /// 把请求或响应对象写成载荷的 JSON（RFC-0011 规则 2 与规则 10「编码」）：调用器编码响应用的就是它。
 ///
 /// 这是类型化的写法：非有限的浮点（及序列化不支持的值，如键不是字符串的映射）写不出、报错，不写成 `null` 或字符串；单精度与
-/// 64 位整数照原样写。要把非有限的浮点写成字符串的是值模型的写法 [`Model`]。回调宿主的请求、信封的数据都可以用它写，读回来用
-/// [`from_slice`](super::from_slice)。
+/// 64 位整数照原样写。要把非有限的浮点写成字符串的是值模型的写法 [`Model`]。回调宿主的请求（feature `plugin` 的 `Host::invoke_json`）、
+/// 信封的数据（`Envelope::with_json_data`）都经它写，读回来用 [`from_slice`](super::from_slice)。
+///
+/// 写出的整段文本还要过 RFC-0001「JSON 文本」的共同检查（[`check`](super::check)；ADR-0319、ADR-0340）：嵌套超过 [`MAX_DEPTH`](super::MAX_DEPTH)
+/// 层（从这个值的根算起，原样嵌进去的 `RawValue` 与 [`Json`](super::Json) 也算）、任何一层有重复的成员名（自定义的 `Serialize` 两次写同名、
+/// `#[serde(flatten)]` 的映射键与字段同名、`RawValue` 原样交出的）、`RawValue` 里孤立代理项的转义，都同样写不出，返回
+/// `PRIMITIVES_VALIDATION_001` 的错误、不交出文本。嵌在里面的 [`WireResult`](crate::primitives::WireResult) 与
+/// [`Error`](crate::primitives::Error) 由这一遍核对一并覆盖，不再各自先写一遍。
 ///
 /// ```
 /// use xihan_framework::primitives::json;
@@ -55,9 +61,21 @@ impl<T: Serialize + ?Sized, const STRICT: bool> Serialize for Wrap<'_, T, STRICT
 /// assert_eq!(json::to_vec(&[1.5, 2.0]).unwrap(), b"[1.5,2.0]");
 /// assert!(json::to_vec(&f64::NAN).is_err());
 /// assert_eq!(json::from_slice::<Vec<f64>>(&json::to_vec(&[1.5, 2.0]).unwrap()).unwrap(), [1.5, 2.0]);
+/// let deep = (0..65).fold(serde_json::json!(0), |value, _| serde_json::json!([value]));
+/// assert!(json::to_vec(&deep).is_err(), "65 levels cannot be written");
 /// ```
 pub fn to_vec<T: Serialize + ?Sized>(value: &T) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&Wrap::<T, true>(value))
+    // 写的时候标记外层会核对：嵌在里面的 Result 与 Error 不再先在缓冲里各写一遍（serialize_checked）。不论外面是否已在标记里都核对自己
+    // 写出的这段文本：它是另一个缓冲，外层的核对看不到
+    let text = {
+        let _scope = CheckedScope(WITHIN_CHECKED.replace(true));
+        serde_json::to_vec(&Wrap::<T, true>(value))?
+    };
+    // serde_json 的序列化器不数层数、不核对成员名，RawValue 的原文它也只照抄：写完之后对整段文本再读一遍（与调用器编码响应的做法相同）
+    match super::check(&text) {
+        Ok(()) => Ok(text),
+        Err(problem) => Err(serde_json::Error::custom(format!("{ERROR_CODE_INVALID_ARGUMENT}: the value cannot be written as JSON text: {problem}."))),
+    }
 }
 
 /// 按值模型把值转成 `serde_json::Value`：给错误细节与模板参数用，非有限的浮点成为字符串，而不是 `Value::from` 给出的 `null`。
@@ -68,7 +86,8 @@ pub fn to_value<T: Serialize + ?Sized>(value: &T) -> Result<Value, serde_json::E
 }
 
 thread_local! {
-    /// 正在为外层的线上编码核对与写出：嵌在里面的 Result 与 Error 不再各自核对，外层核对的整段文本已经包括它们
+    /// 外层会核对整段文本：正在经 [`to_vec`] 写出，或正在为外层的线上编码核对与写出。嵌在里面的 Result 与 Error 不再各自核对，
+    /// 外层核对的整段文本已经包括它们，层数从外层的根算起，不会比从它们自己的根算起少
     static WITHIN_CHECKED: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -86,7 +105,8 @@ impl Drop for CheckedScope {
 ///
 /// Rust 的字符串总是合法的 UTF-8，写不出的是嵌套超过 64 层（从这个结果或错误的根算起）与 `RawValue`（含 [`Json`](super::Json)）
 /// 原样写进去的文本里的重复成员、孤立代理项的转义：序列化器不数层数、不核对成员名，`RawValue` 的原文它只照抄，所以在缓冲里写一遍
-/// 再读。嵌在里面的 Result 与 Error 由最外层一并核对，不再各写一遍。
+/// 再读。嵌在里面的 Result 与 Error 由最外层一并核对，不再各写一遍；经 [`to_vec`] 写出时它写完之后核对整段文本，这里也不再先写一遍
+/// （ADR-0340），结果相同：层数从更外的根算起只会更多，重复成员与转义在整段文本里同样看得到。
 pub(crate) fn serialize_checked<T, S>(value: &T, what: &str, serializer: S) -> Result<S::Ok, S::Error>
 where
     T: Serialize + ?Sized,

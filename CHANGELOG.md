@@ -21,13 +21,14 @@
 
 - **新增** `plugin::Binding.properties`：`Configure` 下发的绑定属性交给配置钩子（ADR-0285）
 - **新增** `plugin::Envelope.data_schema` 与 `with_data_schema`：发布与投递原样带上 CloudEvents `dataschema`（ADR-0305）
-- **新增** `Host::invoke_json`、`Envelope::with_json_data` 与 `data_as`，公开 `json::to_vec`
+- **新增** `Host::invoke_json`、`Envelope::with_json_data` 与 `data_as`，公开 `json::to_vec`；`json::to_vec` 写出的文本嵌套超过 64 层、有重复成员或 `RawValue` 里有孤立代理项的转义时返回 `PRIMITIVES_VALIDATION_001` 的错误、不交出文本（ADR-0340）
 - **新增** `Context::with_cancellation`、`with_deadline`、`with_timeout` 与 `cancellation_error`
 - **新增** `pipeline::middleware_fn`、`operation::EXPOSE_ALL`、`operation::ID_MAX_LENGTH`、`From<FrameworkError> for Error`，`Error` 实现 `Eq`；目录的 `from_json` / `extend`、`LOCALES`、`is_locale_name`、`is_whitespace` 与 `is_blank` 在 `primitives` 公开
 - **新增** `plugin::ERROR_CODE_PLUGIN_UNEXPECTED`，公开 `ERROR_CODE_INVALID_SOURCE` 与 `ERROR_CODE_HANDSHAKE_MISMATCH`
 - **修复** 宿主写来的信封 `time` 读不出（Windows 上还有 1601 年之前）时投递以 `InvalidArgument` 拒绝（ADR-0306）
 - **修复** 插件写给宿主的错误细节超过 64 层时这个错误不带细节、其余字段照写（ADR-0320）
 - **修复** `Contract.expose` 的文档改准：空表示不对外发布，行为没变
+- **优化** `WireResult` 与 `Error` 经 `json::to_vec` 写出（含调用器编码响应）时只写一遍，不再先在缓冲里多写一遍核对，结果不变（ADR-0340）
 - **调整** 弃用 `Context::cancellation()` 与 `plugin::ERROR_CODE_UNEXPECTED`，旧名仍可用：改用 `cancellation_error()` 与 `ERROR_CODE_PLUGIN_UNEXPECTED`；`pipeline::from_fn` 照常可用
 - **调整** 清单 `activation` 里 `onEvent:` 的模式可以带下划线（ADR-0276）
 - **调整** docs.rs 上标出 `plugin` 模块要打开 feature `plugin`；包的 `homepage` 改成文档站

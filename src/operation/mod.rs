@@ -286,15 +286,12 @@ impl<T: Serialize + Send + 'static> Response for T {
 ///
 /// 写出的整段文本还要过 RFC-0001「JSON 文本」的共同检查（[`json::check`]，ADR-0319）：嵌套超过 64 层（从响应的根算起，原样嵌进去的
 /// `RawValue` 与 [`json::Json`] 也算）、任何一层有重复的成员名（自定义的 `Serialize` 两次写同名、`#[serde(flatten)]` 的映射键与字段同名、
-/// `RawValue` 原样交出的）、`RawValue` 里孤立代理项的转义，都同样写不出，不带 `inner`。
+/// `RawValue` 原样交出的）、`RawValue` 里孤立代理项的转义，都同样写不出，不带 `inner`。这一遍核对在 [`json::to_vec`] 里，写完之后对整段
+/// 文本做（ADR-0340）。
 fn encode(response: &dyn Response) -> Result<Vec<u8>> {
     match panic::catch_unwind(AssertUnwindSafe(|| response.encode())) {
-        // serde_json 的序列化器不数层数、不核对成员名，RawValue 的原文它也只照抄：写完之后对整段文本再读一遍。
-        // 写的一方只有这一处能看到完整的文本，代价是多一次读取（读出一棵值树再丢掉），与写出本身同阶
-        Ok(Ok(payload)) => match json::check(&payload) {
-            Ok(()) => Ok(payload),
-            Err(_) => Err(unhandled()),
-        },
+        // json::to_vec 写完之后已对整段文本过了共同检查，没过的与写不出的同样是 Err
+        Ok(Ok(payload)) => Ok(payload),
         Ok(Err(_)) => Err(unhandled()),
         Err(payload) => Err(unhandled_panic(payload.as_ref())),
     }

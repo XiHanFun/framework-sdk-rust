@@ -35,7 +35,8 @@ pub type Maybe<T> = Option<T>;
 ///   值经 [`json::Model`](super::json::Model) 写出，单精度先换成双精度，非有限的浮点写成字符串 `NaN`、`Infinity`、`-Infinity`。
 /// - 写出的整段文本要过共同检查（RFC-0001「写出与转交」，ADR-0320）：从结果的根算起（成功值的最外层是第 2 层）嵌套超过 64 层，
 ///   或 `RawValue`（含 [`json::Json`](super::json::Json)）原样写进去的文本有重复成员、孤立代理项的转义时写不出，序列化以
-///   `PRIMITIVES_VALIDATION_001` 的错误失败、不交出文本，对方读不进的文本不写出去。
+///   `PRIMITIVES_VALIDATION_001` 的错误失败、不交出文本，对方读不进的文本不写出去。交给别的序列化器（如 `serde_json::to_vec`）时
+///   先在缓冲里写一遍核对、再写出；经 [`json::to_vec`](super::json::to_vec) 写出时只写一遍，由它写完之后核对整段文本，结果相同（ADR-0340）。
 #[derive(Clone, Debug, PartialEq)]
 pub struct WireResult<T>(pub Result<T>);
 
